@@ -127,11 +127,15 @@ class ReaderState(
 
             val currentSeries = seriesApi.getOneSeries(newBook.seriesId)
             series.value = currentSeries
+            // Komga reading direction describes page order, not which reader to use.
+            // Only webtoon implies a reader type; ltr/rtl set the direction inside whatever
+            // reader the user picked, so their chosen reader type has to survive reopening.
             readerType.value = when (currentSeries.metadata.readingDirection) {
-                KomgaReadingDirection.LEFT_TO_RIGHT -> ReaderType.PAGED
-                KomgaReadingDirection.RIGHT_TO_LEFT -> ReaderType.PAGED
                 KomgaReadingDirection.WEBTOON -> ReaderType.CONTINUOUS
-                KomgaReadingDirection.VERTICAL, null -> readerSettingsRepository.getReaderType().first()
+                KomgaReadingDirection.LEFT_TO_RIGHT,
+                KomgaReadingDirection.RIGHT_TO_LEFT,
+                KomgaReadingDirection.VERTICAL,
+                null -> readerSettingsRepository.getReaderType().first()
             }
 
             state.value = LoadState.Success(Unit)
