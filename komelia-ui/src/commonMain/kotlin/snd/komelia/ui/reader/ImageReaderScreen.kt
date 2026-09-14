@@ -38,6 +38,7 @@ import snd.komelia.ui.MainScreen
 import snd.komelia.ui.book.bookScreen
 import snd.komelia.ui.color.view.ColorCorrectionScreen
 import snd.komelia.ui.common.components.ErrorContent
+import snd.komelia.ui.platform.BackPressHandler
 import snd.komelia.ui.platform.PlatformTitleBar
 import snd.komelia.ui.platform.canIntegrateWithSystemBar
 import snd.komelia.ui.reader.image.ReaderViewModel
@@ -114,6 +115,11 @@ class ImageReaderScreen(
 
         val vmState = vm.readerState.state.collectAsState(Dispatchers.Main.immediate)
         val currentBook = vm.readerState.booksState.collectAsState().value?.currentBook
+
+        // ReaderContent registers its own handler once the book is loaded; this one covers
+        // the loading and error states, where back would otherwise fall through to the
+        // no-op handler in MainView and appear to do nothing.
+        BackPressHandler { onExit(navigator, currentBook) }
 
         Column {
             PlatformTitleBar(Modifier.zIndex(10f), false) {

@@ -97,6 +97,13 @@ fun MainView(
 
             if (viewModelFactory == null) return@Surface
 
+            // Fallback handler that swallows back presses not handled by any screen.
+            // Registered before screen content so that it's added to the dispatcher first:
+            // OnBackPressedDispatcher invokes the most recently added enabled callback, and
+            // screens composed in the same pass (e.g. reader restored after process death)
+            // would otherwise be shadowed by this one.
+            BackPressHandler {}
+
             CompositionLocalProvider(
                 LocalViewModelFactory provides viewModelFactory,
                 LocalNotifications provides dependencies.appNotifications,
@@ -123,8 +130,6 @@ fun MainView(
                     StartupUpdateChecker(updateChecker)
                 }
             }
-
-            BackPressHandler {}
         }
     }
 }
