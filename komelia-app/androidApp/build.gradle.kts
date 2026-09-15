@@ -67,6 +67,7 @@ android {
 
     buildFeatures {
         buildConfig = true
+        resValues = true
     }
     defaultConfig {
         applicationId = "io.github.snd_r.komelia"
@@ -95,6 +96,14 @@ android {
         }
     }
     buildTypes {
+        debug {
+            // test build installs beside release and does not self-update
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+            resValue("string", "app_name", "Komelia (test)")
+            buildConfigField("boolean", "ENABLE_SELF_UPDATES", "false")
+            ndk { abiFilters += "arm64-v8a" }
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
