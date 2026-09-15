@@ -118,6 +118,8 @@ class ContinuousReaderState(
 
         readingDirection.value = when (readerState.series.value?.metadata?.readingDirection) {
             KomgaReadingDirection.WEBTOON -> TOP_TO_BOTTOM
+            KomgaReadingDirection.LEFT_TO_RIGHT -> LEFT_TO_RIGHT
+            KomgaReadingDirection.RIGHT_TO_LEFT -> RIGHT_TO_LEFT
             else -> settingsRepository.getContinuousReaderReadingDirection().first()
         }
         sidePaddingFraction.value = settingsRepository.getContinuousReaderPadding().first()
