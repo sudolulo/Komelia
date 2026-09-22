@@ -31,6 +31,16 @@ interface ReaderImage : AutoCloseable {
         visibleDisplaySize: IntRect,
     )
 
+    /**
+     * Prepare an exact viewport request without conflation and return only after
+     * its matching painter is installed or the existing painter already covers it.
+     */
+    suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        zoomFactor: Float,
+        visibleDisplaySize: IntRect,
+    )
+
     suspend fun getOriginalImageSize(): Result<IntSize>
 
     suspend fun getOriginalImage(): Result<KomeliaImage>

@@ -3,6 +3,7 @@ package snd.komelia.ui.reader.image.panels
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +33,8 @@ class PanelsReaderStateTest {
     }
 
     private class TestReaderImage : ReaderImage {
+        private val preparation = CompletableDeferred<Unit>()
+
         override val pageId = ReaderImage.PageId("book", 1)
         override val originalSize = MutableStateFlow<IntSize?>(null)
         override val displaySize = MutableStateFlow<IntSize?>(null)
@@ -44,6 +47,18 @@ class PanelsReaderStateTest {
             zoomFactor: Float,
             visibleDisplaySize: IntRect,
         ) = Unit
+
+        override suspend fun prepareUpdate(
+            maxDisplaySize: IntSize,
+            zoomFactor: Float,
+            visibleDisplaySize: IntRect,
+        ) {
+            preparation.await()
+        }
+
+        fun releasePreparation() {
+            preparation.complete(Unit)
+        }
 
         override suspend fun getOriginalImageSize(): Result<IntSize> =
             Result.failure(UnsupportedOperationException())

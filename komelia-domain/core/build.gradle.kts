@@ -66,6 +66,23 @@ kotlin {
 
         commonTest.dependencies {
             implementation(libs.kotlin.test)
+            implementation(libs.kotlinx.coroutines.test)
+        }
+
+        jvmTest.dependencies {
+            val hostOs = when {
+                System.getProperty("os.name").startsWith("Win") -> "windows"
+                System.getProperty("os.name").startsWith("Linux") -> "linux"
+                else -> error("Unsupported OS: ${System.getProperty("os.name")}")
+            }
+            val hostArch = when (val osArch = System.getProperty("os.arch")) {
+                "x86_64", "amd64" -> "x64"
+                "aarch64" -> "arm64"
+                else -> error("Unsupported arch: $osArch")
+            }
+            implementation(
+                "org.jetbrains.compose.desktop:desktop-jvm-$hostOs-$hostArch:${libs.versions.compose.multiplatform.get()}"
+            )
         }
 
         androidMain.dependencies {
