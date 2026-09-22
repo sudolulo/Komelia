@@ -239,14 +239,30 @@ class ScreenScaleState {
 
     fun setZoom(zoom: Float, focus: Offset = Offset.Zero) {
         val newZoom = zoom.coerceIn(zoomLimits.value)
+        val newTransformation = transformationForZoom(zoom, focus)
+        this.currentOffset = newTransformation.offset
+        this.zoom.value = newZoom
+        applyLimits()
+    }
+
+    internal fun calculateTransformationForZoom(zoom: Float, focus: Offset): Transformation {
+        val newZoom = zoom.coerceIn(zoomLimits.value)
+        val newScale = zoomToScale(newZoom)
         val newOffset = Transformation.offsetOf(
             point = transformation.value.pointOf(focus),
             transformedPoint = focus,
-            scale = zoomToScale(newZoom)
+            scale = newScale,
         )
-        this.currentOffset = newOffset
-        this.zoom.value = newZoom
-        applyLimits()
+        val newOffsetXLimits = offsetLimits(targetSize.value.width * newScale, areaSize.value.width.toFloat())
+        val newOffsetYLimits = offsetLimits(targetSize.value.height * newScale, areaSize.value.height.toFloat())
+
+        return Transformation(
+            offset = Offset(
+                x = newOffset.x.coerceIn(newOffsetXLimits),
+                y = newOffset.y.coerceIn(newOffsetYLimits),
+            ),
+            scale = newScale,
+        )
     }
 
     fun setOffset(offset: Offset) {
@@ -288,3 +304,8 @@ class ScreenScaleState {
         }
     }
 }
+
+fun ScreenScaleState.transformationForZoom(
+    zoom: Float,
+    focus: Offset = Offset.Zero,
+): ScreenScaleState.Transformation = calculateTransformationForZoom(zoom, focus)
