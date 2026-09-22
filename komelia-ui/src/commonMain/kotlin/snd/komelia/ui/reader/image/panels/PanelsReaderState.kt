@@ -17,7 +17,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
@@ -43,13 +42,13 @@ import snd.komelia.ui.reader.image.BookState
 import snd.komelia.ui.reader.image.PageMetadata
 import snd.komelia.ui.reader.image.ReaderState
 import snd.komelia.ui.reader.image.ScreenScaleState
+import snd.komelia.ui.reader.image.transformationForZoom
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookEnd
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookStart
 import snd.komga.client.common.KomgaReadingDirection
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 import kotlin.time.measureTimedValue
 
 private val logger = KotlinLogging.logger { }
@@ -76,6 +75,9 @@ class PanelsReaderState(
     val screenScaleState: ScreenScaleState,
 ) {
     private val stateScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val panelTransitionController = PanelTransitionController(stateScope) { error ->
+        logger.catching(error)
+    }
     private val pageLoadCoordinator = PageLoadCoordinator<PageId, PanelsPage>(
         cleanupScope = cleanupScope,
         closeValue = { it.imageResult?.image?.close() },
@@ -99,20 +101,40 @@ class PanelsReaderState(
         screenScaleState.setScrollState(null)
         screenScaleState.setScrollOrientation(Orientation.Vertical, false)
 
-        combine(
-            screenScaleState.transformation,
-            screenScaleState.areaSize,
-        ) {}
-            .drop(1).conflate()
+        screenScaleState.transformation
+            .drop(1)
+            .conflate()
             .onEach {
-                currentPage.value?.let { page ->
-                    updateImageState(page, screenScaleState)
-                    delay(100)
+                panelTransitionController.onViewportChanged {
+                    currentPage.value?.let { page ->
+                        updateImageState(page, screenScaleState)
+                    }
                 }
+                delay(100)
+            }
+            .launchIn(stateScope)
+
+        screenScaleState.areaSize
+            .drop(1)
+            .conflate()
+            .onEach {
+                when (panelTransitionController.phase.value) {
+                    PanelTransitionPhase.Animating -> cancelPanelTransition()
+                    PanelTransitionPhase.Preparing -> {
+                        cancelPanelTransition()
+                        currentPage.value?.let { page -> updateImageState(page, screenScaleState) }
+                    }
+
+                    PanelTransitionPhase.Idle -> {
+                        currentPage.value?.let { page -> updateImageState(page, screenScaleState) }
+                    }
+                }
+                delay(100)
             }
             .launchIn(stateScope)
 
         readingDirection.drop(1).onEach { readingDirection ->
+            cancelPanelTransition()
             val page = currentPage.value
             val panelData = page?.panelData
             if (panelData != null) {
@@ -144,6 +166,7 @@ class PanelsReaderState(
     }
 
     fun stop() {
+        cancelPanelTransition()
         stateScope.coroutineContext.cancelChildren()
         pageLoadCoordinator.stop { currentPage.value = null }
         pendingPageIndex.value = null
@@ -180,6 +203,7 @@ class PanelsReaderState(
     }
 
     private fun onNewBookLoaded(bookState: BookState) {
+        cancelPanelTransition()
         val newPages = bookState.currentBookPages
         val newPageIndex = readerState.readProgressPage.value - 1
 
@@ -193,13 +217,14 @@ class PanelsReaderState(
     }
 
     fun onReadingDirectionChange(readingDirection: PagedReadingDirection) {
+        cancelPanelTransition()
         this.readingDirection.value = readingDirection
         stateScope.launch { settingsRepository.putPagedReaderReadingDirection(readingDirection) }
     }
 
 
     fun nextPanel() {
-        if (pendingPageIndex.value != null) return
+        if (pendingPageIndex.value != null || panelTransitionController.isActive) return
         val pageIndex = currentPageIndex.value
         val currentPage = currentPage.value
         if (currentPage == null || currentPage.panelData == null) {
@@ -219,23 +244,11 @@ class PanelsReaderState(
             }
             return
         }
-        val nextPanel = panels[panelIndex + 1]
-        val areaSize = screenScaleState.areaSize.value
-        val targetSize = IntSize(
-            screenScaleState.targetSize.value.width.roundToInt(),
-            screenScaleState.targetSize.value.height.roundToInt()
-        )
-        val imageSize = currentPage.panelData.originalImageSize
-        scrollToPanel(
-            imageSize = imageSize,
-            screenSize = areaSize,
-            targetSize = targetSize,
-            panel = nextPanel
-        )
-        currentPageIndex.update { it.copy(panel = panelIndex + 1) }
+        launchPanelTransition(panelIndex + 1, panels[panelIndex + 1])
     }
 
     private fun nextPage() {
+        cancelPanelTransition()
         val currentPageIndex = currentPageIndex.value.page
         val currentTransitionPage = transitionPage.value
         when {
@@ -263,7 +276,7 @@ class PanelsReaderState(
     }
 
     fun previousPanel() {
-        if (pendingPageIndex.value != null) return
+        if (pendingPageIndex.value != null || panelTransitionController.isActive) return
         val pageIndex = currentPageIndex.value
         val currentPage = currentPage.value
         if (currentPage == null || currentPage.panelData == null) {
@@ -277,25 +290,11 @@ class PanelsReaderState(
             previousPage()
             return
         }
-        val previousPage = panels[panelIndex - 1]
-        val areaSize = screenScaleState.areaSize.value
-        val targetSize = IntSize(
-            screenScaleState.targetSize.value.width.roundToInt(),
-            screenScaleState.targetSize.value.height.roundToInt()
-        )
-        val imageSize = currentPage.panelData.originalImageSize
-        scrollToPanel(
-            imageSize = imageSize,
-            screenSize = areaSize,
-            targetSize = targetSize,
-            panel = previousPage
-        )
-        currentPageIndex.update {
-            it.copy(panel = panelIndex - 1, isLastPanelZoomOutActive = false)
-        }
+        launchPanelTransition(panelIndex - 1, panels[panelIndex - 1])
     }
 
     private fun previousPage() {
+        cancelPanelTransition()
         val currentPgeIndex = currentPageIndex.value.page
         val currentTransitionPage = transitionPage.value
         when {
@@ -325,6 +324,7 @@ class PanelsReaderState(
     fun onPageChange(page: Int) {
         if (pendingPageIndex.value == page) return
         if (pendingPageIndex.value == null && currentPageIndex.value.page == page) return
+        cancelPanelTransition()
         pageChangeFlow.tryEmit(Unit)
         launchPageLoad(page)
     }
@@ -499,6 +499,88 @@ class PanelsReaderState(
         screenScaleState.setZoom(0f)
         screenScaleState.scrollTo(Offset(0f, 0f))
 
+    }
+
+    private fun launchPanelTransition(targetPanelIndex: Int, panel: ImageRect): Boolean {
+        if (pendingPageIndex.value != null || panelTransitionController.isActive) return false
+
+        val sourcePage = currentPage.value ?: return false
+        val panelData = sourcePage.panelData ?: return false
+        val image = (sourcePage.imageResult as? ReaderImageResult.Success)?.image ?: return false
+        val sourceIndex = currentPageIndex.value
+        val areaSize = screenScaleState.areaSize.value
+        val targetSize = screenScaleState.targetSize.value.toIntSize()
+        val sourceTransformation = screenScaleState.transformation.value
+        val (targetOffset, targetZoom) = getPanelOffsetAndZoom(
+            imageSize = panelData.originalImageSize,
+            areaSize = areaSize,
+            targetSize = targetSize,
+            panel = panel,
+        )
+        val targetZoomStartTransformation = screenScaleState.transformationForZoom(targetZoom)
+        val targetTransformation = ScreenScaleState.Transformation(
+            offset = targetOffset,
+            scale = targetZoomStartTransformation.scale,
+        )
+        val corridor = transitionCorridor(
+            regions = listOf(
+                visibleDisplayRegion(targetSize, areaSize, sourceTransformation),
+                visibleDisplayRegion(targetSize, areaSize, targetZoomStartTransformation),
+                visibleDisplayRegion(targetSize, areaSize, targetTransformation),
+            ),
+            displaySize = targetSize,
+        )
+        val transition = PreparedPanelTransition(
+            sourcePage = sourcePage,
+            sourceIndex = sourceIndex,
+            areaSize = areaSize,
+            targetSize = targetSize,
+            targetPanelIndex = targetPanelIndex,
+            targetZoom = targetZoom,
+            targetOffset = targetOffset,
+            corridor = corridor,
+        )
+
+        return panelTransitionController.launch(
+            prepare = {
+                image.prepareUpdate(
+                    maxDisplaySize = transition.areaSize,
+                    zoomFactor = targetZoomStartTransformation.scale,
+                    visibleDisplaySize = transition.corridor,
+                )
+            },
+            isStillValid = {
+                currentPage.value === transition.sourcePage &&
+                    currentPageIndex.value == transition.sourceIndex &&
+                    screenScaleState.areaSize.value == transition.areaSize &&
+                    screenScaleState.targetSize.value.toIntSize() == transition.targetSize &&
+                    screenScaleState.transformation.value == sourceTransformation
+            },
+            commit = {
+                currentCoroutineContext().ensureActive()
+                currentPageIndex.value = transition.sourceIndex.copy(
+                    panel = transition.targetPanelIndex,
+                    isLastPanelZoomOutActive = false,
+                )
+                logger.info {
+                    "panel transition corridor ${transition.corridor} ready at scale " +
+                        targetZoomStartTransformation.scale
+                }
+                screenScaleState.setZoom(transition.targetZoom)
+                val animation = screenScaleState.scrollTo(transition.targetOffset)
+                try {
+                    animation.join()
+                } finally {
+                    if (animation.isActive) animation.cancel()
+                    currentPage.value?.let { page -> updateImageState(page, screenScaleState) }
+                }
+            },
+        )
+    }
+
+    private fun cancelPanelTransition() {
+        panelTransitionController.cancel()
+        screenScaleState.cancelScroll()
     }
 
     private fun scrollToPanel(

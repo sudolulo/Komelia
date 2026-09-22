@@ -122,11 +122,11 @@ class ScreenScaleState {
         return -extra - overscroll..extra + overscroll
     }
 
-    fun scrollTo(offset: Offset) {
+    fun scrollTo(offset: Offset): Job {
         val coroutineScope = composeScope
         check(coroutineScope != null)
         scrollJob?.cancel()
-        scrollJob = coroutineScope.launch {
+        return coroutineScope.launch {
             logger.info { "current offset $currentOffset" }
             AnimationState(
                 typeConverter = Offset.VectorConverter,
@@ -139,7 +139,12 @@ class ScreenScaleState {
                 applyLimits()
             }
             logger.info { "scrolled to offset $currentOffset" }
-        }
+        }.also { scrollJob = it }
+    }
+
+    fun cancelScroll() {
+        scrollJob?.cancel()
+        scrollJob = null
     }
 
     suspend fun performFling(spec: DecayAnimationSpec<Offset>) {
