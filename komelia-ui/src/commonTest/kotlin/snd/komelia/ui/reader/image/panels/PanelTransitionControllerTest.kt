@@ -150,6 +150,19 @@ class PanelTransitionControllerTest {
     }
 
     @Test
+    fun `buffered idle viewport update is suppressed after animation starts`() = runTest {
+        val fixture = panelTransitionFixture()
+        fixture.bufferViewportChange()
+        fixture.startNextPanel()
+        fixture.completePreparation()
+        fixture.awaitAnimationStarted()
+
+        fixture.consumeBufferedViewportChange()
+
+        assertEquals(0, fixture.normalViewportUpdates)
+    }
+
+    @Test
     fun `animation cancellation resumes one destination viewport update`() = runTest {
         val fixture = panelTransitionFixture()
         fixture.startNextPanel()
@@ -174,6 +187,7 @@ private class PanelTransitionFixture(
     private val animationStartedSignal = CompletableDeferred<Unit>()
     private val animation = CompletableDeferred<Unit>()
     private var preparationFailure: Throwable? = null
+    private var bufferedViewportChange: (suspend () -> Unit)? = null
     private var pageIdentity = Any()
     private var areaSize = IntSize(1080, 2208)
     private var targetSize = IntSize(1080, 1669)
@@ -251,6 +265,19 @@ private class PanelTransitionFixture(
             transformation = transformation.copy(offset = Offset(frame.toFloat(), frame.toFloat()))
             onTransformationOrAreaChanged()
         }
+    }
+
+    fun bufferViewportChange() {
+        val change = controller.captureViewportChange()
+        bufferedViewportChange = {
+            controller.onViewportChanged(change) {
+                requestNormalViewportUpdate()
+            }
+        }
+    }
+
+    suspend fun consumeBufferedViewportChange() {
+        checkNotNull(bufferedViewportChange).invoke()
     }
 
     fun completeAnimation() {

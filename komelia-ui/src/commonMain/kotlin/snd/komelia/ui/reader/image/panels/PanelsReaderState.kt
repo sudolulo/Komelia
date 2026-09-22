@@ -104,10 +104,10 @@ class PanelsReaderState(
 
         screenScaleState.transformation
             .drop(1)
-            .map { panelTransitionController.phase.value }
+            .map { panelTransitionController.captureViewportChange() }
             .conflate()
-            .onEach { phaseAtChange ->
-                panelTransitionController.onViewportChanged(phaseAtChange) {
+            .onEach { change ->
+                panelTransitionController.onViewportChanged(change) {
                     currentPage.value?.let { page ->
                         updateImageState(page, screenScaleState)
                     }

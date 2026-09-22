@@ -67,22 +67,43 @@ internal class PanelTransitionController(
     fun cancel() {
         transitionJob?.cancel()
     }
-}
 
-internal suspend fun PanelTransitionController.onViewportChanged(
-    phaseAtChange: PanelTransitionPhase = phase.value,
-    updateViewport: suspend () -> Unit,
-) {
-    when (phaseAtChange) {
-        PanelTransitionPhase.Animating -> Unit
-        PanelTransitionPhase.Preparing -> {
-            cancel()
-            updateViewport()
+    fun captureViewportChange(): PanelTransitionViewportChange = PanelTransitionViewportChange(
+        phase = phase.value,
+        transitionIdentity = transitionIdentity,
+    )
+
+    suspend fun onViewportChanged(
+        change: PanelTransitionViewportChange = captureViewportChange(),
+        updateViewport: suspend () -> Unit,
+    ) {
+        val currentPhase = phase.value
+        val isCurrentTransition = change.transitionIdentity === transitionIdentity
+
+        when (change.phase) {
+            PanelTransitionPhase.Animating -> Unit
+            PanelTransitionPhase.Preparing -> {
+                when {
+                    isCurrentTransition && currentPhase == PanelTransitionPhase.Preparing -> {
+                        cancel()
+                        updateViewport()
+                    }
+
+                    transitionIdentity == null && currentPhase == PanelTransitionPhase.Idle -> updateViewport()
+                }
+            }
+
+            PanelTransitionPhase.Idle -> {
+                if (isCurrentTransition && currentPhase == PanelTransitionPhase.Idle) updateViewport()
+            }
         }
-
-        PanelTransitionPhase.Idle -> updateViewport()
     }
 }
+
+internal data class PanelTransitionViewportChange(
+    val phase: PanelTransitionPhase,
+    val transitionIdentity: Any?,
+)
 
 internal enum class PanelTransitionPhase {
     Idle,
