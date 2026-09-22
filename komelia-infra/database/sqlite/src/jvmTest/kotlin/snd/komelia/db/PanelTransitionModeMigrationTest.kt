@@ -155,7 +155,8 @@ class PanelTransitionModeMigrationTest {
 }
 
 private fun Path.deleteRecursively() {
-    Files.walk(this)
-        .sorted(Comparator.reverseOrder())
-        .forEach { Files.deleteIfExists(it) }
+    Files.walk(this).use { paths ->
+        paths.sorted(Comparator.reverseOrder())
+            .forEach { Files.deleteIfExists(it) }
+    }
 }
