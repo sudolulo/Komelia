@@ -2,10 +2,16 @@ package snd.komelia.db
 
 import kotlinx.coroutines.runBlocking
 import org.flywaydb.core.Flyway
+import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.Database
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import org.sqlite.SQLiteDataSource
 import snd.komelia.db.migrations.AppMigrations
 import snd.komelia.db.settings.ExposedImageReaderSettingsRepository
+import snd.komelia.db.tables.ImageReaderSettingsTable
+import snd.komelia.settings.model.PanelTransitionMode
 import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.DriverManager
@@ -74,7 +80,7 @@ class PanelTransitionModeMigrationTest {
             }
 
             val repository = ExposedImageReaderSettingsRepository(Database.connect(datasource))
-            val failure = assertFailsWith<IllegalArgumentException> {
+            val failure = assertFailsWith<IllegalStateException> {
                 runBlocking { repository.get() }
             }
             // The exception must come from the enum mapping path, not from an unrelated failure.
@@ -82,6 +88,40 @@ class PanelTransitionModeMigrationTest {
                 failure.message?.contains("TURBO") == true,
                 "expected the unknown literal to surface in the mapping failure, got: ${failure.message}"
             )
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `table maps panel transition mode as an enum by name`() {
+        assertEquals(
+            PanelTransitionMode.SNAPPY,
+            ImageReaderSettingsTable.panelTransitionMode.defaultValueFun?.invoke()
+        )
+
+        val dir = Files.createTempDirectory("komelia-panel-transition-mapping")
+        val url = "jdbc:sqlite:${dir.resolve("komelia.sqlite")}"
+        try {
+            val datasource = SQLiteDataSource().apply { this.url = url }
+            migrate(datasource, target = null)
+            DriverManager.getConnection(url).use { connection ->
+                connection.prepareStatement(insertRow).use { statement ->
+                    statement.setString(1, "DEFAULT")
+                    statement.executeUpdate()
+                }
+            }
+
+            transaction(Database.connect(datasource)) {
+                ImageReaderSettingsTable.update({ ImageReaderSettingsTable.bookId eq "DEFAULT" }) {
+                    it[panelTransitionMode] = PanelTransitionMode.CLASSIC
+                }
+
+                val mode = ImageReaderSettingsTable.selectAll()
+                    .where { ImageReaderSettingsTable.bookId eq "DEFAULT" }
+                    .single()[ImageReaderSettingsTable.panelTransitionMode]
+                assertEquals(PanelTransitionMode.CLASSIC, mode)
+            }
         } finally {
             dir.deleteRecursively()
         }

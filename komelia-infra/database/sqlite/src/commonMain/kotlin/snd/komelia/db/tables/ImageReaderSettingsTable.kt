@@ -1,6 +1,7 @@
 package snd.komelia.db.tables
 
 import org.jetbrains.exposed.v1.core.Table
+import snd.komelia.settings.model.PanelTransitionMode
 
 object ImageReaderSettingsTable : Table("ImageReaderSettings") {
     val bookId = text("book_id")
@@ -11,7 +12,8 @@ object ImageReaderSettingsTable : Table("ImageReaderSettings") {
     val pagedScaleType = text("paged_scale_type")
     val pagedReadingDirection = text("paged_reading_direction")
     val pagedPageLayout = text("paged_page_layout")
-    val panelTransitionMode = text("panel_transition_mode")
+    val panelTransitionMode = enumerationByName<PanelTransitionMode>("panel_transition_mode", 32)
+        .default(PanelTransitionMode.SNAPPY)
 
     val continuousReadingDirection = text("continuous_reading_direction")
     val continuousPadding = float("continuous_padding")
