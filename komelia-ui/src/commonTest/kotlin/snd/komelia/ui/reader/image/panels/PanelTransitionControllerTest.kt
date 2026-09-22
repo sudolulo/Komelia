@@ -6,6 +6,7 @@ import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.toSize
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.TestScope
@@ -18,6 +19,7 @@ import snd.komelia.ui.reader.image.ScreenScaleState.Transformation
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -99,6 +101,38 @@ class PanelTransitionControllerTest {
         assertEquals(0, fixture.currentPanelIndex)
         assertEquals(fixture.startTransformation, fixture.transformation)
         assertEquals("tile render failed", fixture.reportedError?.message)
+    }
+
+    @Test
+    fun `preparation cancellation is not reported as a rendering failure`() = runTest {
+        var reportedError: Throwable? = null
+        val controller = PanelTransitionController(backgroundScope) { reportedError = it }
+
+        controller.launch(
+            prepare = { throw CancellationException("preparation cancelled") },
+            isStillValid = { true },
+            commit = {},
+        )
+        runCurrent()
+
+        assertNull(reportedError)
+        assertEquals(PanelTransitionPhase.Idle, controller.phase.value)
+    }
+
+    @Test
+    fun `commit cancellation is not reported as a rendering failure`() = runTest {
+        var reportedError: Throwable? = null
+        val controller = PanelTransitionController(backgroundScope) { reportedError = it }
+
+        controller.launch(
+            prepare = {},
+            isStillValid = { true },
+            commit = { throw CancellationException("commit cancelled") },
+        )
+        runCurrent()
+
+        assertNull(reportedError)
+        assertEquals(PanelTransitionPhase.Idle, controller.phase.value)
     }
 
     @Test

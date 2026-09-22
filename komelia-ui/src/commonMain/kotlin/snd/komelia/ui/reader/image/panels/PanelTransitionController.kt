@@ -3,6 +3,7 @@ package snd.komelia.ui.reader.image.panels
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -45,6 +46,8 @@ internal class PanelTransitionController(
 
                 mutablePhase.value = PanelTransitionPhase.Animating
                 commit()
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Throwable) {
                 currentCoroutineContext().ensureActive()
                 onError(error)
