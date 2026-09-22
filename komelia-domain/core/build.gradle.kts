@@ -64,6 +64,10 @@ kotlin {
             implementation(libs.richEditor.compose)
         }
 
+        commonTest.dependencies {
+            implementation(libs.kotlin.test)
+        }
+
         androidMain.dependencies {
             implementation(libs.androidx.appcompat)
             implementation(libs.commons.compress)

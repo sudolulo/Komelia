@@ -41,6 +41,20 @@ private const val tileThreshold1 = 2048 * 2048
 private const val tileThreshold2 = 4096 * 4096
 private const val tileThreshold3 = 6144 * 6144
 
+internal fun visibilityWindowFor(displayRegion: Rect, displayArea: IntSize): Rect {
+    val horizontalMargin = displayRegion.width.coerceAtLeast(0f) / 2f
+    val verticalMargin = displayRegion.height.coerceAtLeast(0f) / 2f
+    val maxRight = displayArea.width.coerceAtLeast(0).toFloat()
+    val maxBottom = displayArea.height.coerceAtLeast(0).toFloat()
+
+    return Rect(
+        left = (displayRegion.left - horizontalMargin).coerceIn(0f, maxRight),
+        top = (displayRegion.top - verticalMargin).coerceIn(0f, maxBottom),
+        right = (displayRegion.right + horizontalMargin).coerceIn(0f, maxRight),
+        bottom = (displayRegion.bottom + verticalMargin).coerceIn(0f, maxBottom),
+    )
+}
+
 
 expect class RenderImage
 
@@ -348,12 +362,7 @@ abstract class TilingReaderImage(
         val timeSource = TimeSource.Monotonic
         val start = timeSource.markNow()
 
-        val visibilityWindow = Rect(
-            left = displayRegion.left / 1.5f,
-            top = displayRegion.top / 1.5f,
-            right = displayRegion.right * 1.5f,
-            bottom = displayRegion.bottom * 1.5f
-        )
+        val visibilityWindow = visibilityWindowFor(displayRegion, displayArea)
 
         val oldTiles = frameData.value?.frames?.first()?.tiles ?: emptyList()
         val newTiles = mutableListOf<ReaderImageTile>()
