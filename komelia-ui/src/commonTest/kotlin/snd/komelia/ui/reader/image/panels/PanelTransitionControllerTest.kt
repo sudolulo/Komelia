@@ -13,6 +13,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import snd.komelia.image.KomeliaImage
+import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImage
 import snd.komelia.ui.reader.image.ScreenScaleState
 import snd.komelia.ui.reader.image.ScreenScaleState.Transformation
@@ -77,6 +78,7 @@ class PanelTransitionControllerTest {
 
         assertEquals(0, fixture.commits)
         assertEquals(fixture.startTransformation, fixture.transformation)
+        assertEquals(1, fixture.preparedUpdateReleases)
     }
 
     @Test
@@ -125,7 +127,7 @@ class PanelTransitionControllerTest {
         val controller = PanelTransitionController(backgroundScope) { reportedError = it }
 
         controller.launch(
-            prepare = {},
+            prepare = { PreparedUpdateLease {} },
             isStillValid = { true },
             commit = { throw CancellationException("commit cancelled") },
         )
@@ -144,9 +146,11 @@ class PanelTransitionControllerTest {
         fixture.emitAnimationFrames(10)
 
         assertEquals(0, fixture.normalViewportUpdates)
+        assertEquals(0, fixture.preparedUpdateReleases)
         fixture.completeAnimation()
         fixture.runCurrent()
         assertEquals(1, fixture.normalViewportUpdates)
+        assertEquals(1, fixture.preparedUpdateReleases)
     }
 
     @Test
@@ -173,6 +177,7 @@ class PanelTransitionControllerTest {
 
         assertEquals(PanelTransitionPhase.Idle, fixture.phase)
         assertEquals(1, fixture.normalViewportUpdates)
+        assertEquals(1, fixture.preparedUpdateReleases)
     }
 }
 
@@ -206,6 +211,8 @@ private class PanelTransitionFixture(
         private set
     val normalViewportUpdates: Int
         get() = image.viewportUpdates
+    val preparedUpdateReleases: Int
+        get() = image.preparedUpdateReleases
     val phase: PanelTransitionPhase
         get() = controller.phase.value
 
@@ -221,12 +228,13 @@ private class PanelTransitionFixture(
                 preparationStarts++
                 preparationStarted.complete(Unit)
                 preparationFailure?.let { throw it }
-                image.prepareUpdate(
+                val preparedUpdate = image.prepareUpdate(
                     maxDisplaySize = sourceAreaSize,
                     zoomFactor = 2f,
                     visibleDisplaySize = IntRect(0, 0, 1080, 1669),
                 )
                 preparation.await()
+                preparedUpdate
             },
             isStillValid = {
                 pageIdentity === sourcePage &&
@@ -242,12 +250,9 @@ private class PanelTransitionFixture(
                 onTransformationOrAreaChanged()
                 animationStarted = true
                 animationStartedSignal.complete(Unit)
-                try {
-                    animation.await()
-                } finally {
-                    requestNormalViewportUpdate()
-                }
+                animation.await()
             },
+            afterRelease = { requestNormalViewportUpdate() },
         )
     }
 
@@ -323,6 +328,9 @@ private class TestReaderImage : ReaderImage {
 
     var viewportUpdates = 0
         private set
+    var preparedUpdateReleases = 0
+        private set
+    private var preparedUpdateHeld = false
 
     override val pageId = ReaderImage.PageId("book", 1)
     override val originalSize = MutableStateFlow<IntSize?>(null)
@@ -336,6 +344,7 @@ private class TestReaderImage : ReaderImage {
         zoomFactor: Float,
         visibleDisplaySize: IntRect,
     ) {
+        check(!preparedUpdateHeld) { "normal viewport published before prepared update release" }
         viewportUpdates++
     }
 
@@ -343,8 +352,15 @@ private class TestReaderImage : ReaderImage {
         maxDisplaySize: IntSize,
         zoomFactor: Float,
         visibleDisplaySize: IntRect,
-    ) {
+    ): PreparedUpdateLease {
         preparation.await()
+        preparedUpdateHeld = true
+        return PreparedUpdateLease {
+            if (preparedUpdateHeld) {
+                preparedUpdateHeld = false
+                preparedUpdateReleases++
+            }
+        }
     }
 
     fun releasePreparation() {

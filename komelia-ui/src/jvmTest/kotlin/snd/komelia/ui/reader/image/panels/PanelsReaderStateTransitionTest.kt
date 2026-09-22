@@ -32,6 +32,7 @@ import snd.komelia.image.KomeliaImage
 import snd.komelia.image.KomeliaImageDecoder
 import snd.komelia.image.KomeliaPanelDetector
 import snd.komelia.image.ReaderImage
+import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImageFactory
 import snd.komelia.image.ReaderImageResult
 import snd.komelia.komga.api.KomgaBookApi
@@ -188,9 +189,10 @@ private class ControlledReaderImage(
         maxDisplaySize: IntSize,
         zoomFactor: Float,
         visibleDisplaySize: IntRect,
-    ) {
+    ): PreparedUpdateLease {
         preparationStarted.complete(ImageUpdate(maxDisplaySize, zoomFactor, visibleDisplaySize))
         releasePreparation.await()
+        return PreparedUpdateLease {}
     }
 
     override suspend fun getOriginalImageSize(): Result<IntSize> =

@@ -6,6 +6,10 @@ import androidx.compose.ui.unit.IntSize
 import kotlinx.coroutines.flow.StateFlow
 import kotlin.math.roundToInt
 
+fun interface PreparedUpdateLease : AutoCloseable {
+    override fun close()
+}
+
 interface ReaderImage : AutoCloseable {
     val pageId: PageId
 
@@ -34,12 +38,13 @@ interface ReaderImage : AutoCloseable {
     /**
      * Prepare an exact viewport request without conflation and return only after
      * its matching painter is installed or the existing painter already covers it.
+     * The returned lease keeps later viewport updates from publishing until it is closed.
      */
     suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         zoomFactor: Float,
         visibleDisplaySize: IntRect,
-    )
+    ): PreparedUpdateLease
 
     suspend fun getOriginalImageSize(): Result<IntSize>
 

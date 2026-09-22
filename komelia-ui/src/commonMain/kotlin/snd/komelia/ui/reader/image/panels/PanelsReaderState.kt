@@ -84,6 +84,9 @@ class PanelsReaderState(
         closeValue = { it.imageResult?.image?.close() },
     )
     private val pendingPageIndex = MutableStateFlow<Int?>(null)
+    // The final animation value can reach the conflated observer after the controller returns to Idle.
+    // Suppress only that exact duplicate of the explicit post-lease destination update.
+    private val suppressedViewportUpdate = MutableStateFlow<ViewportUpdateSnapshot?>(null)
 
     val pageMetadata: MutableStateFlow<List<PageMetadata>> = MutableStateFlow(emptyList())
 
@@ -178,7 +181,10 @@ class PanelsReaderState(
     private suspend fun updateImageState(
         page: PanelsPage,
         screenScaleState: ScreenScaleState,
+        force: Boolean = false,
     ) {
+        if (!force && consumeSuppressedViewportUpdate(page, screenScaleState)) return
+
         val maxPageSize = screenScaleState.areaSize.value
         val transformation = screenScaleState.transformation.value
         val zoomFactor = transformation.scale
@@ -574,11 +580,40 @@ class PanelsReaderState(
                     animation.join()
                 } finally {
                     if (animation.isActive) animation.cancel()
-                    currentPage.value?.let { page -> updateImageState(page, screenScaleState) }
+                }
+            },
+            afterRelease = {
+                currentPage.value?.let { page ->
+                    suppressedViewportUpdate.value = viewportUpdateSnapshot(page, screenScaleState)
+                    updateImageState(page, screenScaleState, force = true)
                 }
             },
         )
     }
+
+    private fun consumeSuppressedViewportUpdate(
+        page: PanelsPage,
+        screenScaleState: ScreenScaleState,
+    ): Boolean {
+        while (true) {
+            val suppressed = suppressedViewportUpdate.value ?: return false
+            val matches = suppressed.page === page &&
+                suppressed.areaSize == screenScaleState.areaSize.value &&
+                suppressed.targetSize == screenScaleState.targetSize.value.toIntSize() &&
+                suppressed.transformation == screenScaleState.transformation.value
+            if (suppressedViewportUpdate.compareAndSet(suppressed, null)) return matches
+        }
+    }
+
+    private fun viewportUpdateSnapshot(
+        page: PanelsPage,
+        screenScaleState: ScreenScaleState,
+    ) = ViewportUpdateSnapshot(
+        page = page,
+        areaSize = screenScaleState.areaSize.value,
+        targetSize = screenScaleState.targetSize.value.toIntSize(),
+        transformation = screenScaleState.transformation.value,
+    )
 
     private fun cancelPanelTransition() {
         panelTransitionController.cancel()
@@ -663,6 +698,13 @@ class PanelsReaderState(
     private data class ReadyPanelsPage(
         val page: PanelsPage,
         val scale: ScreenScaleState,
+    )
+
+    private data class ViewportUpdateSnapshot(
+        val page: PanelsPage,
+        val areaSize: IntSize,
+        val targetSize: IntSize,
+        val transformation: ScreenScaleState.Transformation,
     )
 
 }

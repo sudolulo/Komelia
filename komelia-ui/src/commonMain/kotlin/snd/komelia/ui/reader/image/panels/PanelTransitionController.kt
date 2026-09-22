@@ -7,12 +7,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import snd.komelia.image.PreparedUpdateLease
 
 internal class PanelTransitionController(
     private val scope: CoroutineScope,
@@ -28,9 +31,10 @@ internal class PanelTransitionController(
     val phase: StateFlow<PanelTransitionPhase> = mutablePhase.asStateFlow()
 
     fun launch(
-        prepare: suspend () -> Unit,
+        prepare: suspend () -> PreparedUpdateLease,
         isStillValid: () -> Boolean,
         commit: suspend () -> Unit,
+        afterRelease: suspend () -> Unit = {},
     ): Boolean {
         if (transitionJob?.isActive == true) return false
 
@@ -39,12 +43,15 @@ internal class PanelTransitionController(
         mutablePhase.value = PanelTransitionPhase.Preparing
 
         val job = scope.launch(start = CoroutineStart.LAZY) {
+            var preparedUpdate: PreparedUpdateLease? = null
+            var transitionActivated = false
             try {
-                prepare()
+                preparedUpdate = prepare()
                 if (!isStillValid()) return@launch
                 currentCoroutineContext().ensureActive()
 
                 mutablePhase.value = PanelTransitionPhase.Animating
+                transitionActivated = true
                 commit()
             } catch (error: CancellationException) {
                 throw error
@@ -52,6 +59,14 @@ internal class PanelTransitionController(
                 currentCoroutineContext().ensureActive()
                 onError(error)
             } finally {
+                preparedUpdate?.close()
+                if (transitionActivated) {
+                    try {
+                        withContext(NonCancellable) { afterRelease() }
+                    } catch (error: Throwable) {
+                        onError(error)
+                    }
+                }
                 if (transitionIdentity === identity) {
                     transitionIdentity = null
                     transitionJob = null

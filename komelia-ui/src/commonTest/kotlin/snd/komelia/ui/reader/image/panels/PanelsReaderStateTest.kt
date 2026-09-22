@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import snd.komelia.image.KomeliaImage
+import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImage
 import kotlin.test.Test
 import kotlin.test.assertFalse
@@ -52,8 +53,9 @@ class PanelsReaderStateTest {
             maxDisplaySize: IntSize,
             zoomFactor: Float,
             visibleDisplaySize: IntRect,
-        ) {
+        ): PreparedUpdateLease {
             preparation.await()
+            return PreparedUpdateLease {}
         }
 
         fun releasePreparation() {

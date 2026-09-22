@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.jetbrains.skia.Bitmap
 import org.jetbrains.skia.ColorAlphaType
 import org.jetbrains.skia.ColorInfo
@@ -46,9 +47,12 @@ private fun movingViewport(index: Int): IntRect {
 
 internal interface PreparationFixture : ReaderImage {
     val painterPublications: Int
+    val currentTileCoverage: IntRect?
     val publishedRegions: List<IntRect>
     val barrierCompletionCounts: Map<Long, Int>
+    val tileCloseCounts: List<Int>
     fun blockPainterPublication()
+    suspend fun awaitPainterPublicationAttempts(count: Int)
     suspend fun awaitRegionGeneration()
     suspend fun awaitPainterPublications(count: Int)
     fun releasePainterPublication()
@@ -71,7 +75,7 @@ class TilingReaderImagePreparationTest {
 
             assertFalse(preparation.isCompleted)
             image.releasePainterPublication()
-            preparation.await()
+            preparation.await().close()
             assertTrue(image.painter.value != null)
         } finally {
             image.close()
@@ -87,9 +91,40 @@ class TilingReaderImagePreparationTest {
             repeat(20) { image.requestUpdate(screenSize, 2f, movingViewport(it)) }
 
             image.releaseRendering()
-            barrier.await()
+            barrier.await().close()
 
             assertTrue(image.publishedRegions.contains(targetCorridor))
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `prepared corridor remains installed until lease release then latest viewport runs`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.blockPainterPublication()
+            val barrier = async { image.prepareUpdate(screenSize, 2f, targetCorridor) }
+            image.awaitPainterPublicationAttempts(1)
+
+            repeat(20) { image.requestUpdate(screenSize, 2f, movingViewport(it)) }
+            image.releasePainterPublication()
+            val lease = barrier.await()
+
+            assertEquals(listOf(1), image.barrierCompletionCounts.values.toList())
+            assertEquals(1, image.painterPublications)
+            assertTrue(
+                checkNotNull(image.currentTileCoverage).containsRect(targetCorridor),
+                "the corridor must remain installed while its preparation lease is held",
+            )
+
+            lease.close()
+            lease.close()
+            image.awaitPainterPublications(2)
+            assertTrue(
+                checkNotNull(image.currentTileCoverage).containsRect(movingViewport(19)),
+                "the latest deferred viewport must publish after lease release",
+            )
         } finally {
             image.close()
         }
@@ -99,10 +134,10 @@ class TilingReaderImagePreparationTest {
     fun `existing matching tiles satisfy barrier without another painter`() = runTest {
         val image = preparationFixture()
         try {
-            image.prepareUpdate(screenSize, 2f, targetCorridor)
+            image.prepareUpdate(screenSize, 2f, targetCorridor).close()
             val painterBefore = image.painter.value
 
-            image.prepareUpdate(screenSize, 2f, targetCorridor)
+            image.prepareUpdate(screenSize, 2f, targetCorridor).close()
 
             assertSame(painterBefore, image.painter.value)
             assertEquals(1, image.painterPublications)
@@ -157,14 +192,54 @@ class TilingReaderImagePreparationTest {
         image.close()
 
         assertFailsWith<CancellationException> { waiter.await() }
-        Unit
+    }
+
+    @Test
+    fun `closing during blocked replacement closes current and pending old tiles exactly once`() = runTest {
+        val image = preparationFixture()
+        image.prepareUpdate(screenSize, 2f, targetCorridor).close()
+        image.blockPainterPublication()
+        val replacement = async {
+            image.prepareUpdate(screenSize, 2f, movingViewport(19))
+        }
+        image.awaitPainterPublicationAttempts(2)
+
+        try {
+            image.close()
+
+            assertTrue(image.tileCloseCounts.isNotEmpty())
+            assertTrue(
+                image.tileCloseCounts.all { it == 1 },
+                "expected every generated tile to close exactly once, got ${image.tileCloseCounts}",
+            )
+            withTimeout(2_000) {
+                assertFailsWith<CancellationException> { replacement.await() }
+            }
+        } finally {
+            replacement.cancelAndJoin()
+        }
+    }
+
+    @Test
+    fun `closing after replacement publication does not close retired tiles twice`() = runTest {
+        val image = preparationFixture()
+        image.prepareUpdate(screenSize, 2f, targetCorridor).close()
+        image.prepareUpdate(screenSize, 2f, movingViewport(19)).close()
+
+        image.close()
+
+        assertTrue(image.tileCloseCounts.isNotEmpty())
+        assertTrue(
+            image.tileCloseCounts.all { it == 1 },
+            "expected every generated tile to close exactly once, got ${image.tileCloseCounts}",
+        )
     }
 
     @Test
     fun `settings reload does not reuse completed barrier token`() = runTest {
         val image = preparationFixture()
         try {
-            image.prepareUpdate(screenSize, 2f, targetCorridor)
+            image.prepareUpdate(screenSize, 2f, targetCorridor).close()
             val completedBeforeReload = image.barrierCompletionCounts.toMap()
             val publicationsBeforeReload = image.painterPublications
 
@@ -178,6 +253,9 @@ class TilingReaderImagePreparationTest {
         }
     }
 }
+
+private fun IntRect.containsRect(other: IntRect): Boolean =
+    left <= other.left && top <= other.top && right >= other.right && bottom >= other.bottom
 
 private fun preparationFixture(): PreparationFixture {
     return DelegatingPreparationFixture(ControllableTilingReaderImage())
@@ -196,7 +274,9 @@ private class DelegatingPreparationFixture(
     override val painter: StateFlow<androidx.compose.ui.graphics.painter.Painter?> get() = delegate.painter
     override val error: StateFlow<Throwable?> get() = delegate.error
     override val painterPublications: Int get() = delegate.painterPublications
+    override val currentTileCoverage: IntRect? get() = delegate.currentTileCoverage
     override val publishedRegions: List<IntRect> get() = delegate.publishedRegions
+    override val tileCloseCounts: List<Int> get() = delegate.tileCloseCounts
     override val barrierCompletionCounts: Map<Long, Int>
         get() = completions.mapValues { (_, count) ->
             count + if (delegate.reusedCompletedBarrier) 1 else 0
@@ -210,20 +290,23 @@ private class DelegatingPreparationFixture(
         maxDisplaySize: IntSize,
         zoomFactor: Float,
         visibleDisplaySize: IntRect,
-    ) {
+    ): PreparedUpdateLease {
         val barrierId = nextBarrierId.incrementAndGet()
-        try {
+        val lease = try {
             delegate.prepareUpdate(maxDisplaySize, zoomFactor, visibleDisplaySize)
         } catch (e: Throwable) {
             delegate.error.value?.let { throw it }
             throw e
         }
         completions.compute(barrierId) { _, count -> (count ?: 0) + 1 }
+        return lease
     }
 
     override suspend fun getOriginalImageSize(): Result<IntSize> = delegate.getOriginalImageSize()
     override suspend fun getOriginalImage(): Result<KomeliaImage> = delegate.getOriginalImage()
     override fun blockPainterPublication() = delegate.blockPainterPublication()
+    override suspend fun awaitPainterPublicationAttempts(count: Int) =
+        delegate.awaitPainterPublicationAttempts(count)
     override suspend fun awaitRegionGeneration() = delegate.awaitRegionGeneration()
     override suspend fun awaitPainterPublications(count: Int) = delegate.awaitPainterPublications(count)
     override fun releasePainterPublication() = delegate.releasePainterPublication()
@@ -244,19 +327,30 @@ private class ControllableTilingReaderImage : TilingReaderImage(
     pageId = ReaderImage.PageId("preparation", 1),
 ) {
     private val publicationCount = MutableStateFlow(0)
+    private val publicationAttemptCount = MutableStateFlow(0)
     private val generatedRegions = MutableStateFlow(0)
     private val renderedRegions = CopyOnWriteArrayList<IntRect>()
+    private val generatedImages = CopyOnWriteArrayList<RenderImage>()
+    private val closedImages = CopyOnWriteArrayList<RenderImage>()
+    private val installedTileCoverage = AtomicReference<IntRect?>(null)
     private val publicationGate = AtomicReference(CountDownLatch(0))
     private val renderingGate = CountDownLatch(1)
     private val renderFailure = AtomicReference<Throwable?>(null)
     private val completedBarrierReuse = AtomicBoolean(false)
 
     val painterPublications: Int get() = publicationCount.value
+    val currentTileCoverage: IntRect? get() = installedTileCoverage.get()
     val publishedRegions: List<IntRect> get() = renderedRegions.toList()
+    val tileCloseCounts: List<Int>
+        get() = generatedImages.map { generated -> closedImages.count { it === generated } }
     val reusedCompletedBarrier: Boolean get() = completedBarrierReuse.get()
 
     fun blockPainterPublication() {
         publicationGate.set(CountDownLatch(1))
+    }
+
+    suspend fun awaitPainterPublicationAttempts(count: Int) {
+        publicationAttemptCount.first { it >= count }
     }
 
     suspend fun awaitRegionGeneration() {
@@ -290,7 +384,12 @@ private class ControllableTilingReaderImage : TilingReaderImage(
     }
 
     override fun closeTileBitmaps(tiles: List<ReaderImageTile>) {
-        tiles.forEach { tile -> runCatching { tile.renderImage?.close() } }
+        tiles.forEach { tile ->
+            tile.renderImage?.let { renderImage ->
+                closedImages += renderImage
+                runCatching { renderImage.close() }
+            }
+        }
     }
 
     override fun createTilePainter(
@@ -298,6 +397,7 @@ private class ControllableTilingReaderImage : TilingReaderImage(
         displaySize: IntSize,
         scaleFactor: Double,
     ): TiledPainter {
+        publicationAttemptCount.value += 1
         publicationGate.get().await()
         val left = tiles.minOf { it.displayRegion.left }.roundToInt()
         val top = tiles.minOf { it.displayRegion.top }.roundToInt()
@@ -311,6 +411,7 @@ private class ControllableTilingReaderImage : TilingReaderImage(
             right - horizontalInset,
             bottom - verticalInset,
         )
+        installedTileCoverage.set(IntRect(left, top, right, bottom))
         publicationCount.value += 1
         return FixturePainter()
     }
@@ -322,7 +423,7 @@ private class ControllableTilingReaderImage : TilingReaderImage(
     ): ReaderImageData {
         renderingGate.await()
         renderFailure.getAndSet(null)?.let { throw it }
-        return ReaderImageData(scaleWidth, scaleHeight, listOf(renderImage()), null)
+        return ReaderImageData(scaleWidth, scaleHeight, listOf(trackedRenderImage()), null)
     }
 
     override suspend fun getImageRegion(
@@ -334,8 +435,10 @@ private class ControllableTilingReaderImage : TilingReaderImage(
         renderFailure.getAndSet(null)?.let { throw it }
         if (scaleWidth > 512) renderingGate.await()
         generatedRegions.value += 1
-        return ReaderImageData(scaleWidth, scaleHeight, listOf(renderImage()), null)
+        return ReaderImageData(scaleWidth, scaleHeight, listOf(trackedRenderImage()), null)
     }
+
+    private fun trackedRenderImage(): RenderImage = renderImage().also { generatedImages += it }
 
     override fun close() {
         super.close()

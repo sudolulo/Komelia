@@ -148,7 +148,7 @@ abstract class TilingReaderImage(
                         )
                         currentCoroutineContext().ensureActive()
                         this.painter.value = nextPainter
-                        closeTileBitmaps(data.tilesToClose)
+                        closeTileBitmaps(data.takeTilesToClose())
                         data.readiness?.complete(Unit)
                     }
 
@@ -181,7 +181,7 @@ abstract class TilingReaderImage(
                         val frameDelay = data.frames[index].delay
                         this@TilingReaderImage.painter.value = tiledPainter
                         if (!firstPainterPublished) {
-                            closeTileBitmaps(data.tilesToClose)
+                            closeTileBitmaps(data.takeTilesToClose())
                             data.readiness?.complete(Unit)
                             firstPainterPublished = true
                         }
@@ -200,23 +200,23 @@ abstract class TilingReaderImage(
     private suspend fun processUpdate(request: UpdateRequest) {
         try {
             updateMutex.withLock {
-                val publishedFrame = doUpdate(request)
-                if (!publishedFrame) {
-                    request.readiness?.complete(Unit)
-                } else {
-                    request.readiness?.await()
-                }
+                processUpdateLocked(request)
             }
             error.value = null
         } catch (e: Throwable) {
             currentCoroutineContext().ensureActive()
-            val failure = request.readiness
-                ?.takeIf { it.isCompleted }
-                ?.getCompletionExceptionOrNull()
-                ?: e
-            logger.catching(failure)
-            error.value = failure
-            request.readiness?.completeExceptionally(failure)
+            logger.catching(e)
+            error.value = e
+            request.readiness?.completeExceptionally(e)
+        }
+    }
+
+    private suspend fun processUpdateLocked(request: UpdateRequest) {
+        val publishedFrame = doUpdate(request)
+        if (!publishedFrame) {
+            request.readiness?.complete(Unit)
+        } else {
+            request.readiness?.await()
         }
     }
 
@@ -299,27 +299,60 @@ abstract class TilingReaderImage(
         maxDisplaySize: IntSize,
         zoomFactor: Float,
         visibleDisplaySize: IntRect,
-    ) {
+    ): PreparedUpdateLease {
         val readiness = CompletableDeferred<Unit>()
+        val lease = PreparedUpdateLeaseImpl()
+        val prepared = CompletableDeferred<PreparedUpdateLease>()
+        val owner = Any()
         val job = processingScope.launch {
-            processUpdate(
-                UpdateRequest(
+            var gateAcquired = false
+            try {
+                updateMutex.lock(owner)
+                gateAcquired = true
+                val request = UpdateRequest(
                     visibleDisplaySize = visibleDisplaySize,
                     zoomFactor = zoomFactor,
                     maxDisplaySize = maxDisplaySize,
                     readiness = readiness,
                 )
-            )
+                processUpdateLocked(request)
+                error.value = null
+                prepared.complete(lease)
+                lease.awaitRelease()
+            } catch (e: Throwable) {
+                currentCoroutineContext().ensureActive()
+                logger.catching(e)
+                error.value = e
+                readiness.completeExceptionally(e)
+                prepared.completeExceptionally(e)
+            } finally {
+                if (gateAcquired) updateMutex.unlock(owner)
+            }
         }
         job.invokeOnCompletion { cause ->
-            if (cause != null) readiness.completeExceptionally(cause)
+            if (cause != null) {
+                readiness.completeExceptionally(cause)
+                prepared.completeExceptionally(cause)
+            }
         }
         try {
-            readiness.await()
+            return prepared.await()
         } catch (e: Throwable) {
+            lease.close()
             currentCoroutineContext().ensureActive()
-            readiness.getCompletionExceptionOrNull()?.let { throw it }
             throw e
+        }
+    }
+
+    private class PreparedUpdateLeaseImpl : PreparedUpdateLease {
+        private val released = CompletableDeferred<Unit>()
+
+        override fun close() {
+            released.complete(Unit)
+        }
+
+        suspend fun awaitRelease() {
+            released.await()
         }
     }
 
@@ -519,15 +552,32 @@ abstract class TilingReaderImage(
     }
 
     override fun close() {
+        processingScope.cancel()
+        animationScope.cancel()
+        imageAwaitScope.cancel()
+
+        val data = frameData.value
+        frameData.value = null
         originalImage?.close()
-        frameData.value?.frames
-            ?.flatMap { it.tiles }
-            ?.let { closeTileBitmaps(it) }
+        data?.let {
+            closeTileBitmaps(
+                distinctRenderImages(
+                    it.frames.flatMap { frame -> frame.tiles } + it.takeTilesToClose()
+                )
+            )
+        }
         image.value?.close()
         imageSource.close()
-        processingScope.cancel()
-        imageAwaitScope.cancel()
-        animationScope.cancel()
+    }
+
+    private fun distinctRenderImages(tiles: List<ReaderImageTile>): List<ReaderImageTile> {
+        val distinct = mutableListOf<ReaderImageTile>()
+        for (tile in tiles) {
+            if (distinct.none { existing -> existing.renderImage === tile.renderImage }) {
+                distinct += tile
+            }
+        }
+        return distinct
     }
 
     protected abstract fun closeTileBitmaps(tiles: List<ReaderImageTile>)
@@ -573,8 +623,18 @@ abstract class TilingReaderImage(
         val displaySize: IntSize,
         val scaleFactor: Double,
         val readiness: CompletableDeferred<Unit>?,
-        val tilesToClose: List<ReaderImageTile>,
-    )
+        tilesToClose: List<ReaderImageTile>,
+    ) {
+        private val pendingTilesToClose = MutableStateFlow(tilesToClose)
+
+        fun takeTilesToClose(): List<ReaderImageTile> {
+            while (true) {
+                val pending = pendingTilesToClose.value
+                if (pending.isEmpty()) return emptyList()
+                if (pendingTilesToClose.compareAndSet(pending, emptyList())) return pending
+            }
+        }
+    }
 
     data class ImageFrame(
         val tiles: List<ReaderImageTile>,
