@@ -41,6 +41,10 @@ kotlin {
             implementation(libs.ktor.client.core)
             implementation(libs.komga.client)
         }
+        commonTest.dependencies {
+            implementation(libs.kotlin.test)
+            implementation(libs.kotlinx.serialization.json)
+        }
     }
 }
 

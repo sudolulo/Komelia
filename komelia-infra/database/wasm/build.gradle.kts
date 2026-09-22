@@ -32,5 +32,8 @@ kotlin {
             implementation(libs.filekit.core)
             implementation(libs.indexeddb)
         }
+        wasmJsTest.dependencies {
+            implementation(libs.kotlin.test)
+        }
     }
 }

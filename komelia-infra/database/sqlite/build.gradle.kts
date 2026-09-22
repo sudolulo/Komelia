@@ -48,6 +48,9 @@ kotlin {
             implementation(libs.flyway.core)
             implementation(libs.sqlite.xerial.jdbc)
         }
+        jvmTest.dependencies {
+            implementation(libs.kotlin.test)
+        }
     }
 }
 

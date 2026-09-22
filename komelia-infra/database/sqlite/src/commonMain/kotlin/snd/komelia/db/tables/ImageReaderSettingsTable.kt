@@ -11,6 +11,7 @@ object ImageReaderSettingsTable : Table("ImageReaderSettings") {
     val pagedScaleType = text("paged_scale_type")
     val pagedReadingDirection = text("paged_reading_direction")
     val pagedPageLayout = text("paged_page_layout")
+    val panelTransitionMode = text("panel_transition_mode")
 
     val continuousReadingDirection = text("continuous_reading_direction")
     val continuousPadding = float("continuous_padding")

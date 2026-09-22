@@ -12,6 +12,7 @@ import snd.komelia.settings.model.ContinuousReadingDirection
 import snd.komelia.settings.model.LayoutScaleType
 import snd.komelia.settings.model.PageDisplayLayout
 import snd.komelia.settings.model.PagedReadingDirection
+import snd.komelia.settings.model.PanelTransitionMode
 import snd.komelia.settings.model.ReaderFlashColor
 import snd.komelia.settings.model.ReaderType
 
@@ -65,6 +66,14 @@ class ReaderSettingsRepositoryWrapper(
 
     override suspend fun putPagedReaderDisplayLayout(layout: PageDisplayLayout) {
         wrapper.transform { it.copy(pagedPageLayout = layout) }
+    }
+
+    override fun getPanelTransitionMode(): Flow<PanelTransitionMode> {
+        return wrapper.mapState { it.panelTransitionMode }
+    }
+
+    override suspend fun putPanelTransitionMode(mode: PanelTransitionMode) {
+        wrapper.transform { it.copy(panelTransitionMode = mode) }
     }
 
     override fun getContinuousReaderReadingDirection(): Flow<ContinuousReadingDirection> {

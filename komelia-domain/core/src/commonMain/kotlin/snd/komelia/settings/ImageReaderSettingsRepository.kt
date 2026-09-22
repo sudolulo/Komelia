@@ -9,6 +9,7 @@ import snd.komelia.settings.model.ContinuousReadingDirection
 import snd.komelia.settings.model.LayoutScaleType
 import snd.komelia.settings.model.PageDisplayLayout
 import snd.komelia.settings.model.PagedReadingDirection
+import snd.komelia.settings.model.PanelTransitionMode
 import snd.komelia.settings.model.ReaderFlashColor
 import snd.komelia.settings.model.ReaderType
 
@@ -30,6 +31,9 @@ interface ImageReaderSettingsRepository {
 
     fun getPagedReaderDisplayLayout(): Flow<PageDisplayLayout>
     suspend fun putPagedReaderDisplayLayout(layout: PageDisplayLayout)
+
+    fun getPanelTransitionMode(): Flow<PanelTransitionMode>
+    suspend fun putPanelTransitionMode(mode: PanelTransitionMode)
 
     fun getContinuousReaderReadingDirection(): Flow<ContinuousReadingDirection>
     suspend fun putContinuousReaderReadingDirection(direction: ContinuousReadingDirection)

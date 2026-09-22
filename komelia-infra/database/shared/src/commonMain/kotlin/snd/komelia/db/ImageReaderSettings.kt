@@ -9,6 +9,7 @@ import snd.komelia.settings.model.ContinuousReadingDirection
 import snd.komelia.settings.model.LayoutScaleType
 import snd.komelia.settings.model.PageDisplayLayout
 import snd.komelia.settings.model.PagedReadingDirection
+import snd.komelia.settings.model.PanelTransitionMode
 import snd.komelia.settings.model.ReaderFlashColor
 import snd.komelia.settings.model.ReaderType
 import snd.komelia.settings.model.ReaderType.PAGED
@@ -20,6 +21,7 @@ data class ImageReaderSettings(
     val pagedScaleType: LayoutScaleType = LayoutScaleType.SCREEN,
     val pagedReadingDirection: PagedReadingDirection = PagedReadingDirection.LEFT_TO_RIGHT,
     val pagedPageLayout: PageDisplayLayout = PageDisplayLayout.SINGLE_PAGE,
+    val panelTransitionMode: PanelTransitionMode = PanelTransitionMode.SNAPPY,
     val continuousReadingDirection: ContinuousReadingDirection = ContinuousReadingDirection.TOP_TO_BOTTOM,
     val continuousPadding: Float = 0f,
     val continuousPageSpacing: Int = 0,
