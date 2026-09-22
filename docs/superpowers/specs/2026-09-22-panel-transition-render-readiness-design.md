@@ -45,6 +45,7 @@ Extract pure geometry helpers for:
 1. predicting the transformation produced by `ScreenScaleState.setZoom` without mutating state;
 2. converting a transformation into its visible rectangle in fitted-image coordinates;
 3. constructing a transition corridor as the clamped bounding rectangle of:
+   - the viewport currently visible at the current render scale, so publishing target-scale tiles cannot blank the screen while preparation is still pending;
    - the viewport visible immediately after applying the target zoom at the current focus; and
    - the viewport visible at the destination panel offset using that same target zoom.
 
@@ -56,7 +57,7 @@ For next/previous-panel navigation within a page:
 
 1. Resolve the already-detected target panel and calculate its target zoom and offset.
 2. Capture the current page, panel index, screen area, target image size, and transformation inputs.
-3. Calculate the target-zoom start viewport, destination viewport, and corridor.
+3. Calculate the current viewport, target-zoom start viewport, destination viewport, and corridor containing all three.
 4. Call `ReaderImage.prepareUpdate` for the corridor at the target render scale.
 5. Revalidate that the page, panel index, screen dimensions, and target image size are unchanged.
 6. Update `currentPageIndex`, apply target zoom, and start the existing offset animation.
