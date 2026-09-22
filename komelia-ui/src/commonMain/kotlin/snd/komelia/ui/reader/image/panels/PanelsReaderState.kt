@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -103,9 +104,10 @@ class PanelsReaderState(
 
         screenScaleState.transformation
             .drop(1)
+            .map { panelTransitionController.phase.value }
             .conflate()
-            .onEach {
-                panelTransitionController.onViewportChanged {
+            .onEach { phaseAtChange ->
+                panelTransitionController.onViewportChanged(phaseAtChange) {
                     currentPage.value?.let { page ->
                         updateImageState(page, screenScaleState)
                     }

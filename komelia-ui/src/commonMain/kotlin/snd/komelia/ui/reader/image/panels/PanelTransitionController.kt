@@ -70,9 +70,10 @@ internal class PanelTransitionController(
 }
 
 internal suspend fun PanelTransitionController.onViewportChanged(
+    phaseAtChange: PanelTransitionPhase = phase.value,
     updateViewport: suspend () -> Unit,
 ) {
-    when (phase.value) {
+    when (phaseAtChange) {
         PanelTransitionPhase.Animating -> Unit
         PanelTransitionPhase.Preparing -> {
             cancel()
