@@ -426,6 +426,9 @@
     <string name="reader_settings_image_settings">Image settings</string>
 
     <string name="reader_image_settings">Image Settings</string>
+    <string name="reader_image_panel_transition">Panel transition</string>
+    <string name="reader_image_panel_transition_snappy">Snappy</string>
+    <string name="reader_image_panel_transition_classic">Classic</string>
     <string name="reader_image_upsampling_mode">upsampling mode</string>
     <string name="reader_image_upsampling_mode_nearest">Nearest neighbour</string>
     <string name="reader_image_upsampling_mode_bilinear">Bilinear</string>

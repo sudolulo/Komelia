@@ -78,6 +78,8 @@ import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_do
 import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_downsampling_kernel_lanczos2
 import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_downsampling_kernel_lanczos3
 import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_downsampling_kernel_mitchell
+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_panel_transition_classic
+import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_panel_transition_snappy
 import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_upsampling_mode_bicubic_catmull_rom
 import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_upsampling_mode_bicubic_mitchell
 import io.github.snd_r.komelia.ui.komelia_ui.generated.resources.reader_image_upsampling_mode_bilinear
@@ -161,6 +163,7 @@ import snd.komelia.settings.model.EpubReaderType
 import snd.komelia.settings.model.LayoutScaleType
 import snd.komelia.settings.model.PageDisplayLayout
 import snd.komelia.settings.model.PagedReadingDirection
+import snd.komelia.settings.model.PanelTransitionMode
 import snd.komelia.settings.model.ReaderType
 import snd.komelia.ui.book.BooksFilterState.BooksSort
 import snd.komelia.ui.common.components.LabeledEntry
@@ -360,6 +363,13 @@ data object AppStrings {
             UpsamplingMode.BILINEAR -> Res.string.reader_image_upsampling_mode_bilinear
             UpsamplingMode.MITCHELL -> Res.string.reader_image_upsampling_mode_bicubic_mitchell
             UpsamplingMode.CATMULL_ROM -> Res.string.reader_image_upsampling_mode_bicubic_catmull_rom
+        }
+    }
+
+    fun forPanelTransitionMode(mode: PanelTransitionMode): StringResource {
+        return when (mode) {
+            PanelTransitionMode.SNAPPY -> Res.string.reader_image_panel_transition_snappy
+            PanelTransitionMode.CLASSIC -> Res.string.reader_image_panel_transition_classic
         }
     }
 

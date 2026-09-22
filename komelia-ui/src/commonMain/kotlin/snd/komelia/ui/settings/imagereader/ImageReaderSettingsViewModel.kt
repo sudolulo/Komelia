@@ -6,6 +6,8 @@ import coil3.disk.DiskCache
 import coil3.memory.MemoryCache
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import snd.komelia.AppNotification
 import snd.komelia.AppNotifications
@@ -17,6 +19,7 @@ import snd.komelia.image.availableReduceKernels
 import snd.komelia.image.availableUpsamplingModes
 import snd.komelia.onnxruntime.OnnxRuntime
 import snd.komelia.settings.ImageReaderSettingsRepository
+import snd.komelia.settings.model.PanelTransitionMode
 import snd.komelia.ui.settings.imagereader.onnxruntime.OnnxRuntimeSettingsState
 import snd.komelia.updates.OnnxModelDownloader
 import snd.komelia.updates.OnnxRuntimeInstaller
@@ -51,9 +54,15 @@ class ImageReaderSettingsViewModel(
     val linearLightDownsampling = MutableStateFlow(false)
     val loadThumbnailsPreview = MutableStateFlow(false)
     val volumeKeysNavigation = MutableStateFlow(false)
+    val panelTransitionMode = MutableStateFlow(PanelTransitionMode.SNAPPY)
     val availableUpsamplingModes = availableUpsamplingModes()
     val availableDownsamplingKernels = availableReduceKernels()
 
+    init {
+        settingsRepository.getPanelTransitionMode()
+            .onEach { panelTransitionMode.value = it }
+            .launchIn(screenModelScope)
+    }
 
     suspend fun initialize() {
 
@@ -88,6 +97,11 @@ class ImageReaderSettingsViewModel(
     fun onVolumeKeysNavigationChange(enable: Boolean) {
         volumeKeysNavigation.value = enable
         screenModelScope.launch { settingsRepository.putVolumeKeysNavigation(enable) }
+    }
+
+    fun onPanelTransitionModeChange(mode: PanelTransitionMode) {
+        panelTransitionMode.value = mode
+        screenModelScope.launch { settingsRepository.putPanelTransitionMode(mode) }
     }
 
     fun onClearImageCache() {

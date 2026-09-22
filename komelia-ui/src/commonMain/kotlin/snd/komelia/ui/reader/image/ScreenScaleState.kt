@@ -32,6 +32,9 @@ import kotlin.math.min
 
 private val logger = KotlinLogging.logger {}
 
+internal const val SNAPPY_TRANSITION_DURATION_MS = 250
+internal const val CLASSIC_TRANSITION_DURATION_MS = 1000
+
 class ScreenScaleState {
     val zoom = MutableStateFlow(1f)
     private val zoomLimits = MutableStateFlow(1.0f..5f)
@@ -122,7 +125,10 @@ class ScreenScaleState {
         return -extra - overscroll..extra + overscroll
     }
 
-    fun scrollTo(offset: Offset): Job {
+    fun scrollTo(
+        offset: Offset,
+        durationMillis: Int = CLASSIC_TRANSITION_DURATION_MS,
+    ): Job {
         val coroutineScope = composeScope
         check(coroutineScope != null)
         scrollJob?.cancel()
@@ -133,7 +139,7 @@ class ScreenScaleState {
                 initialValue = currentOffset,
             ).animateTo(
                 targetValue = offset,
-                animationSpec = tween(durationMillis = 1000)
+                animationSpec = tween(durationMillis = durationMillis)
             ) {
                 currentOffset = value
                 applyLimits()

@@ -17,6 +17,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
@@ -24,6 +25,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
@@ -39,9 +41,12 @@ import snd.komelia.settings.ImageReaderSettingsRepository
 import snd.komelia.settings.model.PagedReadingDirection
 import snd.komelia.settings.model.PagedReadingDirection.LEFT_TO_RIGHT
 import snd.komelia.settings.model.PagedReadingDirection.RIGHT_TO_LEFT
+import snd.komelia.settings.model.PanelTransitionMode
 import snd.komelia.ui.reader.image.BookState
+import snd.komelia.ui.reader.image.CLASSIC_TRANSITION_DURATION_MS
 import snd.komelia.ui.reader.image.PageMetadata
 import snd.komelia.ui.reader.image.ReaderState
+import snd.komelia.ui.reader.image.SNAPPY_TRANSITION_DURATION_MS
 import snd.komelia.ui.reader.image.ScreenScaleState
 import snd.komelia.ui.reader.image.transformationForZoom
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage
@@ -53,6 +58,11 @@ import kotlin.math.min
 import kotlin.time.measureTimedValue
 
 private val logger = KotlinLogging.logger { }
+
+internal fun PanelTransitionMode.durationMillis(): Int = when (this) {
+    PanelTransitionMode.SNAPPY -> SNAPPY_TRANSITION_DURATION_MS
+    PanelTransitionMode.CLASSIC -> CLASSIC_TRANSITION_DURATION_MS
+}
 
 internal suspend fun awaitFirstPainter(image: ReaderImage?) {
     image ?: return
@@ -76,6 +86,8 @@ class PanelsReaderState(
     val screenScaleState: ScreenScaleState,
 ) {
     private val stateScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val panelTransitionMode = settingsRepository.getPanelTransitionMode()
+        .stateIn(stateScope, SharingStarted.Eagerly, PanelTransitionMode.SNAPPY)
     private val panelTransitionController = PanelTransitionController(stateScope) { error ->
         logger.catching(error)
     }
@@ -511,6 +523,7 @@ class PanelsReaderState(
 
     private fun launchPanelTransition(targetPanelIndex: Int, panel: ImageRect): Boolean {
         if (pendingPageIndex.value != null || panelTransitionController.isActive) return false
+        val transitionDurationMillis = panelTransitionMode.value.durationMillis()
 
         val sourcePage = currentPage.value ?: return false
         val panelData = sourcePage.panelData ?: return false
@@ -575,7 +588,10 @@ class PanelsReaderState(
                         targetZoomStartTransformation.scale
                 }
                 screenScaleState.setZoom(transition.targetZoom)
-                val animation = screenScaleState.scrollTo(transition.targetOffset)
+                val animation = screenScaleState.scrollTo(
+                    offset = transition.targetOffset,
+                    durationMillis = transitionDurationMillis,
+                )
                 try {
                     animation.join()
                 } finally {

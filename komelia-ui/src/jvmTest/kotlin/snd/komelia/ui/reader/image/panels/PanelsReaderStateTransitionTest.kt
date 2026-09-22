@@ -42,6 +42,7 @@ import snd.komelia.onnxruntime.OnnxRuntimeExecutionProvider
 import snd.komelia.onnxruntime.OnnxRuntimeRfDetr
 import snd.komelia.settings.ImageReaderSettingsRepository
 import snd.komelia.settings.model.PagedReadingDirection
+import snd.komelia.settings.model.PanelTransitionMode
 import snd.komelia.ui.BookSiblingsContext
 import snd.komelia.ui.reader.image.PageMetadata
 import snd.komelia.ui.reader.image.ReaderState
@@ -53,6 +54,80 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class PanelsReaderStateTransitionTest {
+    @Test
+    fun `snappy uses 250 milliseconds`() {
+        assertEquals(250, PanelTransitionMode.SNAPPY.durationMillis())
+    }
+
+    @Test
+    fun `classic uses stock 1000 milliseconds`() {
+        assertEquals(1000, PanelTransitionMode.CLASSIC.durationMillis())
+    }
+
+    @Test
+    fun `mode change during movement affects only the next transition`() = runBlocking {
+        val transitionMode = MutableStateFlow(PanelTransitionMode.CLASSIC)
+        val image = ControlledReaderImage(IntSize(300, 300))
+        val frameClock = ControlledFrameClock()
+        val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + frameClock)
+        val screenScaleState = ScreenScaleState().apply {
+            composeScope = animationScope
+            setAreaSize(IntSize(100, 100))
+            setTargetSize(IntSize(100, 100).toSize())
+            setZoom(3f)
+        }
+        val state = panelsReaderState(screenScaleState, transitionMode)
+        state.currentPage.value = PanelsReaderState.PanelsPage(
+            metadata = PageMetadata(KomgaBookId("book"), 1, IntSize(300, 300)),
+            imageResult = ReaderImageResult.Success(image),
+            panelData = PanelsReaderState.PanelData(
+                panels = listOf(
+                    ImageRect(100, 100, 200, 200),
+                    ImageRect(200, 200, 300, 300),
+                ),
+                originalImageSize = IntSize(300, 300),
+                panelCoversMajorityOfImage = false,
+            ),
+        )
+
+        try {
+            state.initialize()
+            awaitViewportObserver(state, image)
+
+            state.nextPanel()
+            withTimeout(2_000) { image.preparationStarted.await() }
+            image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (state.currentPageIndex.value.panel != 1) delay(10)
+            }
+
+            frameClock.sendFrame(0L)
+            frameClock.sendFrame(250_000_000L)
+            delay(50)
+            transitionMode.value = PanelTransitionMode.SNAPPY
+            assertEquals(emptyList(), image.viewportUpdates.toList())
+
+            frameClock.sendFrame(1_000_000_000L)
+            withTimeout(2_000) {
+                while (image.viewportUpdates.isEmpty()) delay(10)
+            }
+            val completedTransitions = image.viewportUpdates.size
+
+            state.previousPanel()
+            withTimeout(2_000) {
+                while (state.currentPageIndex.value.panel != 0) delay(10)
+            }
+            frameClock.sendFrame(1_100_000_000L)
+            frameClock.sendFrame(1_350_000_000L)
+            withTimeout(2_000) {
+                while (image.viewportUpdates.size == completedTransitions) delay(10)
+            }
+        } finally {
+            state.stop()
+            animationScope.cancel()
+        }
+    }
+
     @Test
     fun `real panel transition prepares corridor and suppresses animation viewport updates`() = runBlocking {
         val image = ControlledReaderImage(IntSize(300, 300))
@@ -205,9 +280,12 @@ private class ControlledReaderImage(
 }
 
 @OptIn(InternalVoyagerApi::class)
-private fun CoroutineScope.panelsReaderState(screenScaleState: ScreenScaleState): PanelsReaderState {
+private fun CoroutineScope.panelsReaderState(
+    screenScaleState: ScreenScaleState,
+    transitionMode: MutableStateFlow<PanelTransitionMode> = MutableStateFlow(PanelTransitionMode.SNAPPY),
+): PanelsReaderState {
     val bookApi = unsupportedProxy<KomgaBookApi>()
-    val settingsRepository = settingsRepository()
+    val settingsRepository = settingsRepository(transitionMode)
     val pageChangeFlow = MutableSharedFlow<Unit>()
     val readerState = ReaderState(
         bookApi = bookApi,
@@ -256,13 +334,16 @@ private fun CoroutineScope.panelsReaderState(screenScaleState: ScreenScaleState)
     )
 }
 
-private fun settingsRepository(): ImageReaderSettingsRepository =
+private fun settingsRepository(
+    transitionMode: MutableStateFlow<PanelTransitionMode>,
+): ImageReaderSettingsRepository =
     Proxy.newProxyInstance(
         ImageReaderSettingsRepository::class.java.classLoader,
         arrayOf(ImageReaderSettingsRepository::class.java),
     ) { _, method, _ ->
         when (method.name) {
             "getPagedReaderReadingDirection" -> flowOf(PagedReadingDirection.LEFT_TO_RIGHT)
+            "getPanelTransitionMode" -> transitionMode
             "toString" -> "PanelTransitionSettingsRepository"
             else -> throw UnsupportedOperationException(method.name)
         }
