@@ -2,7 +2,6 @@ package snd.komelia.ui.reader.image.panels
 
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.toIntSize
 import androidx.compose.ui.unit.toSize
@@ -156,9 +155,8 @@ class PanelsReaderState(
         screenScaleState: ScreenScaleState,
     ) {
         val maxPageSize = screenScaleState.areaSize.value
-        val zoomFactor = screenScaleState.transformation.value.scale
-        val offset = screenScaleState.transformation.value.offset
-        val areaSize = screenScaleState.areaSize.value.toSize()
+        val transformation = screenScaleState.transformation.value
+        val zoomFactor = transformation.scale
         val stretchToFit = readerState.imageStretchToFit.value
 
 
@@ -167,23 +165,10 @@ class PanelsReaderState(
             val imageDisplaySize = image.calculateSizeForArea(maxPageSize, stretchToFit) ?: return
             screenScaleState.setTargetSize(imageDisplaySize.toSize())
 
-            val visibleHeight = (imageDisplaySize.height * zoomFactor - areaSize.height) / 2
-            val visibleWidth = (imageDisplaySize.width * zoomFactor - areaSize.width) / 2
-
-            val top = ((visibleHeight - offset.y) / zoomFactor).roundToInt()
-                .coerceIn(0..imageDisplaySize.height)
-            val left = ((visibleWidth - offset.x) / zoomFactor).roundToInt()
-                .coerceIn(0..imageDisplaySize.width)
-
-            val visibleArea = IntRect(
-                top = top,
-                left = left,
-                bottom = (top + areaSize.height / zoomFactor)
-                    .roundToInt()
-                    .coerceAtMost(imageDisplaySize.height),
-                right = (left + (areaSize.width) / zoomFactor)
-                    .roundToInt()
-                    .coerceAtMost(imageDisplaySize.width),
+            val visibleArea = visibleDisplayRegion(
+                displaySize = imageDisplaySize,
+                areaSize = maxPageSize,
+                transformation = transformation,
             )
 
             image.requestUpdate(
