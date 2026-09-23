@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import snd.komelia.AppNotifications
@@ -40,6 +41,7 @@ import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.ReaderImage.PageId
 import snd.komelia.image.ReaderImageResult
+import snd.komelia.image.TransitionRenderStats
 import snd.komelia.onnxruntime.OnnxRuntimeException
 import snd.komelia.settings.ImageReaderSettingsRepository
 import snd.komelia.settings.model.PagedReadingDirection
@@ -60,6 +62,7 @@ import snd.komga.client.common.KomgaReadingDirection
 import kotlin.concurrent.Volatile
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.time.TimeSource
 import kotlin.time.measureTimedValue
 
 private val logger = KotlinLogging.logger { }
@@ -67,6 +70,81 @@ private val logger = KotlinLogging.logger { }
 internal fun PanelTransitionMode.durationMillis(): Int = when (this) {
     PanelTransitionMode.SNAPPY -> SNAPPY_TRANSITION_DURATION_MS
     PanelTransitionMode.CLASSIC -> CLASSIC_TRANSITION_DURATION_MS
+}
+
+/** How one panel transition ended. Exactly one outcome is reported per accepted transition. */
+enum class PanelTransitionOutcome {
+    /** the swept corridor was covered and the movement animation ran to completion */
+    ANIMATED,
+
+    /** only the endpoints were covered, so the destination was reached without animation */
+    JUMPED,
+
+    /** not even the endpoints fit the render budget; frame and transform were preserved */
+    REJECTED,
+
+    /** the reader moved on before the prepared coverage could be used */
+    SUPERSEDED,
+
+    /** the transition was cancelled before it finished */
+    CANCELLED,
+
+    /** the transition failed; the throwable itself is reported through the error path */
+    FAILED,
+}
+
+/**
+ * One transition, correlated across both layers: the generation, mode, duration and movement
+ * timings this state owns, joined with what the renderer reported it did.
+ *
+ * Every time is milliseconds elapsed since the input was accepted. A phase a transition never
+ * reached reports the elapsed time at which the transition ended instead.
+ *
+ * Carries no book title, source URL, server URL, user identifier or credential.
+ */
+data class PanelTransitionEvent(
+    val generation: Long,
+    val mode: PanelTransitionMode,
+    val durationMillis: Int,
+    val outcome: PanelTransitionOutcome,
+    val requirementCount: Int,
+    val stats: TransitionRenderStats?,
+    val readinessMillis: Long,
+    val movementStartMillis: Long,
+    val movementEndMillis: Long,
+) {
+    /**
+     * Native tile renders the demand path issued before movement, or null when the renderer
+     * does not account for pixels. Null is never reported as zero: zero is the success case.
+     */
+    val renderedTiles: Int? get() = stats?.renderedTiles
+
+    fun toLogLine(): String = "panel transition $generation $outcome mode=$mode " +
+        "duration=${durationMillis}ms requirements=$requirementCount " +
+        "readiness=${readinessMillis}ms " +
+        "movement=${movementStartMillis}ms..${movementEndMillis}ms stats=${statsField()}"
+
+    private fun statsField(): String {
+        val stats = stats ?: return "unavailable"
+        return "[rendered=${stats.renderedTiles} reused=${stats.reusedTiles} " +
+            "upgraded=${stats.upgradedTiles} evicted=${stats.evictedTiles} " +
+            "retainedPixels=${stats.uniqueRetainedPixels} reservedPixels=${stats.reservedPixels}]"
+    }
+}
+
+/** Where [PanelTransitionEvent]s go. The default sink logs them. */
+fun interface PanelTransitionDiagnostics {
+    fun onTransition(event: PanelTransitionEvent)
+
+    companion object {
+        val Logging = PanelTransitionDiagnostics { event -> logger.info { event.toLogLine() } }
+    }
+}
+
+private fun PreparedTransitionCoverage.statsOrNull(): TransitionRenderStats? = when (this) {
+    is PreparedTransitionCoverage.Animated -> stats
+    is PreparedTransitionCoverage.EndpointOnly -> stats
+    PreparedTransitionCoverage.Rejected -> null
 }
 
 internal suspend fun awaitFirstPainter(image: ReaderImage?) {
@@ -89,6 +167,7 @@ class PanelsReaderState(
     private val pageChangeFlow: MutableSharedFlow<Unit>,
     private val onnxRuntimeRfDetr: KomeliaPanelDetector,
     val screenScaleState: ScreenScaleState,
+    private val transitionDiagnostics: PanelTransitionDiagnostics = PanelTransitionDiagnostics.Logging,
 ) {
     private val stateScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val panelTransitionMode = settingsRepository.getPanelTransitionMode()
@@ -101,6 +180,9 @@ class PanelsReaderState(
         closeValue = { it.imageResult?.image?.close() },
     )
     private val pendingPageIndex = MutableStateFlow<Int?>(null)
+
+    /** one monotonically increasing generation per accepted transition, for correlation */
+    private val transitionGeneration = MutableStateFlow(0L)
 
     /** generation-scoped neighbour prefetch; replaced or cancelled whenever its inputs change */
     @Volatile
@@ -545,7 +627,9 @@ class PanelsReaderState(
 
     private fun launchPanelTransition(targetPanelIndex: Int, panel: ImageRect): Boolean {
         if (pendingPageIndex.value != null || panelTransitionController.isActive) return false
-        val transitionDurationMillis = panelTransitionMode.value.durationMillis()
+        // the mode is snapshotted here, so a change during movement only affects the next one
+        val transitionMode = panelTransitionMode.value
+        val transitionDurationMillis = transitionMode.durationMillis()
 
         val sourcePage = currentPage.value ?: return false
         val panelData = sourcePage.panelData ?: return false
@@ -577,60 +661,118 @@ class PanelsReaderState(
         )
         var coverage: PreparedTransitionCoverage = PreparedTransitionCoverage.Rejected
 
+        // the renderer reports what it rendered; every other field of the event lives here, so
+        // the correlated record can only be assembled at this layer
+        val generation = transitionGeneration.updateAndGet { it + 1 }
+        val transitionStart = TimeSource.Monotonic.markNow()
+        var readinessMillis: Long? = null
+        var movementStartMillis: Long? = null
+        var movementEndMillis: Long? = null
+        var eventEmitted = false
+
+        fun emitTransitionEvent(outcome: PanelTransitionOutcome) {
+            // every terminal path calls this; the first one wins, so one input is one event
+            if (eventEmitted) return
+            eventEmitted = true
+            val elapsedMillis = transitionStart.elapsedNow().inWholeMilliseconds
+            transitionDiagnostics.onTransition(
+                PanelTransitionEvent(
+                    generation = generation,
+                    mode = transitionMode,
+                    durationMillis = transitionDurationMillis,
+                    outcome = outcome,
+                    requirementCount = transition.requirements.animatedRequirements.size,
+                    stats = coverage.statsOrNull(),
+                    readinessMillis = readinessMillis ?: elapsedMillis,
+                    movementStartMillis = movementStartMillis ?: elapsedMillis,
+                    movementEndMillis = movementEndMillis ?: elapsedMillis,
+                )
+            )
+        }
+
         return panelTransitionController.launch(
             prepare = {
-                val prepared = image.prepareTransitionUpdate(
-                    maxDisplaySize = transition.areaSize,
-                    animatedRequirements = transition.requirements.animatedRequirements,
-                    endpointRequirements = transition.requirements.endpointRequirements,
-                )
-                coverage = prepared
-                when (prepared) {
-                    is PreparedTransitionCoverage.Animated -> prepared.lease
-                    is PreparedTransitionCoverage.EndpointOnly -> prepared.lease
-                    // nothing was rendered or published, so there is no coverage to hold
-                    PreparedTransitionCoverage.Rejected -> PreparedUpdateLease {}
+                try {
+                    val prepared = image.prepareTransitionUpdate(
+                        maxDisplaySize = transition.areaSize,
+                        animatedRequirements = transition.requirements.animatedRequirements,
+                        endpointRequirements = transition.requirements.endpointRequirements,
+                    )
+                    coverage = prepared
+                    readinessMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                    when (prepared) {
+                        is PreparedTransitionCoverage.Animated -> prepared.lease
+                        is PreparedTransitionCoverage.EndpointOnly -> prepared.lease
+                        // nothing was rendered or published, so there is no coverage to hold
+                        PreparedTransitionCoverage.Rejected -> {
+                            emitTransitionEvent(PanelTransitionOutcome.REJECTED)
+                            PreparedUpdateLease {}
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
+                    throw e
+                } catch (e: Throwable) {
+                    emitTransitionEvent(PanelTransitionOutcome.FAILED)
+                    throw e
                 }
             },
             // a rejected transition must not activate: no movement, and no reconciliation either
             isStillValid = {
-                coverage != PreparedTransitionCoverage.Rejected &&
+                val valid = coverage != PreparedTransitionCoverage.Rejected &&
                     currentPage.value === transition.sourcePage &&
                     currentPageIndex.value == transition.sourceIndex &&
                     screenScaleState.areaSize.value == transition.areaSize &&
                     screenScaleState.targetSize.value.toIntSize() == transition.targetSize &&
                     screenScaleState.transformation.value == sourceTransformation
+                // the controller runs nothing else once this reports false, so the terminal
+                // event for a superseded transition has to be emitted here
+                if (!valid) emitTransitionEvent(PanelTransitionOutcome.SUPERSEDED)
+                valid
             },
             commit = {
-                currentCoroutineContext().ensureActive()
-                currentPageIndex.value = transition.sourceIndex.copy(
-                    panel = transition.targetPanelIndex,
-                    isLastPanelZoomOutActive = false,
-                )
-                screenScaleState.setZoom(transition.targetZoom)
-
-                if (coverage is PreparedTransitionCoverage.EndpointOnly) {
-                    // only the endpoints are covered, so the path between them must not be drawn
-                    logger.info {
-                        "panel transition jumped to ${transition.requirements.destination.region}: " +
-                            "animated coverage did not fit the render budget"
-                    }
-                    screenScaleState.setOffset(transition.targetOffset)
-                    return@launch
-                }
-
-                logger.info {
-                    "panel transition coverage ${transition.requirements.swept.region} ready at " +
-                        "scale ${transition.requirements.targetTransformation.scale}"
-                }
-                val animation = screenScaleState.scrollTo(
-                    offset = transition.targetOffset,
-                    durationMillis = transitionDurationMillis,
-                )
                 try {
-                    animation.join()
-                } finally {
-                    if (animation.isActive) animation.cancel()
+                    currentCoroutineContext().ensureActive()
+                    movementStartMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                    currentPageIndex.value = transition.sourceIndex.copy(
+                        panel = transition.targetPanelIndex,
+                        isLastPanelZoomOutActive = false,
+                    )
+                    screenScaleState.setZoom(transition.targetZoom)
+
+                    if (coverage is PreparedTransitionCoverage.EndpointOnly) {
+                        // only the endpoints are covered, so the path between them must not be drawn
+                        logger.info {
+                            "panel transition jumped to ${transition.requirements.destination.region}: " +
+                                "animated coverage did not fit the render budget"
+                        }
+                        screenScaleState.setOffset(transition.targetOffset)
+                        movementEndMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                        emitTransitionEvent(PanelTransitionOutcome.JUMPED)
+                        return@launch
+                    }
+
+                    logger.info {
+                        "panel transition coverage ${transition.requirements.swept.region} ready at " +
+                            "scale ${transition.requirements.targetTransformation.scale}"
+                    }
+                    val animation = screenScaleState.scrollTo(
+                        offset = transition.targetOffset,
+                        durationMillis = transitionDurationMillis,
+                    )
+                    try {
+                        animation.join()
+                    } finally {
+                        if (animation.isActive) animation.cancel()
+                    }
+                    movementEndMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                    emitTransitionEvent(PanelTransitionOutcome.ANIMATED)
+                } catch (e: CancellationException) {
+                    emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
+                    throw e
+                } catch (e: Throwable) {
+                    emitTransitionEvent(PanelTransitionOutcome.FAILED)
+                    throw e
                 }
             },
             afterRelease = {

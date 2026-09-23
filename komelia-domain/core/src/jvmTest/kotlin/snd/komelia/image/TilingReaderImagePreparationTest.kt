@@ -39,6 +39,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -800,6 +802,61 @@ class TilingReaderImagePreparationTest {
             )
             assertSame(painterBefore, image.painter.value, "a rejected transition keeps the current frame")
             assertNull(image.error.value, "a rejected transition is not renderer error state")
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `warm transition reports zero rendered tiles`() = runTest {
+        val image = preparationFixture()
+        try {
+            val requirements = listOf(requirement(narrowPanel, 2f))
+            image.prefetchUpdate(screenSize, requirements)
+            val prefetched = image.renderedTiles.size
+            assertTrue(prefetched > 0, "the fixture must prefetch the coverage the transition reuses")
+
+            val coverage = image.prepareTransitionUpdate(
+                maxDisplaySize = screenSize,
+                animatedRequirements = requirements,
+                endpointRequirements = requirements,
+            )
+
+            val stats = assertIs<PreparedTransitionCoverage.Animated>(coverage).stats
+            assertNotNull(stats)
+            assertEquals(0, stats.renderedTiles)
+            assertTrue(stats.reusedTiles > 0)
+            assertTrue(stats.uniqueRetainedPixels > 0)
+            assertEquals(
+                prefetched,
+                image.renderedTiles.size,
+                "the reported zero must match the native renders the fixture observed",
+            )
+            coverage.lease.close()
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `cold transition reports the tiles it rendered`() = runTest {
+        val image = preparationFixture()
+        try {
+            val requirements = listOf(requirement(narrowPanel, 2f))
+
+            val coverage = image.prepareTransitionUpdate(
+                maxDisplaySize = screenSize,
+                animatedRequirements = requirements,
+                endpointRequirements = requirements,
+            )
+
+            val stats = assertIs<PreparedTransitionCoverage.Animated>(coverage).stats
+            assertNotNull(stats)
+            assertTrue(stats.renderedTiles > 0, "a cold transition renders its own coverage")
+            assertEquals(image.renderedTiles.size, stats.renderedTiles)
+            assertEquals(0, stats.reusedTiles)
+            assertTrue(stats.uniqueRetainedPixels > 0)
+            coverage.lease.close()
         } finally {
             image.close()
         }

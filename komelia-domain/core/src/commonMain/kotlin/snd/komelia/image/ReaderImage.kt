@@ -57,13 +57,17 @@ interface ReaderImage : AutoCloseable {
      *
      * The default implementation always animates: a renderer without a native pixel budget has
      * nothing to degrade to. [TilingReaderImage] overrides it with real admission.
+     *
+     * It also reports no [TransitionRenderStats]: a renderer with no native pixel budget has
+     * nothing to account for, and reporting zeroes would read as "did no work" instead.
      */
     suspend fun prepareTransitionUpdate(
         maxDisplaySize: IntSize,
         animatedRequirements: List<ViewportRenderRequirement>,
         endpointRequirements: List<ViewportRenderRequirement>,
     ): PreparedTransitionCoverage = PreparedTransitionCoverage.Animated(
-        prepareUpdate(maxDisplaySize = maxDisplaySize, requirements = animatedRequirements)
+        lease = prepareUpdate(maxDisplaySize = maxDisplaySize, requirements = animatedRequirements),
+        stats = null,
     )
 
     /**

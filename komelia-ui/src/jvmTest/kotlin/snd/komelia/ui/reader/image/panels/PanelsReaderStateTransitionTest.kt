@@ -37,6 +37,7 @@ import snd.komelia.image.PreparedTransitionCoverage
 import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImageFactory
 import snd.komelia.image.ReaderImageResult
+import snd.komelia.image.TransitionRenderStats
 import snd.komelia.image.ViewportRenderRequirement
 import snd.komelia.komga.api.KomgaBookApi
 import snd.komelia.komga.api.KomgaReadListApi
@@ -487,6 +488,66 @@ class PanelsReaderStateTransitionTest {
         }
     }
 
+    @Test
+    fun `warm snappy transition emits one correlated diagnostic event`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(diagnostics = { events += it })
+        try {
+            fixture.settle()
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+            // 250 ms of movement at 16 ms per frame needs far fewer than this
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            withTimeout(2_000) {
+                while (events.isEmpty()) delay(10)
+            }
+
+            val event = events.single()
+            assertEquals(PanelTransitionMode.SNAPPY, event.mode)
+            assertEquals(250, event.durationMillis)
+            assertEquals(0, event.renderedTiles)
+            assertTrue(event.generation > 0)
+            assertTrue(event.requirementCount > 0)
+            assertTrue(event.readinessMillis >= 0)
+            assertTrue(event.movementEndMillis >= event.movementStartMillis)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `cancelled transition emits a cancellation event and no error event`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(diagnostics = { events += it })
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            // the coverage is never released, so the transition is cancelled while preparing
+            fixture.state.stop()
+
+            withTimeout(2_000) {
+                while (events.isEmpty()) delay(10)
+            }
+
+            val event = events.single()
+            assertEquals(PanelTransitionOutcome.CANCELLED, event.outcome)
+            assertTrue(
+                events.none { it.outcome == PanelTransitionOutcome.FAILED },
+                "a cancellation must never be reported as a renderer failure, got $events",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
     private suspend fun awaitViewportObserver(
         state: PanelsReaderState,
         image: ControlledReaderImage,
@@ -580,6 +641,7 @@ private class PanelFixture(
 private suspend fun CoroutineScope.panelFixture(
     panels: List<ImageRect> = defaultPanels,
     startPanel: Int = 1,
+    diagnostics: PanelTransitionDiagnostics = PanelTransitionDiagnostics {},
 ): PanelFixture {
     val image = ControlledReaderImage(fixtureImageSize)
     val frameClock = ControlledFrameClock()
@@ -590,7 +652,7 @@ private suspend fun CoroutineScope.panelFixture(
         setTargetSize(fixtureAreaSize.toSize())
         setZoom(3f)
     }
-    val state = panelsReaderState(screenScaleState)
+    val state = panelsReaderState(screenScaleState, diagnostics = diagnostics)
     state.currentPage.value = PanelsReaderState.PanelsPage(
         metadata = PageMetadata(KomgaBookId("book"), 1, fixtureImageSize),
         imageResult = ReaderImageResult.Success(image),
@@ -694,15 +756,11 @@ private class ControlledReaderImage(
         releasePreparation.await()
 
         return when (transitionOutcome) {
-            TransitionOutcome.ANIMATED -> {
-                render(animatedRequirements)
-                PreparedTransitionCoverage.Animated(PreparedUpdateLease {})
-            }
+            TransitionOutcome.ANIMATED ->
+                PreparedTransitionCoverage.Animated(PreparedUpdateLease {}, render(animatedRequirements))
 
-            TransitionOutcome.ENDPOINT_ONLY -> {
-                render(endpointRequirements)
-                PreparedTransitionCoverage.EndpointOnly(PreparedUpdateLease {})
-            }
+            TransitionOutcome.ENDPOINT_ONLY ->
+                PreparedTransitionCoverage.EndpointOnly(PreparedUpdateLease {}, render(endpointRequirements))
 
             TransitionOutcome.REJECTED -> PreparedTransitionCoverage.Rejected
         }
@@ -726,10 +784,26 @@ private class ControlledReaderImage(
     fun hasCoverage(requirement: ViewportRenderRequirement): Boolean =
         renderedCoverage.contains(requirement)
 
-    private fun render(requirements: List<ViewportRenderRequirement>) {
+    /** one requirement stands in for one tile here, so the counts are directly assertable */
+    private fun render(requirements: List<ViewportRenderRequirement>): TransitionRenderStats {
+        var rendered = 0
+        var reused = 0
         for (requirement in requirements.toSet()) {
-            if (renderedCoverage.add(requirement)) renders.incrementAndGet()
+            if (renderedCoverage.add(requirement)) {
+                renders.incrementAndGet()
+                rendered += 1
+            } else {
+                reused += 1
+            }
         }
+        return TransitionRenderStats(
+            reusedTiles = reused,
+            upgradedTiles = 0,
+            renderedTiles = rendered,
+            evictedTiles = 0,
+            uniqueRetainedPixels = renderedCoverage.size.toLong(),
+            reservedPixels = rendered.toLong(),
+        )
     }
 
     override suspend fun getOriginalImageSize(): Result<IntSize> =
@@ -745,6 +819,7 @@ private class ControlledReaderImage(
 private fun CoroutineScope.panelsReaderState(
     screenScaleState: ScreenScaleState,
     transitionMode: MutableStateFlow<PanelTransitionMode> = MutableStateFlow(PanelTransitionMode.SNAPPY),
+    diagnostics: PanelTransitionDiagnostics = PanelTransitionDiagnostics {},
 ): PanelsReaderState {
     val bookApi = unsupportedProxy<KomgaBookApi>()
     val settingsRepository = settingsRepository(transitionMode)
@@ -793,6 +868,7 @@ private fun CoroutineScope.panelsReaderState(
         pageChangeFlow = pageChangeFlow,
         onnxRuntimeRfDetr = panelDetector,
         screenScaleState = screenScaleState,
+        transitionDiagnostics = diagnostics,
     )
 }
 
