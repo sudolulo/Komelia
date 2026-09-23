@@ -48,6 +48,7 @@ class DesktopReaderImage(
 
     init {
         upscaler?.upscaleMode?.drop(1)?.onEach {
+            invalidateRenderGeneration()
             lastUpdateRequest?.let {
                 this.painter.value = null
                 reloadLastRequest()
@@ -55,8 +56,8 @@ class DesktopReaderImage(
         }?.launchIn(processingScope)
     }
 
-    override fun closeTileBitmaps(tiles: List<ReaderImageTile>) {
-        tiles.forEach { runCatching { it.renderImage?.close() } }
+    override fun closeRenderImage(renderImage: RenderImage) {
+        runCatching { renderImage.close() }
     }
 
     override fun createTilePainter(

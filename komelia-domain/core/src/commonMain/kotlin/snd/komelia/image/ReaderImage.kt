@@ -36,15 +36,27 @@ interface ReaderImage : AutoCloseable {
     )
 
     /**
-     * Prepare an exact viewport request without conflation and return only after
-     * its matching painter is installed or the existing painter already covers it.
+     * Prepare an exact set of viewport requirements without conflation and return only after
+     * a painter covering all of them is installed, or the existing painter already covers them.
      * The returned lease keeps later viewport updates from publishing until it is closed.
+     *
+     * Every requirement contributes its own density, so a high zoom viewport is never
+     * replaced by under-resolved tiles because a lower zoom viewport overlaps it.
      */
+    suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    ): PreparedUpdateLease
+
+    /** normal-viewport convenience path over [prepareUpdate] with a single requirement */
     suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         zoomFactor: Float,
         visibleDisplaySize: IntRect,
-    ): PreparedUpdateLease
+    ): PreparedUpdateLease = prepareUpdate(
+        maxDisplaySize = maxDisplaySize,
+        requirements = listOf(ViewportRenderRequirement(visibleDisplaySize, zoomFactor)),
+    )
 
     suspend fun getOriginalImageSize(): Result<IntSize>
 

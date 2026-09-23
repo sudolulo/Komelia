@@ -38,8 +38,8 @@ class AndroidReaderImage(
     pageId = pageId,
 ) {
 
-    override fun closeTileBitmaps(tiles: List<ReaderImageTile>) {
-        tiles.forEach { it.renderImage?.recycle() }
+    override fun closeRenderImage(renderImage: RenderImage) {
+        renderImage.recycle()
     }
 
     override fun createTilePainter(

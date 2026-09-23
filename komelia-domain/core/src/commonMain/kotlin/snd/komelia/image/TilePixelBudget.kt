@@ -6,6 +6,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
+/**
+ * Raised when a render cannot be admitted within the hard peak. Callers that have a bounded
+ * fallback catch it; everything else surfaces it as ordinary renderer error state.
+ */
+class TilePixelBudgetExceededException(message: String) : IllegalStateException(message)
+
 internal class TilePixelBudget(
     private val hardPeakPixels: Long,
 ) {

@@ -17,6 +17,13 @@ internal class TileHandle private constructor(
     val pixelCount: Long = checkedPixelCount(renderSize)
     internal val isClosed: Boolean get() = references.value == 0
 
+    /**
+     * A tile may serve a request at the same or a lower output resolution. Serving a higher
+     * one would hide a cache miss behind visibly soft content, so both dimensions must fit.
+     */
+    fun isSufficientFor(requiredSize: IntSize): Boolean =
+        renderSize.width >= requiredSize.width && renderSize.height >= requiredSize.height
+
     fun retain(): TileOwnership? {
         while (true) {
             val current = references.value

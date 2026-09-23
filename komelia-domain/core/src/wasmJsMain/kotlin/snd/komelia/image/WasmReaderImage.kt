@@ -30,8 +30,8 @@ class WasmReaderImage(
     pageId = pageId,
 ) {
 
-    override fun closeTileBitmaps(tiles: List<ReaderImageTile>) {
-        tiles.forEach { it.renderImage?.close() }
+    override fun closeRenderImage(renderImage: RenderImage) {
+        renderImage.close()
     }
 
     override fun createTilePainter(
