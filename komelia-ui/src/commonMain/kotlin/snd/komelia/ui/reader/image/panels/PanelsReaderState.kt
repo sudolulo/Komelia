@@ -453,6 +453,7 @@ class PanelsReaderState(
                 true
             },
             afterReady = {
+                enterFirstPanel()
                 preloadImagesBetween(pageIndex)
             },
         )
@@ -560,7 +561,7 @@ class PanelsReaderState(
         }
     }
 
-    private suspend fun getScaleFor(
+    internal suspend fun getScaleFor(
         page: PanelsPage,
         containerSize: IntSize
     ): ScreenScaleState {
@@ -575,21 +576,11 @@ class PanelsReaderState(
         scaleState.setTargetSize(fitToScreenSize.toSize())
         scaleState.enableOverscrollArea(true)
 
-        val panels = page.panelData?.panels
-        if (panels.isNullOrEmpty()) {
-            scaleState.setZoom(0f)
-        } else {
-            val firstPanel = panels.first()
-            val imageSize = image.getOriginalImageSize().getOrNull() ?: return defaultScale
-            val (offset, zoom) = getPanelOffsetAndZoom(
-                imageSize = imageSize,
-                areaSize = containerSize,
-                targetSize = fitToScreenSize,
-                panel = firstPanel
-            )
-            scaleState.setZoom(zoom)
-            scaleState.setOffset(offset)
-        }
+        // First paint stays at fit zoom: that keeps the render area under the tiling
+        // threshold, so doFullResize runs and retains the page frame every panel
+        // transition on this page then publishes without rendering. The move into
+        // panel 0 happens afterwards, as an ordinary animated transition.
+        scaleState.setZoom(0f)
 
         return scaleState
     }
@@ -601,6 +592,17 @@ class PanelsReaderState(
         screenScaleState.setZoom(0f)
         screenScaleState.scrollTo(Offset(0f, 0f))
 
+    }
+
+    /**
+     * Moves from the fit-zoom first paint into the page's first panel. Returns false when the
+     * page has no panels, or when a transition is already running, in which case the reader
+     * simply stays at fit zoom showing the whole page.
+     */
+    internal fun enterFirstPanel(): Boolean {
+        val panels = currentPage.value?.panelData?.panels
+        if (panels.isNullOrEmpty()) return false
+        return launchPanelTransition(0, panels.first())
     }
 
     private fun launchPanelTransition(targetPanelIndex: Int, panel: ImageRect): Boolean {

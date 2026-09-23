@@ -467,6 +467,67 @@ class PanelsReaderStateTransitionTest {
             fixture.close()
         }
     }
+
+    @Test
+    fun `a page with panels prepares at fit zoom so the full resize path retains a page frame`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            val containerSize = fixture.screenScaleState.areaSize.value
+            val page = fixture.state.currentPage.value!!
+            val withPanels = fixture.state.getScaleFor(page, containerSize)
+
+            val fitted = ScreenScaleState()
+            fitted.setAreaSize(containerSize)
+            fitted.setTargetSize(fixture.screenScaleState.targetSize.value)
+            fitted.enableOverscrollArea(true)
+            fitted.setZoom(0f)
+
+            assertEquals(
+                fitted.zoom.value,
+                withPanels.zoom.value,
+                "a page with panels must prepare at fit zoom, not panel-fit zoom",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a freshly published page animates into its first panel`() = runBlocking {
+        val fixture = panelFixture(startPanel = 0)
+        try {
+            fixture.awaitViewportObserver()
+            fixture.screenScaleState.setZoom(0f)
+            val fitTransformation = fixture.screenScaleState.transformation.value
+
+            assertTrue(fixture.state.enterFirstPanel(), "entering the first panel must start a transition")
+
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            withTimeout(2_000) {
+                while (fixture.screenScaleState.transformation.value == fitTransformation) delay(10)
+            }
+
+            assertNotEquals(
+                fitTransformation,
+                fixture.screenScaleState.transformation.value,
+                "the viewport must have moved off fit zoom into panel 0",
+            )
+            assertEquals(0, fixture.state.currentPageIndex.value.panel)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a page with no panels does not try to enter a panel`() = runBlocking {
+        val fixture = panelFixture(panels = emptyList())
+        try {
+            fixture.awaitViewportObserver()
+            assertTrue(!fixture.state.enterFirstPanel(), "a page with no panels must not start a transition")
+        } finally {
+            fixture.close()
+        }
+    }
 }
 
 private class ControlledFrameClock : MonotonicFrameClock {
