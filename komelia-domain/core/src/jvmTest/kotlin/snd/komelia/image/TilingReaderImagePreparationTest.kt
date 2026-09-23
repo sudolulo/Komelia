@@ -72,6 +72,22 @@ private val wholeSmallPagePanel = IntRect(400, 400, 1_200, 1_200)
 private val largerScreen = IntSize(2_000, 2_000)
 private val largerScreenPanel = IntRect(1_850, 1_850, 1_950, 1_950)
 
+// a measured device page: 2588x4000 fitted into a 1198x1851 area is 2.2M display pixels at fit
+// zoom, under the tiling threshold, so the fit pass renders one full page frame
+private val devicePage = IntSize(2_588, 4_000)
+private val deviceDisplay = IntSize(1_198, 1_851)
+private val deviceFitPanel = IntRect(0, 0, 1_198, 1_851)
+
+// the same screen one Compose layout pass later: calculateSizeForArea rounds a min ratio, so the
+// fitted size drifts by three by four pixels with nothing visibly changing. At panel zoom it
+// tiles, so this pass renders no page frame of its own to hide a discarded one.
+private val driftedDisplay = IntSize(1_195, 1_847)
+private val driftedPanel = IntRect(500, 800, 700, 1_000)
+
+// unfolding the device: the fitted size grows by 35% on both axes, and still tiles at panel zoom
+private val unfoldedDisplay = IntSize(1_618, 2_500)
+private val unfoldedPanel = IntRect(600, 900, 800, 1_100)
+
 private fun movingViewport(index: Int): IntRect {
     val offset = index * 16
     return IntRect(1_900 + offset, 1_900, 2_700 + offset, 2_700)
@@ -622,6 +638,66 @@ class TilingReaderImagePreparationTest {
             assertFalse(
                 image.hasRetainedPageFrame,
                 "a generation with no full resize of its own has no page frame",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `a few pixels of display drift keep the retained page frame`() = runTest {
+        val image = preparationFixture(imageSize = devicePage)
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(deviceDisplay, listOf(requirement(deviceFitPanel, 1f))).close()
+            val pageFrame = image.renderedTiles.single()
+            assertTrue(image.hasRetainedPageFrame, "a fit zoom render must retain a page frame")
+
+            image.prepareUpdate(driftedDisplay, listOf(requirement(driftedPanel, 3f))).close()
+
+            assertTrue(
+                image.hasRetainedPageFrame,
+                "a three pixel display drift must not discard the retained page frame",
+            )
+            assertEquals(
+                0,
+                image.closedImages.count { it === pageFrame.renderImage },
+                "the page frame that survived the drift must stay live",
+            )
+            val lease = assertNotNull(
+                image.publishPageFrame(),
+                "the frame that survived the drift must still be publishable",
+            )
+            assertEquals(
+                listOf(pageFrame.renderImage),
+                image.publishedTiles.last().map { it.renderImage },
+                "the installed frame must be the retained page frame itself",
+            )
+            lease.close()
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `a real display size change discards the retained page frame`() = runTest {
+        val image = preparationFixture(imageSize = devicePage)
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(deviceDisplay, listOf(requirement(deviceFitPanel, 1f))).close()
+            val pageFrame = image.renderedTiles.single()
+            assertTrue(image.hasRetainedPageFrame)
+
+            image.prepareUpdate(unfoldedDisplay, listOf(requirement(unfoldedPanel, 3f))).close()
+
+            assertFalse(
+                image.hasRetainedPageFrame,
+                "a material display size change must discard the stale page frame",
+            )
+            assertEquals(
+                1,
+                image.closedImages.count { it === pageFrame.renderImage },
+                "the stale page frame must be released exactly once",
             )
         } finally {
             image.close()

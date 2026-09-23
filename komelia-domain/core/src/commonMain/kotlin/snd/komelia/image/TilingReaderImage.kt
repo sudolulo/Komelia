@@ -33,6 +33,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import snd.komelia.image.processing.ImageProcessingPipeline
 import kotlin.concurrent.Volatile
+import kotlin.math.abs
 import kotlin.math.round
 import kotlin.math.roundToInt
 import kotlin.time.TimeSource
@@ -50,6 +51,14 @@ private const val tileThreshold3 = 6144 * 6144
  * would hide a thrashing settings flow, so a bounded number of restarts is allowed per request.
  */
 private const val maxGenerationRetries = 8
+
+/**
+ * How far, per axis in display pixels, the fitted display size may drift from the one the
+ * retained page frame was rendered at before the frame is discarded. Compose layout passes
+ * report areas a pixel or two apart and calculateSizeForArea rounds, so the fitted size jitters
+ * without anything visibly changing; a fold, rotation or window resize moves it by hundreds.
+ */
+private const val maxToleratedDisplayDrift = 8
 
 internal fun visibilityWindowFor(displayRegion: Rect, displayArea: IntSize): Rect {
     val horizontalMargin = displayRegion.width.coerceAtLeast(0f) / 2f
@@ -887,14 +896,39 @@ abstract class TilingReaderImage(
             rendererEpoch = rendererEpoch,
         )
         if (fingerprint != renderFingerprint) {
+            val onlyDisplaySizeChanged =
+                renderFingerprint?.copy(displaySize = fingerprint.displaySize) == fingerprint
             renderFingerprint = fingerprint
             renderGeneration += 1
             lastUsedScaleFactor = null
-            // the page frame was rendered for the fitted geometry and raster inputs that just
-            // changed, so it can no longer be drawn
-            releaseRetainedPageFrame()
+            // the page frame survives layout jitter, but not a real change of geometry or of any
+            // raster input it was rendered with. A surviving frame is re-stamped to the new
+            // generation, so hasRetainedPageFrame and publishPageFrame stay truthful instead of
+            // having to special-case an older generation.
+            val frame = retainedPageFrame.value
+            val keepPageFrame = onlyDisplaySizeChanged &&
+                frame != null &&
+                !isMaterialDisplayChange(frame.displaySize, fingerprint.displaySize)
+            if (keepPageFrame) {
+                retainedPageFrame.update { it?.retagged(renderGeneration) }
+            } else {
+                releaseRetainedPageFrame()
+            }
         }
         return renderGeneration
+    }
+
+    /**
+     * Whether the fitted display size has moved far enough from the one the retained page frame
+     * was rendered at that the frame must be discarded. The frame is only ever drawn for the
+     * 250 ms of a panel transition, and its tiles carry absolute display coordinates, so a few
+     * pixels of staleness is invisible. The drift is measured against the frame's own size, not
+     * the previous fingerprint's, so successive tolerated jitters cannot add up past the bound.
+     */
+    private fun isMaterialDisplayChange(previous: IntSize, next: IntSize): Boolean {
+        val widthDrift = abs(previous.width - next.width)
+        val heightDrift = abs(previous.height - next.height)
+        return widthDrift > maxToleratedDisplayDrift || heightDrift > maxToleratedDisplayDrift
     }
 
     /**
@@ -1111,6 +1145,25 @@ abstract class TilingReaderImage(
         private val ownership: List<TileOwnership>,
     ) {
         fun release() = ownership.forEach { it.close() }
+
+        /**
+         * The same frame under a newer render generation. The display size drifted by a pixel
+         * or two but nothing the frame was rendered from changed, so the bitmaps and their
+         * ownership carry over untouched.
+         *
+         * This TRANSFERS the existing references rather than taking new ones, so the instance
+         * it replaces must be dropped without releasing it - releasing it would close the very
+         * handles the returned frame now owns. That is why generationFor swaps it in with
+         * update rather than the getAndUpdate/release pattern retainPageFrame uses.
+         */
+        fun retagged(generation: Long) = RetainedPageFrame(
+            generation = generation,
+            handles = handles,
+            frames = frames,
+            displaySize = displaySize,
+            scaleFactor = scaleFactor,
+            ownership = ownership,
+        )
     }
 
     internal class RetainedTile(
