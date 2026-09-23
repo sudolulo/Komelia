@@ -9,7 +9,6 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
@@ -57,7 +56,6 @@ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookEnd
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookStart
 import snd.komga.client.common.KomgaReadingDirection
-import kotlin.concurrent.Volatile
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.time.TimeSource
@@ -174,9 +172,6 @@ class PanelsReaderState(
     /** one monotonically increasing generation per accepted transition, for correlation */
     private val transitionGeneration = MutableStateFlow(0L)
 
-    /** generation-scoped neighbour prefetch; replaced or cancelled whenever its inputs change */
-    @Volatile
-    private var prefetchJob: Job? = null
     // The final animation value can reach the conflated observer after the controller returns to Idle.
     // Suppress only that exact duplicate of the explicit post-lease destination update.
     private val suppressedViewportUpdate = MutableStateFlow<ViewportUpdateSnapshot?>(null)
@@ -206,8 +201,6 @@ class PanelsReaderState(
                 panelTransitionController.onViewportChanged(change) {
                     currentPage.value?.let { page ->
                         updateImageState(page, screenScaleState)
-                        // the viewport this prefetch was keyed on just changed
-                        scheduleAdjacentPrefetch()
                     }
                 }
                 delay(100)
@@ -218,22 +211,18 @@ class PanelsReaderState(
             .drop(1)
             .conflate()
             .onEach {
-                // the fitted geometry changed, so nothing keyed on the old one is reusable
-                cancelAdjacentPrefetch()
                 when (panelTransitionController.phase.value) {
                     PanelTransitionPhase.Animating -> cancelPanelTransition()
                     PanelTransitionPhase.Preparing -> {
                         cancelPanelTransition()
                         currentPage.value?.let { page ->
                             updateImageState(page, screenScaleState)
-                            scheduleAdjacentPrefetch()
                         }
                     }
 
                     PanelTransitionPhase.Idle -> {
                         currentPage.value?.let { page ->
                             updateImageState(page, screenScaleState)
-                            scheduleAdjacentPrefetch()
                         }
                     }
                 }
@@ -464,7 +453,6 @@ class PanelsReaderState(
                 true
             },
             afterReady = {
-                scheduleAdjacentPrefetch()
                 preloadImagesBetween(pageIndex)
             },
         )
@@ -636,9 +624,6 @@ class PanelsReaderState(
             panel = panel,
         ) ?: return false
 
-        // the neighbour prefetch was keyed on the viewport this transition is about to leave
-        cancelAdjacentPrefetch()
-
         val transition = PreparedPanelTransition(
             sourcePage = sourcePage,
             sourceIndex = sourceIndex,
@@ -756,7 +741,6 @@ class PanelsReaderState(
                     suppressedViewportUpdate.value = viewportUpdateSnapshot(page, screenScaleState)
                     updateImageState(page, screenScaleState, force = true)
                 }
-                scheduleAdjacentPrefetch()
             },
         )
     }
@@ -807,60 +791,6 @@ class PanelsReaderState(
         }
     }
 
-    /**
-     * Fills the coverage the immediate reading-direction neighbour needs, then the opposite one,
-     * so a transition the user is about to ask for finds its tiles already rendered.
-     *
-     * Best effort and generation scoped: any page, image or geometry change cancels it, and a
-     * failure is logged rather than surfaced, because nothing on screen depends on it.
-     */
-    private fun scheduleAdjacentPrefetch() {
-        cancelAdjacentPrefetch()
-
-        val page = currentPage.value ?: return
-        val panelData = page.panelData ?: return
-        val image = (page.imageResult as? ReaderImageResult.Success)?.image ?: return
-        val panelIndex = currentPageIndex.value.panel
-        val areaSize = screenScaleState.areaSize.value
-        val targetSize = screenScaleState.targetSize.value.toIntSize()
-        val sourceTransformation = screenScaleState.transformation.value
-
-        val neighbours = listOfNotNull(
-            panelData.panels.getOrNull(panelIndex + 1),
-            panelData.panels.getOrNull(panelIndex - 1),
-        )
-        if (neighbours.isEmpty()) return
-
-        prefetchJob = stateScope.launch {
-            for (neighbour in neighbours) {
-                val target = panelTarget(
-                    panelData = panelData,
-                    areaSize = areaSize,
-                    targetSize = targetSize,
-                    sourceTransformation = sourceTransformation,
-                    panel = neighbour,
-                ) ?: continue
-
-                try {
-                    image.prefetchUpdate(
-                        maxDisplaySize = areaSize,
-                        requirements = listOf(target.requirements.destination),
-                    )
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Throwable) {
-                    logger.warn(e) { "panel neighbour prefetch failed" }
-                    return@launch
-                }
-            }
-        }
-    }
-
-    private fun cancelAdjacentPrefetch() {
-        prefetchJob?.cancel()
-        prefetchJob = null
-    }
-
     private fun consumeSuppressedViewportUpdate(
         page: PanelsPage,
         screenScaleState: ScreenScaleState,
@@ -886,7 +816,6 @@ class PanelsReaderState(
     )
 
     private fun cancelPanelTransition() {
-        cancelAdjacentPrefetch()
         panelTransitionController.cancel()
         screenScaleState.cancelScroll()
     }

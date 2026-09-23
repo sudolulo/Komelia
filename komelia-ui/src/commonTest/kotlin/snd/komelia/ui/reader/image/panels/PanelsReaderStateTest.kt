@@ -63,11 +63,6 @@ class PanelsReaderStateTest {
             return PreparedUpdateLease {}
         }
 
-        override suspend fun prefetchUpdate(
-            maxDisplaySize: IntSize,
-            requirements: List<ViewportRenderRequirement>,
-        ) = Unit
-
         fun releasePreparation() {
             preparation.complete(Unit)
         }

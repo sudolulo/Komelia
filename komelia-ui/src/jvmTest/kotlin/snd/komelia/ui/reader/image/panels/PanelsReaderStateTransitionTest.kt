@@ -14,7 +14,6 @@ import cafe.adriel.voyager.core.annotation.InternalVoyagerApi
 import cafe.adriel.voyager.core.screen.Screen
 import cafe.adriel.voyager.navigator.Navigator
 import cafe.adriel.voyager.navigator.NavigatorDisposeBehavior
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -63,7 +62,6 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
-import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 private val fixtureAreaSize = IntSize(100, 100)
@@ -118,7 +116,6 @@ class PanelsReaderStateTransitionTest {
     fun `painter is never null during a panel transition`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
 
             val samples = CopyOnWriteArrayList<TransitionSample>()
@@ -170,7 +167,6 @@ class PanelsReaderStateTransitionTest {
     fun `transition publishes the page frame before changing zoom or offset`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
             fixture.image.blockPageFramePublication()
             val startTransformation = fixture.screenScaleState.transformation.value
@@ -197,7 +193,6 @@ class PanelsReaderStateTransitionTest {
     fun `transition performs zero native renders before movement starts`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
             val rendersBeforeTransition = fixture.image.nativeRenders
 
@@ -220,7 +215,6 @@ class PanelsReaderStateTransitionTest {
     fun `destination viewport is rendered after movement and published as a second frame`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
 
             fixture.state.nextPanel()
@@ -258,7 +252,6 @@ class PanelsReaderStateTransitionTest {
     fun `an ordinary requestUpdate mid animation does not publish over the page frame`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
 
             fixture.state.nextPanel()
@@ -287,7 +280,6 @@ class PanelsReaderStateTransitionTest {
     fun `cancelling mid animation leaves the page frame published and releases ownership once`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
 
             val samples = CopyOnWriteArrayList<TransitionSample>()
@@ -347,7 +339,6 @@ class PanelsReaderStateTransitionTest {
     fun `a transition before the initial paint takes the waiting fallback`() = runBlocking {
         val fixture = panelFixture(pageFrameAvailable = false)
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
             val startTransformation = fixture.screenScaleState.transformation.value
 
@@ -379,7 +370,6 @@ class PanelsReaderStateTransitionTest {
         val transitionMode = MutableStateFlow(PanelTransitionMode.CLASSIC)
         val fixture = panelFixture(transitionMode = transitionMode, diagnostics = { events += it })
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
 
             fixture.state.nextPanel()
@@ -422,91 +412,6 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `stable panel prefetches preferred next then previous`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            fixture.settle()
-
-            val requests = fixture.image.prefetchRequests.toList()
-            assertEquals(2, requests.size)
-            assertRequirements(listOf(nextDestinationRegion), 3f, requests[0].requirements)
-            assertRequirements(listOf(previousDestinationRegion), 3f, requests[1].requirements)
-            assertTrue(requests.all { it.maxDisplaySize == fixtureAreaSize })
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `page or geometry change invalidates scheduled prefetch`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            fixture.settle()
-            fixture.image.blockPrefetch()
-            fixture.image.prefetchRequests.clear()
-            fixture.screenScaleState.setOffset(Offset(2f, 2f))
-            withTimeout(2_000) {
-                while (fixture.image.prefetchRequests.isEmpty()) delay(10)
-            }
-
-            fixture.screenScaleState.setAreaSize(IntSize(120, 120))
-
-            withTimeout(2_000) {
-                while (fixture.image.prefetchCancellations == 0) delay(10)
-            }
-            withTimeout(2_000) {
-                while (fixture.image.prefetchRequests.none { it.maxDisplaySize == IntSize(120, 120) }) {
-                    delay(10)
-                }
-            }
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `prefetch failure does not break current reader`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            fixture.image.prefetchFailure = IllegalStateException("prefetch render failed")
-            fixture.awaitViewportObserver()
-            withTimeout(2_000) {
-                while (fixture.image.prefetchRequests.isEmpty()) delay(10)
-            }
-
-            fixture.state.nextPanel()
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
-            }
-
-            assertNull(fixture.image.error.value)
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `blocked prefetch does not delay a panel transition`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            fixture.image.blockPrefetch()
-            fixture.awaitViewportObserver()
-            withTimeout(2_000) {
-                while (fixture.image.prefetchRequests.isEmpty()) delay(10)
-            }
-
-            fixture.state.nextPanel()
-
-            // the transition publishes and moves while the prefetch is still suspended
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
-            }
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
     fun `warm snappy transition emits one correlated diagnostic event`() = runBlocking {
         val events = CopyOnWriteArrayList<PanelTransitionEvent>()
         val fixture = panelFixture(diagnostics = { events += it })
@@ -541,7 +446,6 @@ class PanelsReaderStateTransitionTest {
         val events = CopyOnWriteArrayList<PanelTransitionEvent>()
         val fixture = panelFixture(pageFrameAvailable = false, diagnostics = { events += it })
         try {
-            fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
 
             fixture.state.nextPanel()
@@ -623,19 +527,10 @@ private class PanelFixture(
         last
     }
 
-    /**
-     * Leaves the reader on a stable panel with both neighbours prefetched. The settled viewport
-     * offset of (1, 1) rounds to the same fitted regions as offset zero, so the recorded
-     * requirements are the ones the tests assert on.
-     */
+    /** Leaves the reader on a stable panel with its viewport observers settled. */
     suspend fun settle() {
         awaitViewportObserver()
-        delay(400)
-        image.prefetchRequests.clear()
         screenScaleState.setOffset(Offset(1f, 1f))
-        withTimeout(2_000) {
-            while (image.prefetchRequests.size < 2) delay(10)
-        }
         delay(150)
         image.viewportUpdates.clear()
         image.publications.clear()
@@ -685,11 +580,6 @@ private data class ImageUpdate(
     val visibleDisplaySize: IntRect,
 )
 
-private data class PrefetchRequest(
-    val maxDisplaySize: IntSize,
-    val requirements: List<ViewportRenderRequirement>,
-)
-
 private data class PrepareRequest(
     val maxDisplaySize: IntSize,
     val requirements: List<ViewportRenderRequirement>,
@@ -722,37 +612,26 @@ private class ControlledReaderImage(
     val pageFramePublicationStarted = CompletableDeferred<Unit>()
 
     val viewportUpdates = Collections.synchronizedList(mutableListOf<ImageUpdate>())
-    val prefetchRequests = CopyOnWriteArrayList<PrefetchRequest>()
     val prepareRequests = CopyOnWriteArrayList<PrepareRequest>()
     val publications = CopyOnWriteArrayList<Publication>()
 
     private val renderedCoverage = Collections.synchronizedSet(mutableSetOf<ViewportRenderRequirement>())
     private val renders = AtomicInteger()
-    private val prefetchCancels = AtomicInteger()
     private val pageFramePublishCount = AtomicInteger()
     private val pageFrameReleases = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
-    private val prefetchGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
     private val pageFrameGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
     private val pageFramePainter = FixturePainter("page-frame")
 
     @Volatile
     var pageFrameAvailable: Boolean = pageFrameAvailable
 
-    @Volatile
-    var prefetchFailure: Throwable? = null
-
     val nativeRenders: Int get() = renders.get()
-    val prefetchCancellations: Int get() = prefetchCancels.get()
     val pageFramePublications: Int get() = pageFramePublishCount.get()
     val pageFrameLeaseReleases: Int get() = pageFrameReleases.get()
 
     /** the fitted display region the currently installed frame can draw */
     val installedCoverage: IntRect? get() = coverage.get()
-
-    fun blockPrefetch() {
-        prefetchGate.set(CompletableDeferred())
-    }
 
     fun blockPageFramePublication() {
         pageFrameGate.set(CompletableDeferred())
@@ -809,21 +688,6 @@ private class ControlledReaderImage(
         }
         install(Publication.TILED, installed, FixturePainter("tiled $installed"))
         return PreparedUpdateLease {}
-    }
-
-    override suspend fun prefetchUpdate(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-    ) {
-        prefetchRequests += PrefetchRequest(maxDisplaySize, requirements)
-        try {
-            prefetchGate.get().await()
-        } catch (e: CancellationException) {
-            prefetchCancels.incrementAndGet()
-            throw e
-        }
-        prefetchFailure?.let { throw it }
-        render(requirements)
     }
 
     private fun install(publication: Publication, region: IntRect, frame: Painter) {

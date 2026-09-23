@@ -64,7 +64,6 @@ internal fun requiredTileRenderSize(
 
 /**
  * Rounds a source extent to the exact output extent handed to the native renderer.
- * The same helper feeds pixel admission, so a reservation can never undercount the allocation.
  */
 internal fun checkedRenderDimension(sourceExtent: Int, scaleFactor: Double): Int {
     require(sourceExtent > 0) { "source extent must be positive, got $sourceExtent" }

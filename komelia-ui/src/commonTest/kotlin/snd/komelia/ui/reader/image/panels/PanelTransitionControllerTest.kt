@@ -351,11 +351,6 @@ private class TestReaderImage : ReaderImage {
         viewportUpdates++
     }
 
-    override suspend fun prefetchUpdate(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-    ) = Unit
-
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         requirements: List<ViewportRenderRequirement>,

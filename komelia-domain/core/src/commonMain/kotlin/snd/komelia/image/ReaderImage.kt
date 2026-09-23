@@ -60,18 +60,6 @@ interface ReaderImage : AutoCloseable {
      */
     suspend fun publishPageFrame(): PreparedUpdateLease?
 
-    /**
-     * Populate reusable tile coverage for [requirements] without publishing it.
-     *
-     * Best effort and bounded: it never replaces the visible painter, never changes the size
-     * flows, never acquires a preparation lease, yields the processing lane to demand work at
-     * every tile boundary, and stops rather than pushing the retained working set over budget.
-     */
-    suspend fun prefetchUpdate(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-    )
-
     /** normal-viewport convenience path over [prepareUpdate] with a single requirement */
     suspend fun prepareUpdate(
         maxDisplaySize: IntSize,

@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
@@ -29,8 +28,6 @@ import org.jetbrains.skia.Image
 import org.jetbrains.skia.ImageInfo
 import snd.komelia.image.processing.ImageProcessingPipeline
 import snd.komelia.image.processing.ProcessingStep
-import java.util.Collections
-import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -58,53 +55,13 @@ private val highDensityTile = IntSize(500, 500)
 private val narrowPanel = IntRect(1_000, 1_000, 1_400, 1_400)
 private val widePanel = IntRect(200, 200, 2_800, 2_800)
 
-// the two neighbour corridors below expand into disjoint source tile ranges:
-// nearNeighbor covers source 0..1536 and farNeighbor covers source 2560..4096
 private val nearNeighbor = IntRect(0, 0, 800, 800)
-private val farNeighbor = IntRect(2_400, 2_400, 3_200, 3_200)
-private const val nearNeighborSourceEnd = 1_536
-private const val farNeighborSourceStart = 2_560
-private const val neighborTileCount = 36
 
-// the whole fitted page; at zoom 2.5 it needs 256 tiles of 500x500 (64M pixels, inside the
-// 81.92M hard peak) and at zoom 3 it needs 256 tiles of 600x600 (92.16M pixels, over the peak)
-private val fullPagePanel = IntRect(0, 0, 3_200, 3_200)
-private const val fullPageTileCount = 256
-private val overBudgetTile = IntSize(600, 600)
-
-// the visibility window adds half the region on every side, so this expands to display
-// 500..2500, which is 11 of the 200 pixel tile columns; at zoom 3 that is 121 tiles of 600x600
-// (43.56M pixels, inside the 81.92M hard peak on its own) but it cannot also fit the 64M pixels
-// a published full page frame keeps live
-private val midPanel = IntRect(1_000, 1_000, 2_000, 2_000)
-
-// expands to source x 0..4096 and y 0..2560, so it is disjoint from farNeighbor's source tiles
-// and at zoom 2.5 it needs 160 tiles of 500x500, which is 40M pixels against a 30.72M normal budget
-private val evictionCorridor = IntRect(800, 500, 2_400, 1_500)
-private const val evictionCorridorTileCount = 160
-
-private val screenPixels = screenSize.width.toLong() * screenSize.height
-private val normalBudgetPixels = 3 * screenPixels
-private val hardPeakPixels = 8 * screenPixels
-
-// a 1600x1600 screen fits the 4096 pixel page at 0.390625, and at zoom 3 that page tiles into
-// an 8x8 grid of 512 pixel source tiles, each rendering to 600x600 native pixels. The whole grid
-// is therefore 23.04M pixels against a 20.48M hard peak and a 7.68M normal working set, which is
-// small enough to state eviction outcomes as exact tile counts.
 private val smallScreen = IntSize(1_600, 1_600)
 
 // expands to display 1400..1600 on both axes: the last tile of the grid, and so the last tile
 // any pass renders
 private val lastTilePanel = IntRect(1_450, 1_450, 1_550, 1_550)
-
-// expands to display 0..200 on both axes: the first tile of the grid
-private val firstTilePanel = IntRect(50, 50, 150, 150)
-
-// expands to display y 200..1600 by x 0..1600: every row but the first, which is 56 tiles
-private val allButFirstRowPanel = IntRect(400, 600, 1_200, 1_400)
-
-// expands to display y 1400..1600 by x 0..1600: the last row, which is 8 tiles
-private val lastRowPanel = IntRect(400, 1_450, 1_200, 1_550)
 
 // expands to the whole fitted page
 private val wholeSmallPagePanel = IntRect(400, 400, 1_200, 1_200)
@@ -138,11 +95,7 @@ internal interface PreparationFixture : ReaderImage {
     val renderedTiles: List<RenderedTile>
     val closedImages: List<RenderImage>
     val publishedTiles: List<List<RenderedTile>>
-    val retainedWorkingSet: StateFlow<Map<TilingReaderImage.TileCacheKey, TilingReaderImage.RetainedTile>>
     val hasRetainedPageFrame: Boolean
-
-    /** highest number of native bitmap pixels alive at the same time across the whole run */
-    val peakLiveNativePixels: Long
     fun replacePageImage()
     suspend fun awaitPageReplacement()
     fun releasePageReplacement()
@@ -163,6 +116,13 @@ internal interface PreparationFixture : ReaderImage {
 }
 
 class TilingReaderImagePreparationTest {
+    @Test
+    fun `destination only rendering stays within the expected viewport expansion`() = runTest {
+        // visibilityWindowFor expands by half of each dimension on each axis: 1.5W x 1.5H = 2.25x
+        val rendered = renderDestinationViewport(displaySize = IntSize(1192, 1843), zoom = 3f)
+        assertTrue(rendered.pixels <= (2.25 * 1192 * 1843 * 3 * 3).toLong())
+    }
+
     @Test
     fun `prepare update does not complete before matching painter is installed`() = runTest {
         val image = preparationFixture()
@@ -557,262 +517,6 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
-    fun `prefetch does not change painter current size or lease state`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
-            val painterBefore = image.painter.value
-            val currentSizeBefore = image.currentSize.value
-            val displaySizeBefore = image.displaySize.value
-            val coverageBefore = image.currentTileCoverage
-            val publicationsBefore = image.painterPublications
-            val renderedBefore = image.renderedTiles.size
-
-            // a different zoom than the published frame, so any leak into the size flows shows
-            image.prefetchUpdate(screenSize, listOf(requirement(farNeighbor, 2.5f)))
-
-            assertEquals(
-                renderedBefore + neighborTileCount,
-                image.renderedTiles.size,
-                "prefetch must render the missing neighbour coverage",
-            )
-            assertSame(painterBefore, image.painter.value, "prefetch must not replace the painter")
-            assertEquals(currentSizeBefore, image.currentSize.value)
-            assertEquals(displaySizeBefore, image.displaySize.value)
-            assertEquals(coverageBefore, image.currentTileCoverage)
-            assertEquals(publicationsBefore, image.painterPublications)
-            assertNull(image.error.value)
-
-            // no lease may be outstanding and the published frame must still be complete
-            val renderedAfterPrefetch = image.renderedTiles.size
-            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
-            assertEquals(renderedAfterPrefetch, image.renderedTiles.size)
-            assertEquals(publicationsBefore, image.painterPublications)
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `prefetch stops before exceeding normal or hard budget`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
-            val demandTiles = image.renderedTiles.size
-
-            image.prefetchUpdate(screenSize, listOf(requirement(widePanel, 2.5f)))
-            val prefetched = image.renderedTiles.drop(demandTiles)
-
-            assertTrue(prefetched.isNotEmpty(), "prefetch must fill what the budget allows")
-            assertTrue(prefetched.all { it.renderSize == highDensityTile })
-            // the whole page needs 16x16 tiles at 500x500, which is 64M pixels against a
-            // 30.72M normal working set
-            assertTrue(
-                prefetched.size < 256,
-                "prefetch must stop inside the normal budget, rendered ${prefetched.size} of 256 tiles",
-            )
-            val maxTilesInNormalBudget = normalBudgetPixels / (highDensityTile.width * highDensityTile.height)
-            assertTrue(
-                prefetched.size <= maxTilesInNormalBudget,
-                "${prefetched.size} retained tiles exceed the $maxTilesInNormalBudget tile normal budget",
-            )
-            assertTrue(image.peakLiveNativePixels <= hardPeakPixels)
-            assertNull(image.error.value, "a budget stop is not renderer error state")
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `preferred neighbor fills before opposite neighbor`() = runTest {
-        val image = preparationFixture()
-        try {
-            val preferred = launch { image.prefetchUpdate(screenSize, listOf(requirement(nearNeighbor, 2f))) }
-            val opposite = launch { image.prefetchUpdate(screenSize, listOf(requirement(farNeighbor, 2f))) }
-            joinAll(preferred, opposite)
-
-            val tiles = image.renderedTiles
-            val preferredTiles = tiles.filter { it.sourceBounds.right <= nearNeighborSourceEnd }
-            val oppositeTiles = tiles.filter { it.sourceBounds.left >= farNeighborSourceStart }
-            assertEquals(neighborTileCount, preferredTiles.size)
-            assertEquals(neighborTileCount, oppositeTiles.size)
-
-            val lastPreferred = tiles.indexOfLast { it.sourceBounds.right <= nearNeighborSourceEnd }
-            val firstOpposite = tiles.indexOfFirst { it.sourceBounds.left >= farNeighborSourceStart }
-            assertTrue(
-                lastPreferred < firstOpposite,
-                "the preferred neighbour must be complete before the opposite one starts",
-            )
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `demand may evict prefetch but not frame or lease ownership`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
-            val demandTiles = image.renderedTiles.size
-
-            image.prefetchUpdate(screenSize, listOf(requirement(farNeighbor, 2f)))
-            val prefetched = image.renderedTiles.drop(demandTiles)
-            assertEquals(neighborTileCount, prefetched.size)
-            assertTrue(prefetched.none { tile -> image.closedImages.any { it === tile.renderImage } })
-
-            // this corridor needs 40M pixels of its own coverage and never touches the
-            // prefetched source tiles, so only eviction can bring the working set back down
-            val lease = image.prepareUpdate(screenSize, listOf(requirement(evictionCorridor, 2.5f)))
-            try {
-                assertTrue(
-                    prefetched.all { tile -> image.closedImages.count { it === tile.renderImage } == 1 },
-                    "an over-budget demand pass must evict prefetched coverage exactly once",
-                )
-                val published = image.publishedTiles.last()
-                assertEquals(evictionCorridorTileCount, published.size)
-                assertTrue(
-                    published.none { tile -> image.closedImages.any { it === tile.renderImage } },
-                    "eviction must never release a tile the published frame and its lease own",
-                )
-            } finally {
-                lease.close()
-            }
-
-            // the published coverage kept its working-set entries, so repeating the same
-            // corridor needs no native render at all
-            val renderedAfterEviction = image.renderedTiles.size
-            image.prepareUpdate(screenSize, listOf(requirement(evictionCorridor, 2.5f))).close()
-            assertEquals(
-                renderedAfterEviction,
-                image.renderedTiles.size,
-                "eviction must not drop the published frame's own working-set coverage",
-            )
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `interleaved demand and prefetch reservations stay below hard peak`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
-            // fill the retained working set to its normal budget before interleaving
-            image.prefetchUpdate(screenSize, listOf(requirement(widePanel, 2.5f)))
-            assertTrue(image.renderedTiles.size > 100)
-
-            val prefetch = launch { image.prefetchUpdate(screenSize, listOf(requirement(farNeighbor, 2.5f))) }
-            val demand = launch {
-                image.prepareUpdate(screenSize, listOf(requirement(evictionCorridor, 2.5f))).close()
-            }
-            joinAll(prefetch, demand)
-
-            assertTrue(image.peakLiveNativePixels > 0)
-            assertTrue(
-                image.peakLiveNativePixels <= hardPeakPixels,
-                "peak live pixels ${image.peakLiveNativePixels} exceeded the hard peak $hardPeakPixels",
-            )
-            assertNull(image.error.value)
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `demand pass publishes the prefetched coverage it adopts as demand class`() = runTest {
-        val image = preparationFixture()
-        // every working set the renderer publishes, captured on the publishing thread with the
-        // classification each entry carried at that moment, so a demotion applied in place after
-        // publication cannot be mistaken for a published one
-        val published = CopyOnWriteArrayList<List<Boolean>>()
-        val observer = launch(Dispatchers.Unconfined) {
-            image.retainedWorkingSet.collect { working -> published += working.values.map { it.isPrefetch } }
-        }
-        try {
-            image.releaseRendering()
-            image.prefetchUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f)))
-            assertEquals(1, image.retainedWorkingSet.value.size)
-
-            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
-
-            assertTrue(
-                published.any { working -> working.isNotEmpty() && working.none { it } },
-                "the demotion to demand class must reach collectors as a published working set, " +
-                    "got $published",
-            )
-        } finally {
-            observer.cancel()
-            image.close()
-        }
-    }
-
-    @Test
-    fun `adopted coverage survives an over budget pass that evicts genuine prefetch`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.releaseRendering()
-            // prefetched and then published by a demand pass, which adopts it as demand class.
-            // It is the last tile of the grid, so the pass below reaches it only after it has
-            // already run out of hard peak capacity.
-            image.prefetchUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f)))
-            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
-            val adopted = image.renderedTiles.single()
-
-            // genuine prefetch that the pass below does not cover, so it may be evicted
-            image.prefetchUpdate(smallScreen, listOf(requirement(firstTilePanel, 3f)))
-            val evictable = image.renderedTiles.last()
-            assertEquals(2, image.renderedTiles.size)
-
-            // 56 covered tiles against a hard peak that already holds both retained tiles: the
-            // 55th render is admissible only after prefetched coverage gives its pixels back
-            image.prepareUpdate(smallScreen, listOf(requirement(allButFirstRowPanel, 3f))).close()
-
-            assertEquals(
-                1,
-                image.closedImages.count { it === evictable.renderImage },
-                "the over budget pass must take its pixels back from genuine prefetch coverage",
-            )
-            assertTrue(
-                image.closedImages.none { it === adopted.renderImage },
-                "eviction must not release coverage the current frame adopted as demand class",
-            )
-            assertEquals(
-                57,
-                image.renderedTiles.size,
-                "the adopted tile must be reused, not evicted and rendered a second time",
-            )
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `normal budget eviction stops as soon as the working set fits again`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.releaseRendering()
-            // prefetch fills the 7_680_000 pixel normal working set: 21 tiles of 360_000, since
-            // a 22nd would cross it
-            image.prefetchUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 3f)))
-            val prefetched = image.renderedTiles.toList()
-            assertEquals(21, prefetched.size)
-
-            // the last row is 8 tiles the prefetch never reached, so the working set goes to 29
-            // and exactly 8 entries have to go to get back to 21
-            image.prepareUpdate(smallScreen, listOf(requirement(lastRowPanel, 3f))).close()
-
-            assertEquals(29 - 8, image.retainedWorkingSet.value.size)
-            assertEquals(
-                prefetched.takeLast(8),
-                prefetched.filter { tile -> image.closedImages.any { it === tile.renderImage } },
-                "eviction must take the newest prefetched coverage and stop at the budget",
-            )
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
     fun `full resize output is retained after tiled rendering replaces it`() = runTest {
         val image = preparationFixture()
         try {
@@ -1058,18 +762,17 @@ class TilingReaderImagePreparationTest {
     fun `reader close drains queues and releases every ownership once`() = runTest {
         val image = preparationFixture()
         image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
-        image.prefetchUpdate(screenSize, listOf(requirement(farNeighbor, 2f)))
 
         image.blockPainterPublication()
         val barrier = async { image.prepareUpdate(screenSize, listOf(requirement(nearNeighbor, 2f))) }
         image.awaitPainterPublicationAttempts(2)
-        val queuedPrefetch = async { image.prefetchUpdate(screenSize, listOf(requirement(widePanel, 2f))) }
+        val queuedDemand = async { image.prepareUpdate(screenSize, listOf(requirement(widePanel, 2f))) }
         yield()
 
         image.close()
 
-        queuedPrefetch.await()
         assertFailsWith<CancellationException> { barrier.await() }
+        assertFailsWith<CancellationException> { queuedDemand.await() }
         assertTrue(image.tileCloseCounts.isNotEmpty())
         assertTrue(
             image.tileCloseCounts.all { it == 1 },
@@ -1078,11 +781,34 @@ class TilingReaderImagePreparationTest {
     }
 }
 
+private data class RenderedViewport(val pixels: Long)
+
+private suspend fun renderDestinationViewport(displaySize: IntSize, zoom: Float): RenderedViewport {
+    val image = preparationFixture(imageSize = displaySize)
+    val viewportWidth = (displaySize.width / zoom).roundToInt().coerceAtLeast(1)
+    val viewportHeight = (displaySize.height / zoom).roundToInt().coerceAtLeast(1)
+    val left = (displaySize.width - viewportWidth) / 2
+    val top = (displaySize.height - viewportHeight) / 2
+    val destination = IntRect(left, top, left + viewportWidth, top + viewportHeight)
+
+    return try {
+        image.releaseRendering()
+        image.prepareUpdate(displaySize, listOf(requirement(destination, zoom))).close()
+        RenderedViewport(
+            pixels = image.renderedTiles.sumOf { tile ->
+                tile.renderSize.width.toLong() * tile.renderSize.height
+            }
+        )
+    } finally {
+        image.close()
+    }
+}
+
 private fun IntRect.containsRect(other: IntRect): Boolean =
     left <= other.left && top <= other.top && right >= other.right && bottom >= other.bottom
 
-private fun preparationFixture(): PreparationFixture {
-    return DelegatingPreparationFixture(ControllableTilingReaderImage())
+private fun preparationFixture(imageSize: IntSize = IntSize(4_096, 4_096)): PreparationFixture {
+    return DelegatingPreparationFixture(ControllableTilingReaderImage(imageSize))
 }
 
 private class DelegatingPreparationFixture(
@@ -1104,9 +830,6 @@ private class DelegatingPreparationFixture(
     override val renderedTiles: List<RenderedTile> get() = delegate.renderedTiles
     override val closedImages: List<RenderImage> get() = delegate.closedRenderImages
     override val publishedTiles: List<List<RenderedTile>> get() = delegate.publishedTiles
-    override val peakLiveNativePixels: Long get() = delegate.peakLiveNativePixels
-    override val retainedWorkingSet: StateFlow<Map<TilingReaderImage.TileCacheKey, TilingReaderImage.RetainedTile>>
-        get() = delegate.retainedWorkingSet
     override val hasRetainedPageFrame: Boolean get() = delegate.hasRetainedPageFrame
     override val barrierCompletionCounts: Map<Long, Int>
         get() = completions.mapValues { (_, count) ->
@@ -1116,11 +839,6 @@ private class DelegatingPreparationFixture(
     override fun requestUpdate(maxDisplaySize: IntSize, zoomFactor: Float, visibleDisplaySize: IntRect) {
         delegate.requestUpdate(maxDisplaySize, zoomFactor, visibleDisplaySize)
     }
-
-    override suspend fun prefetchUpdate(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-    ) = delegate.prefetchUpdate(maxDisplaySize, requirements)
 
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
@@ -1166,9 +884,10 @@ private class DelegatingPreparationFixture(
 private class ControllableTilingReaderImage private constructor(
     private val linearLight: MutableStateFlow<Boolean>,
     private val processingPipeline: ImageProcessingPipeline,
+    fixtureImage: KomeliaImage,
 ) : TilingReaderImage(
     imageSource = ImageSource.MemorySource(byteArrayOf(0)),
-    imageDecoder = FixtureDecoder,
+    imageDecoder = FixtureDecoder(fixtureImage),
     processingPipeline = processingPipeline,
     stretchImages = MutableStateFlow(false),
     upsamplingMode = MutableStateFlow(UpsamplingMode.BILINEAR),
@@ -1176,7 +895,11 @@ private class ControllableTilingReaderImage private constructor(
     linearLightDownSampling = linearLight,
     pageId = ReaderImage.PageId("preparation", 1),
 ) {
-    constructor() : this(MutableStateFlow(false), ImageProcessingPipeline())
+    constructor(imageSize: IntSize) : this(
+        MutableStateFlow(false),
+        ImageProcessingPipeline(),
+        FixtureImage(imageSize.width, imageSize.height),
+    )
 
     private val publicationCount = MutableStateFlow(0)
     private val publicationAttemptCount = MutableStateFlow(0)
@@ -1195,9 +918,6 @@ private class ControllableTilingReaderImage private constructor(
     private val remainingSuccesses = AtomicLong(0)
     private val completedBarrierReuse = AtomicBoolean(false)
     private val pageReplacement = AtomicReference<PageReplacementStep?>(null)
-    private val pixelsByImage = Collections.synchronizedMap(IdentityHashMap<RenderImage, Long>())
-    private val liveNativePixels = AtomicLong(0)
-    private val peakNativePixels = AtomicLong(0)
 
     val painterPublications: Int get() = publicationCount.value
     val currentTileCoverage: IntRect? get() = installedTileCoverage.get()
@@ -1205,7 +925,6 @@ private class ControllableTilingReaderImage private constructor(
     val renderedTiles: List<RenderedTile> get() = generatedTiles.toList()
     val closedRenderImages: List<RenderImage> get() = closedImages.toList()
     val publishedTiles: List<List<RenderedTile>> get() = publishedFrames.toList()
-    val peakLiveNativePixels: Long get() = peakNativePixels.get()
     val tileCloseCounts: List<Int>
         get() = generatedTiles.map { generated -> closedImages.count { it === generated.renderImage } }
     val reusedCompletedBarrier: Boolean get() = completedBarrierReuse.get()
@@ -1298,7 +1017,6 @@ private class ControllableTilingReaderImage private constructor(
 
     override fun closeRenderImage(renderImage: RenderImage) {
         closedImages += renderImage
-        pixelsByImage.remove(renderImage)?.let { liveNativePixels.addAndGet(-it) }
         runCatching { renderImage.close() }
         closedImageCount.update { it + 1 }
     }
@@ -1378,10 +1096,6 @@ private class ControllableTilingReaderImage private constructor(
     ): RenderImage {
         val image = renderImage()
         generatedTiles += RenderedTile(sourceBounds, IntSize(scaleWidth, scaleHeight), image)
-        val pixels = scaleWidth.toLong() * scaleHeight
-        pixelsByImage[image] = pixels
-        val live = liveNativePixels.addAndGet(pixels)
-        peakNativePixels.getAndUpdate { peak -> maxOf(peak, live) }
         return image
     }
 
@@ -1419,9 +1133,9 @@ private class FixturePainter : TilingReaderImage.TiledPainter() {
     override fun withSamplingMode(upsamplingMode: UpsamplingMode): TilingReaderImage.TiledPainter = this
 }
 
-private object FixtureDecoder : KomeliaImageDecoder {
-    override suspend fun decode(encoded: ByteArray, nPages: Int?): KomeliaImage = FixtureImage
-    override suspend fun decodeFromFile(path: String, nPages: Int?): KomeliaImage = FixtureImage
+private class FixtureDecoder(private val image: KomeliaImage) : KomeliaImageDecoder {
+    override suspend fun decode(encoded: ByteArray, nPages: Int?): KomeliaImage = image
+    override suspend fun decodeFromFile(path: String, nPages: Int?): KomeliaImage = image
 
     override suspend fun decodeAndResize(
         encoded: ByteArray,
@@ -1429,7 +1143,7 @@ private object FixtureDecoder : KomeliaImageDecoder {
         scaleHeight: Int,
         crop: Boolean,
         nPages: Int?,
-    ): KomeliaImage = FixtureImage
+    ): KomeliaImage = image
 
     override suspend fun decodeAndResize(
         path: String,
@@ -1437,17 +1151,18 @@ private object FixtureDecoder : KomeliaImageDecoder {
         scaleHeight: Int,
         crop: Boolean,
         nPages: Int?,
-    ): KomeliaImage = FixtureImage
+    ): KomeliaImage = image
 }
 
-private object FixtureImage : KomeliaImage {
-    override val width = 4_096
-    override val height = 4_096
+private class FixtureImage(
+    override val width: Int,
+    override val height: Int,
+) : KomeliaImage {
     override val bands = 4
     override val type = ImageFormat.RGBA_8888
     override val pagesLoaded = 1
     override val pagesTotal = 1
-    override val pageHeight = 4_096
+    override val pageHeight = height
     override val pageDelays: IntArray? = null
 
     override suspend fun extractArea(rect: ImageRect): KomeliaImage = this
