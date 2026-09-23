@@ -85,6 +85,28 @@ private val screenPixels = screenSize.width.toLong() * screenSize.height
 private val normalBudgetPixels = 3 * screenPixels
 private val hardPeakPixels = 8 * screenPixels
 
+// a 1600x1600 screen fits the 4096 pixel page at 0.390625, and at zoom 3 that page tiles into
+// an 8x8 grid of 512 pixel source tiles, each rendering to 600x600 native pixels. The whole grid
+// is therefore 23.04M pixels against a 20.48M hard peak and a 7.68M normal working set, which is
+// small enough to state eviction outcomes as exact tile counts.
+private val smallScreen = IntSize(1_600, 1_600)
+
+// expands to display 1400..1600 on both axes: the last tile of the grid, and so the last tile
+// any pass renders
+private val lastTilePanel = IntRect(1_450, 1_450, 1_550, 1_550)
+
+// expands to display 0..200 on both axes: the first tile of the grid
+private val firstTilePanel = IntRect(50, 50, 150, 150)
+
+// expands to display y 200..1600 by x 0..1600: every row but the first, which is 56 tiles
+private val allButFirstRowPanel = IntRect(400, 600, 1_200, 1_400)
+
+// expands to display y 1400..1600 by x 0..1600: the last row, which is 8 tiles
+private val lastRowPanel = IntRect(400, 1_450, 1_200, 1_550)
+
+// expands to the whole fitted page
+private val wholeSmallPagePanel = IntRect(400, 400, 1_200, 1_200)
+
 private fun movingViewport(index: Int): IntRect {
     val offset = index * 16
     return IntRect(1_900 + offset, 1_900, 2_700 + offset, 2_700)
@@ -108,6 +130,7 @@ internal interface PreparationFixture : ReaderImage {
     val renderedTiles: List<RenderedTile>
     val closedImages: List<RenderImage>
     val publishedTiles: List<List<RenderedTile>>
+    val retainedWorkingSet: StateFlow<Map<TilingReaderImage.TileCacheKey, TilingReaderImage.RetainedTile>>
 
     /** highest number of native bitmap pixels alive at the same time across the whole run */
     val peakLiveNativePixels: Long
@@ -808,6 +831,50 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
+    fun `animated fallback withdraws its refusal before the endpoint attempt`() = runTest {
+        val image = preparationFixture()
+        // every value the error flow publishes, captured on the publishing thread itself, so an
+        // error state left standing across the fallback cannot hide behind a later clear
+        val published = CopyOnWriteArrayList<Throwable?>()
+        val observer = launch(Dispatchers.Unconfined) { image.error.collect { published += it } }
+        try {
+            image.releaseRendering()
+            // the published frame keeps 64M native pixels live, so the animated attempt passes
+            // its own admission estimate and then runs out of hard peak capacity mid render
+            image.prepareUpdate(screenSize, listOf(requirement(fullPagePanel, 2.5f))).close()
+
+            image.blockPainterPublication()
+            val transition = async {
+                image.prepareTransitionUpdate(
+                    maxDisplaySize = screenSize,
+                    animatedRequirements = listOf(requirement(midPanel, 3f)),
+                    endpointRequirements = listOf(requirement(narrowPanel, 3f)),
+                )
+            }
+            // the endpoint frame is parked on publication, so this observes the renderer part
+            // way through the fallback rather than after it has settled
+            image.awaitPainterPublicationAttempts(2)
+            val publishedDuringEndpoint = published.size
+
+            assertNull(
+                image.error.value,
+                "the endpoint attempt must not run while the refused animated attempt's error is set",
+            )
+
+            image.releasePainterPublication()
+            val coverage = transition.await()
+            assertIs<PreparedTransitionCoverage.EndpointOnly>(coverage).lease.close()
+            assertTrue(
+                published.drop(publishedDuringEndpoint - 1).all { it == null },
+                "the fallback must publish no error state from the endpoint attempt on, got $published",
+            )
+        } finally {
+            observer.cancel()
+            image.close()
+        }
+    }
+
+    @Test
     fun `warm transition reports zero rendered tiles`() = runTest {
         val image = preparationFixture()
         try {
@@ -857,6 +924,100 @@ class TilingReaderImagePreparationTest {
             assertEquals(0, stats.reusedTiles)
             assertTrue(stats.uniqueRetainedPixels > 0)
             coverage.lease.close()
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `demand pass publishes the prefetched coverage it adopts as demand class`() = runTest {
+        val image = preparationFixture()
+        // every working set the renderer publishes, captured on the publishing thread with the
+        // classification each entry carried at that moment, so a demotion applied in place after
+        // publication cannot be mistaken for a published one
+        val published = CopyOnWriteArrayList<List<Boolean>>()
+        val observer = launch(Dispatchers.Unconfined) {
+            image.retainedWorkingSet.collect { working -> published += working.values.map { it.isPrefetch } }
+        }
+        try {
+            image.releaseRendering()
+            image.prefetchUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f)))
+            assertEquals(1, image.retainedWorkingSet.value.size)
+
+            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
+
+            assertTrue(
+                published.any { working -> working.isNotEmpty() && working.none { it } },
+                "the demotion to demand class must reach collectors as a published working set, " +
+                    "got $published",
+            )
+        } finally {
+            observer.cancel()
+            image.close()
+        }
+    }
+
+    @Test
+    fun `adopted coverage survives an over budget pass that evicts genuine prefetch`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            // prefetched and then published by a demand pass, which adopts it as demand class.
+            // It is the last tile of the grid, so the pass below reaches it only after it has
+            // already run out of hard peak capacity.
+            image.prefetchUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f)))
+            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
+            val adopted = image.renderedTiles.single()
+
+            // genuine prefetch that the pass below does not cover, so it may be evicted
+            image.prefetchUpdate(smallScreen, listOf(requirement(firstTilePanel, 3f)))
+            val evictable = image.renderedTiles.last()
+            assertEquals(2, image.renderedTiles.size)
+
+            // 56 covered tiles against a hard peak that already holds both retained tiles: the
+            // 55th render is admissible only after prefetched coverage gives its pixels back
+            image.prepareUpdate(smallScreen, listOf(requirement(allButFirstRowPanel, 3f))).close()
+
+            assertEquals(
+                1,
+                image.closedImages.count { it === evictable.renderImage },
+                "the over budget pass must take its pixels back from genuine prefetch coverage",
+            )
+            assertTrue(
+                image.closedImages.none { it === adopted.renderImage },
+                "eviction must not release coverage the current frame adopted as demand class",
+            )
+            assertEquals(
+                57,
+                image.renderedTiles.size,
+                "the adopted tile must be reused, not evicted and rendered a second time",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `normal budget eviction stops as soon as the working set fits again`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            // prefetch fills the 7_680_000 pixel normal working set: 21 tiles of 360_000, since
+            // a 22nd would cross it
+            image.prefetchUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 3f)))
+            val prefetched = image.renderedTiles.toList()
+            assertEquals(21, prefetched.size)
+
+            // the last row is 8 tiles the prefetch never reached, so the working set goes to 29
+            // and exactly 8 entries have to go to get back to 21
+            image.prepareUpdate(smallScreen, listOf(requirement(lastRowPanel, 3f))).close()
+
+            assertEquals(29 - 8, image.retainedWorkingSet.value.size)
+            assertEquals(
+                prefetched.takeLast(8),
+                prefetched.filter { tile -> image.closedImages.any { it === tile.renderImage } },
+                "eviction must take the newest prefetched coverage and stop at the budget",
+            )
         } finally {
             image.close()
         }
@@ -913,6 +1074,8 @@ private class DelegatingPreparationFixture(
     override val closedImages: List<RenderImage> get() = delegate.closedRenderImages
     override val publishedTiles: List<List<RenderedTile>> get() = delegate.publishedTiles
     override val peakLiveNativePixels: Long get() = delegate.peakLiveNativePixels
+    override val retainedWorkingSet: StateFlow<Map<TilingReaderImage.TileCacheKey, TilingReaderImage.RetainedTile>>
+        get() = delegate.retainedWorkingSet
     override val barrierCompletionCounts: Map<Long, Int>
         get() = completions.mapValues { (_, count) ->
             count + if (delegate.reusedCompletedBarrier) 1 else 0

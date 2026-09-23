@@ -113,7 +113,14 @@ abstract class TilingReaderImage(
     protected val image = MutableStateFlow<KomeliaImage?>(null)
     protected val defaultFrameDelay = 100L
 
+    /**
+     * Tiles the renderer keeps alive between passes, with the working-set class that decides
+     * eviction order. Every entry is published, never mutated in place, so a value handed to a
+     * collector stays the value that was published with it.
+     */
     private val retainedTiles = MutableStateFlow<Map<TileCacheKey, RetainedTile>>(emptyMap())
+
+    internal val retainedWorkingSet: StateFlow<Map<TileCacheKey, RetainedTile>> get() = retainedTiles
 
     /**
      * Mutated only from the processing lane, but read off it when a prefetch request is keyed,
@@ -445,6 +452,9 @@ abstract class TilingReaderImage(
             } catch (e: TilePixelBudgetExceededException) {
                 // concurrent work took pixels the admission estimate assumed were free
                 logger.info { "page ${pageId.pageNumber} lost the animated coverage race: ${e.message}" }
+                // a budget refusal is a graceful fallback to the endpoint attempt, not a failed
+                // render, so it must not leave the renderer showing error state
+                error.value = null
             }
         }
 
@@ -1187,12 +1197,14 @@ abstract class TilingReaderImage(
             retired.clear()
             val next = LinkedHashMap<TileCacheKey, RetainedTile>(current.size)
             for ((key, tile) in current) {
-                if (key in activeKeys || tile.isPrefetch) next[key] = tile
-                else retired += tile.ownership
+                when {
+                    key in activeKeys -> next[key] = tile.asDemandClass()
+                    tile.isPrefetch -> next[key] = tile
+                    else -> retired += tile.ownership
+                }
             }
             next
         }
-        for (key in activeKeys) retainedTiles.value[key]?.isPrefetch = false
         retired.forEach { it.close() }
     }
 
@@ -1207,7 +1219,10 @@ abstract class TilingReaderImage(
      * @return how many working-set entries were released
      */
     private fun evictToNormalBudget(protectedKeys: Set<TileCacheKey>, generation: Long): Int {
-        var pixels = retainedPixels()
+        // one deduplicating scan for the whole loop: rescanning after every step made the loop
+        // cost O(evicted * retained) on the same lane demand rendering waits for
+        val tally = RetainedPixelTally(retainedTiles.value.values.map { it.handle })
+        var pixels = tally.pixels
         if (pixels <= pixelBudgetNormal) return 0
 
         val victims = retainedTiles.value.entries
@@ -1224,7 +1239,7 @@ abstract class TilingReaderImage(
         for (victim in victims) {
             if (pixels <= pixelBudgetNormal) break
             dropRetainedTile(victim.key)
-            pixels = retainedPixels()
+            pixels = tally.remove(victim.value.handle)
             evicted += 1
         }
 
@@ -1372,20 +1387,34 @@ abstract class TilingReaderImage(
         STALE,
     }
 
-    private data class TileCacheKey(
+    internal data class TileCacheKey(
         val sourceBounds: IntRect,
         val displayRegion: Rect,
         val generation: Long,
     )
 
-    private class RetainedTile(
+    internal class RetainedTile(
         val handle: TileHandle,
         val ownership: TileOwnership,
         /** working-set class; a published pass adopts its own coverage as demand-class */
-        var isPrefetch: Boolean,
+        val isPrefetch: Boolean,
         /** fill order, so the most recently prefetched coverage is evicted first */
         val sequence: Long,
-    )
+    ) {
+        /**
+         * The same retained reference classified as demand-class. A new entry rather than a
+         * mutated field, so the classification is published with the working set that carries
+         * it instead of being applied to a map collectors already hold.
+         */
+        fun asDemandClass(): RetainedTile =
+            if (!isPrefetch) this
+            else RetainedTile(
+                handle = handle,
+                ownership = ownership,
+                isPrefetch = false,
+                sequence = sequence,
+            )
+    }
 
     private data class TileGeometry(
         val sourceBounds: IntRect,
