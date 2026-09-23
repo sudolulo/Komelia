@@ -1,6 +1,8 @@
 package snd.komelia.ui.reader.image.panels
 
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -43,7 +45,7 @@ class PanelTransitionControllerTest {
     }
 
     @Test
-    fun `panel index zoom and offset remain unchanged until corridor painter is ready`() = runTest {
+    fun `panel index zoom and offset remain unchanged until the page frame is published`() = runTest {
         val fixture = panelTransitionFixture()
         fixture.startNextPanel()
         fixture.awaitPreparationStarted()
@@ -229,11 +231,7 @@ private class PanelTransitionFixture(
                 preparationStarts++
                 preparationStarted.complete(Unit)
                 preparationFailure?.let { throw it }
-                val preparedUpdate = image.prepareUpdate(
-                    maxDisplaySize = sourceAreaSize,
-                    zoomFactor = 2f,
-                    visibleDisplaySize = IntRect(0, 0, 1080, 1669),
-                )
+                val preparedUpdate = checkNotNull(image.publishPageFrame())
                 preparation.await()
                 preparedUpdate
             },
@@ -326,6 +324,10 @@ private fun TestScope.panelTransitionFixture() = PanelTransitionFixture(this)
 
 private class TestReaderImage : ReaderImage {
     private val preparation = CompletableDeferred<Unit>()
+    private val pageFrame = object : Painter() {
+        override val intrinsicSize = Size.Zero
+        override fun DrawScope.onDraw() = Unit
+    }
 
     var viewportUpdates = 0
         private set
@@ -359,6 +361,16 @@ private class TestReaderImage : ReaderImage {
         requirements: List<ViewportRenderRequirement>,
     ): PreparedUpdateLease {
         preparation.await()
+        return publicationLock()
+    }
+
+    override suspend fun publishPageFrame(): PreparedUpdateLease {
+        preparation.await()
+        painter.value = pageFrame
+        return publicationLock()
+    }
+
+    private fun publicationLock(): PreparedUpdateLease {
         preparedUpdateHeld = true
         return PreparedUpdateLease {
             if (preparedUpdateHeld) {

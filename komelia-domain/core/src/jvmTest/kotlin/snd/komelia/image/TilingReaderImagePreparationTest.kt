@@ -9,6 +9,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -41,7 +42,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
-import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
@@ -719,230 +719,6 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
-    fun `transition update animates when the full coverage fits the hard peak`() = runTest {
-        val image = preparationFixture()
-        try {
-            val coverage = image.prepareTransitionUpdate(
-                maxDisplaySize = screenSize,
-                animatedRequirements = listOf(requirement(targetCorridor, 2f), requirement(narrowPanel, 2.5f)),
-                endpointRequirements = listOf(requirement(targetCorridor, 2f), requirement(narrowPanel, 2.5f)),
-            )
-
-            assertTrue(coverage is PreparedTransitionCoverage.Animated, "got $coverage")
-            coverage.lease.close()
-            assertTrue(image.painterPublications >= 1)
-            assertNull(image.error.value)
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `over budget animated coverage falls back to endpoints only`() = runTest {
-        val image = preparationFixture()
-        try {
-            val coverage = image.prepareTransitionUpdate(
-                maxDisplaySize = screenSize,
-                animatedRequirements = listOf(requirement(fullPagePanel, 3f)),
-                endpointRequirements = listOf(requirement(narrowPanel, 2.5f), requirement(farNeighbor, 2.5f)),
-            )
-
-            assertTrue(coverage is PreparedTransitionCoverage.EndpointOnly, "got $coverage")
-            assertTrue(image.renderedTiles.isNotEmpty(), "the endpoints must still be rendered")
-            assertTrue(
-                image.renderedTiles.none { it.renderSize == overBudgetTile },
-                "the over budget animated coverage must be refused before any native render",
-            )
-            assertTrue(image.renderedTiles.all { it.renderSize == highDensityTile })
-            assertTrue(image.peakLiveNativePixels <= hardPeakPixels)
-            coverage.lease.close()
-            assertNull(image.error.value, "a budget fallback is not renderer error state")
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `overlapping endpoints share admitted pixels in the fallback`() = runTest {
-        val image = preparationFixture()
-        try {
-            // counted separately the two identical endpoints need 128M pixels against an 81.92M
-            // peak; a shared tile counted once needs 64M and fits
-            val coverage = image.prepareTransitionUpdate(
-                maxDisplaySize = screenSize,
-                animatedRequirements = listOf(requirement(fullPagePanel, 3f)),
-                endpointRequirements = listOf(
-                    requirement(fullPagePanel, 2.5f),
-                    requirement(fullPagePanel, 2.5f),
-                ),
-            )
-
-            assertTrue(coverage is PreparedTransitionCoverage.EndpointOnly, "got $coverage")
-            assertEquals(fullPageTileCount, image.renderedTiles.size)
-            assertEquals(fullPageTileCount, image.renderedTiles.map { it.sourceBounds }.toSet().size)
-            assertTrue(image.renderedTiles.all { it.renderSize == highDensityTile })
-            assertTrue(
-                image.peakLiveNativePixels <= hardPeakPixels,
-                "peak live pixels ${image.peakLiveNativePixels} exceeded the hard peak $hardPeakPixels",
-            )
-            coverage.lease.close()
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `transition update is rejected before rendering when endpoints cannot fit`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
-            val painterBefore = image.painter.value
-            val renderedBefore = image.renderedTiles.size
-
-            val coverage = image.prepareTransitionUpdate(
-                maxDisplaySize = screenSize,
-                animatedRequirements = listOf(requirement(fullPagePanel, 3f)),
-                endpointRequirements = listOf(requirement(fullPagePanel, 3f)),
-            )
-
-            assertEquals(PreparedTransitionCoverage.Rejected, coverage)
-            assertEquals(renderedBefore, image.renderedTiles.size, "a rejected transition renders nothing")
-            assertSame(painterBefore, image.painter.value, "a rejected transition keeps the current frame")
-            assertNull(image.error.value, "a rejected transition is not renderer error state")
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `endpoint admission failure during rendering is not renderer error state`() = runTest {
-        val image = preparationFixture()
-        try {
-            image.releaseRendering()
-            // the published frame keeps 64M native pixels live, so the endpoint pass runs out of
-            // hard peak capacity part way through even though its own estimate fits
-            image.prepareUpdate(screenSize, listOf(requirement(fullPagePanel, 2.5f))).close()
-            val painterBefore = image.painter.value
-            val renderedBefore = image.renderedTiles.size
-
-            val coverage = image.prepareTransitionUpdate(
-                maxDisplaySize = screenSize,
-                animatedRequirements = listOf(requirement(fullPagePanel, 3f)),
-                endpointRequirements = listOf(requirement(midPanel, 3f)),
-            )
-
-            assertEquals(PreparedTransitionCoverage.Rejected, coverage)
-            assertTrue(
-                image.renderedTiles.size > renderedBefore,
-                "the endpoints must have been admitted and started rendering before running out",
-            )
-            assertSame(painterBefore, image.painter.value, "a rejected transition keeps the current frame")
-            assertNull(image.error.value, "a rejected transition is not renderer error state")
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `animated fallback withdraws its refusal before the endpoint attempt`() = runTest {
-        val image = preparationFixture()
-        // every value the error flow publishes, captured on the publishing thread itself, so an
-        // error state left standing across the fallback cannot hide behind a later clear
-        val published = CopyOnWriteArrayList<Throwable?>()
-        val observer = launch(Dispatchers.Unconfined) { image.error.collect { published += it } }
-        try {
-            image.releaseRendering()
-            // the published frame keeps 64M native pixels live, so the animated attempt passes
-            // its own admission estimate and then runs out of hard peak capacity mid render
-            image.prepareUpdate(screenSize, listOf(requirement(fullPagePanel, 2.5f))).close()
-
-            image.blockPainterPublication()
-            val transition = async {
-                image.prepareTransitionUpdate(
-                    maxDisplaySize = screenSize,
-                    animatedRequirements = listOf(requirement(midPanel, 3f)),
-                    endpointRequirements = listOf(requirement(narrowPanel, 3f)),
-                )
-            }
-            // the endpoint frame is parked on publication, so this observes the renderer part
-            // way through the fallback rather than after it has settled
-            image.awaitPainterPublicationAttempts(2)
-            val publishedDuringEndpoint = published.size
-
-            assertNull(
-                image.error.value,
-                "the endpoint attempt must not run while the refused animated attempt's error is set",
-            )
-
-            image.releasePainterPublication()
-            val coverage = transition.await()
-            assertIs<PreparedTransitionCoverage.EndpointOnly>(coverage).lease.close()
-            assertTrue(
-                published.drop(publishedDuringEndpoint - 1).all { it == null },
-                "the fallback must publish no error state from the endpoint attempt on, got $published",
-            )
-        } finally {
-            observer.cancel()
-            image.close()
-        }
-    }
-
-    @Test
-    fun `warm transition reports zero rendered tiles`() = runTest {
-        val image = preparationFixture()
-        try {
-            val requirements = listOf(requirement(narrowPanel, 2f))
-            image.prefetchUpdate(screenSize, requirements)
-            val prefetched = image.renderedTiles.size
-            assertTrue(prefetched > 0, "the fixture must prefetch the coverage the transition reuses")
-
-            val coverage = image.prepareTransitionUpdate(
-                maxDisplaySize = screenSize,
-                animatedRequirements = requirements,
-                endpointRequirements = requirements,
-            )
-
-            val stats = assertIs<PreparedTransitionCoverage.Animated>(coverage).stats
-            assertNotNull(stats)
-            assertEquals(0, stats.renderedTiles)
-            assertTrue(stats.reusedTiles > 0)
-            assertTrue(stats.uniqueRetainedPixels > 0)
-            assertEquals(
-                prefetched,
-                image.renderedTiles.size,
-                "the reported zero must match the native renders the fixture observed",
-            )
-            coverage.lease.close()
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
-    fun `cold transition reports the tiles it rendered`() = runTest {
-        val image = preparationFixture()
-        try {
-            val requirements = listOf(requirement(narrowPanel, 2f))
-
-            val coverage = image.prepareTransitionUpdate(
-                maxDisplaySize = screenSize,
-                animatedRequirements = requirements,
-                endpointRequirements = requirements,
-            )
-
-            val stats = assertIs<PreparedTransitionCoverage.Animated>(coverage).stats
-            assertNotNull(stats)
-            assertTrue(stats.renderedTiles > 0, "a cold transition renders its own coverage")
-            assertEquals(image.renderedTiles.size, stats.renderedTiles)
-            assertEquals(0, stats.reusedTiles)
-            assertTrue(stats.uniqueRetainedPixels > 0)
-            coverage.lease.close()
-        } finally {
-            image.close()
-        }
-    }
-
-    @Test
     fun `demand pass publishes the prefetched coverage it adopts as demand class`() = runTest {
         val image = preparationFixture()
         // every working set the renderer publishes, captured on the publishing thread with the
@@ -1167,6 +943,118 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
+    fun `publishing the page frame installs it without rendering`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            val pageFrame = image.renderedTiles.single()
+            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
+            val renderedBeforePublication = image.renderedTiles.size
+            val publicationsBefore = image.painterPublications
+
+            val lease = assertNotNull(image.publishPageFrame(), "a retained page frame must be publishable")
+
+            assertEquals(
+                renderedBeforePublication,
+                image.renderedTiles.size,
+                "publishing an existing frame must not render anything",
+            )
+            assertEquals(publicationsBefore + 1, image.painterPublications)
+            assertEquals(
+                listOf(pageFrame.renderImage),
+                image.publishedTiles.last().map { it.renderImage },
+                "the installed frame must be the retained page frame itself",
+            )
+            lease.close()
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `publishing the page frame is refused before the first full resize`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            // a tiled pass covers one viewport, so it leaves no frame that covers the page
+            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
+            val painterBefore = image.painter.value
+            val renderedBefore = image.renderedTiles.size
+
+            assertNull(image.publishPageFrame(), "an unavailable page frame must be refused, not rendered")
+
+            assertEquals(renderedBefore, image.renderedTiles.size)
+            assertSame(painterBefore, image.painter.value)
+            assertNull(image.error.value)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `an ordinary viewport update does not publish while the page frame lease is held`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            val pageFrame = image.renderedTiles.single()
+            val lease = assertNotNull(image.publishPageFrame())
+            val publicationsUnderLease = image.painterPublications
+
+            image.requestUpdate(smallScreen, 3f, lastTilePanel)
+            // long enough for the conflated lane to have run the request had it not been held
+            withContext(Dispatchers.Default) { delay(200) }
+
+            assertEquals(
+                publicationsUnderLease,
+                image.painterPublications,
+                "an ordinary viewport update must not publish over the held page frame",
+            )
+            assertEquals(
+                listOf(pageFrame.renderImage),
+                image.publishedTiles.last().map { it.renderImage },
+            )
+
+            lease.close()
+            image.awaitPainterPublications(publicationsUnderLease + 1)
+            assertTrue(
+                image.publishedTiles.last().none { it.renderImage === pageFrame.renderImage },
+                "the deferred viewport must publish once the lease is released",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `releasing the page frame lease keeps the retained page frame alive`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            val pageFrame = image.renderedTiles.single()
+
+            val lease = assertNotNull(image.publishPageFrame())
+            lease.close()
+            lease.close()
+
+            assertTrue(image.hasRetainedPageFrame, "releasing the publication lock must not retire the frame")
+            assertEquals(
+                0,
+                image.closedImages.count { it === pageFrame.renderImage },
+                "the page frame must stay live after its lease is released",
+            )
+            assertTrue(
+                image.tileCloseCounts.all { it <= 1 },
+                "expected no tile to close twice, got ${image.tileCloseCounts}",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
     fun `reader close drains queues and releases every ownership once`() = runTest {
         val image = preparationFixture()
         image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
@@ -1249,15 +1137,7 @@ private class DelegatingPreparationFixture(
         return lease
     }
 
-    override suspend fun prepareTransitionUpdate(
-        maxDisplaySize: IntSize,
-        animatedRequirements: List<ViewportRenderRequirement>,
-        endpointRequirements: List<ViewportRenderRequirement>,
-    ): PreparedTransitionCoverage = delegate.prepareTransitionUpdate(
-        maxDisplaySize = maxDisplaySize,
-        animatedRequirements = animatedRequirements,
-        endpointRequirements = endpointRequirements,
-    )
+    override suspend fun publishPageFrame(): PreparedUpdateLease? = delegate.publishPageFrame()
 
     override suspend fun getOriginalImageSize(): Result<IntSize> = delegate.getOriginalImageSize()
     override suspend fun getOriginalImage(): Result<KomeliaImage> = delegate.getOriginalImage()

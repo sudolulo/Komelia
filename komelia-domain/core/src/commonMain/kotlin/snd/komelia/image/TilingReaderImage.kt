@@ -456,105 +456,73 @@ abstract class TilingReaderImage(
         arbiter.submitPrefetch(key) { doPrefetch(key) }
     }
 
-    final override suspend fun prepareTransitionUpdate(
-        maxDisplaySize: IntSize,
-        animatedRequirements: List<ViewportRenderRequirement>,
-        endpointRequirements: List<ViewportRenderRequirement>,
-    ): PreparedTransitionCoverage {
-        require(animatedRequirements.isNotEmpty()) { "a transition needs at least one animated requirement" }
-        require(endpointRequirements.isNotEmpty()) { "a transition needs at least one endpoint requirement" }
-
-        if (fitsHardPeak(maxDisplaySize, animatedRequirements)) {
-            try {
-                val prepared = prepareUpdateWithStats(maxDisplaySize, animatedRequirements)
-                return PreparedTransitionCoverage.Animated(prepared.lease, prepared.stats)
-            } catch (e: TilePixelBudgetExceededException) {
-                // concurrent work took pixels the admission estimate assumed were free
-                logger.info { "page ${pageId.pageNumber} lost the animated coverage race: ${e.message}" }
-                // a budget refusal is a graceful fallback to the endpoint attempt, not a failed
-                // render, so it must not leave the renderer showing error state
-                error.value = null
-            }
-        }
-
-        if (!fitsHardPeak(maxDisplaySize, endpointRequirements)) {
-            logger.warn {
-                "page ${pageId.pageNumber} rejected a transition: even its endpoints exceed the hard peak"
-            }
-            return PreparedTransitionCoverage.Rejected
-        }
-
-        logger.info { "page ${pageId.pageNumber} degraded a transition to endpoint only coverage" }
-        return try {
-            val prepared = prepareUpdateWithStats(maxDisplaySize, endpointRequirements)
-            PreparedTransitionCoverage.EndpointOnly(prepared.lease, prepared.stats)
-        } catch (e: TilePixelBudgetExceededException) {
-            logger.warn { "page ${pageId.pageNumber} rejected a transition: ${e.message}" }
-            // a budget rejection is a graceful refusal handled by the caller, not a failed
-            // render, so it must not leave the renderer showing error state
-            error.value = null
-            PreparedTransitionCoverage.Rejected
-        }
-    }
-
     /**
-     * Whether the native bitmaps [requirements] need can all be live at once inside the hard peak.
+     * Installs the retained fit-zoom page frame and holds the processing lane until the returned
+     * lease is closed, which is what keeps an ordinary viewport update from publishing a tiled
+     * frame over it mid movement.
      *
-     * Counts every source tile once at the densest requirement covering it, exactly the way a
-     * render pass allocates, so overlapping requirements share their tiles here too. An estimate
-     * that cannot be computed yet is treated as admissible and left to the pass itself to enforce.
+     * Nothing is rendered here and the lease holds no rendered coverage of its own: the frame
+     * already exists and stays alive through its own long-lived retention.
      */
-    private suspend fun fitsHardPeak(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-    ): Boolean {
-        val required = requiredNativePixels(maxDisplaySize, requirements) ?: return true
-        val peak = checkedDisplayAreas(checkedPixelCount(maxDisplaySize), hardPeakDisplayAreas)
-        return required <= peak
-    }
+    final override suspend fun publishPageFrame(): PreparedUpdateLease? {
+        val lease = PreparedUpdateLeaseImpl()
+        val published = CompletableDeferred<Boolean>()
+        val job = processingScope.launch {
+            arbiter.submitDemand {
+                var frameOwnership: List<TileOwnership> = emptyList()
+                try {
+                    val page = retainedPageFrame.value?.takeIf { it.generation == renderGeneration }
+                    if (page == null) {
+                        logger.debug { "page ${pageId.pageNumber} has no page frame to publish" }
+                        published.complete(false)
+                        return@submitDemand
+                    }
 
-    private suspend fun requiredNativePixels(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-    ): Long? {
-        if (maxDisplaySize.width <= 0 || maxDisplaySize.height <= 0) return null
+                    frameOwnership = page.handles.mapNotNull { it.retain() }
+                    if (frameOwnership.size != page.handles.size) {
+                        // the frame died between the availability check and the reference
+                        logger.warn { "page ${pageId.pageNumber} lost its page frame before publication" }
+                        published.complete(false)
+                        return@submitDemand
+                    }
 
-        val image = getCurrentImage()
-        val displaySize = calculateSizeForArea(maxDisplaySize, stretchImages.value) ?: return null
-        if (displaySize.width <= 0 || displaySize.height <= 0) return null
-
-        val widthRatio = displaySize.width.toDouble() / image.width
-        val heightRatio = displaySize.height.toDouble() / image.pageHeight
-        val displayScaleFactor = widthRatio.coerceAtMost(heightRatio)
-        if (displayScaleFactor <= 0.0) return null
-
-        val zoomFactor = requirements.maxOf { it.zoomFactor }
-        val dstWidth = displaySize.width * zoomFactor
-        val dstHeight = displaySize.height * zoomFactor
-        val tileSize = tileSizeFor((dstWidth * dstHeight).roundToInt())
-
-        if (image.pagesLoaded > 1 || tileSize == null) {
-            val actualScaleFactor = displayScaleFactor * zoomFactor
-            return checkedPixelCount(
-                IntSize(
-                    checkedRenderDimension(image.width, actualScaleFactor),
-                    checkedRenderDimension(image.pageHeight, actualScaleFactor),
-                )
-            ) * image.pagesLoaded
+                    val readiness = CompletableDeferred<Unit>()
+                    frameData.value = FrameData(
+                        frames = page.frames,
+                        displaySize = page.displaySize,
+                        scaleFactor = page.scaleFactor,
+                        readiness = readiness,
+                        handles = page.handles,
+                        frameOwnership = frameOwnership,
+                        retiredOwnership = frameData.value?.takePendingOwnership() ?: emptyList(),
+                    )
+                    // the frame owns those references now, so the failure path must not close them
+                    frameOwnership = emptyList()
+                    readiness.await()
+                    // the installed frame is the fit-zoom full resize again
+                    lastUsedScaleFactor = page.scaleFactor
+                    published.complete(true)
+                    lease.awaitRelease()
+                } catch (e: Throwable) {
+                    currentCoroutineContext().ensureActive()
+                    logger.catching(e)
+                    error.value = e
+                    published.completeExceptionally(e)
+                } finally {
+                    frameOwnership.forEach { it.close() }
+                }
+            }
         }
-
-        var pixels = 0L
-        for (geometry in tileGeometries(image, tileSize, displayScaleFactor)) {
-            val requiredSize = requiredTileRenderSize(
-                tileSourceBounds = geometry.sourceBounds,
-                tileDisplayRegion = geometry.displayRegion,
-                displayScaleFactor = displayScaleFactor,
-                displayArea = displaySize,
-                requirements = requirements,
-            ) ?: continue
-            pixels += checkedPixelCount(requiredSize)
+        job.invokeOnCompletion { cause ->
+            if (cause != null) published.completeExceptionally(cause)
         }
-        return pixels
+        try {
+            return if (published.await()) lease else null
+        } catch (e: Throwable) {
+            lease.close()
+            currentCoroutineContext().ensureActive()
+            throw e
+        }
     }
 
     private class PreparedUpdateResult(
@@ -764,7 +732,13 @@ abstract class TilingReaderImage(
 
             // taken before publication, so a page frame is only ever recorded for a frame that
             // actually reached the frame pipeline
-            retainPageFrame(generation, frameHandles)
+            retainPageFrame(
+                generation = generation,
+                handles = frameHandles,
+                frames = frames.toList(),
+                displayArea = displayArea,
+                scaleFactor = scaleFactor,
+            )
 
             frameData.value = FrameData(
                 frames = frames,
@@ -1197,7 +1171,13 @@ abstract class TilingReaderImage(
      * the frame ownership [doFullResize] hands to [FrameData]. Neither reference can close the
      * bitmap while the other holds it.
      */
-    private fun retainPageFrame(generation: Long, handles: List<TileHandle>) {
+    private fun retainPageFrame(
+        generation: Long,
+        handles: List<TileHandle>,
+        frames: List<ImageFrame>,
+        displayArea: IntSize,
+        scaleFactor: Double,
+    ) {
         val ownership = handles.mapNotNull { it.retain() }
         if (ownership.size != handles.size) {
             ownership.forEach { it.close() }
@@ -1205,7 +1185,15 @@ abstract class TilingReaderImage(
                 "page ${pageId.pageNumber} lost a full resize frame before it could be retained"
             )
         }
-        retainedPageFrame.getAndUpdate { RetainedPageFrame(generation, ownership) }?.release()
+        val retained = RetainedPageFrame(
+            generation = generation,
+            handles = handles.toList(),
+            frames = frames,
+            displaySize = displayArea,
+            scaleFactor = scaleFactor,
+            ownership = ownership,
+        )
+        retainedPageFrame.getAndUpdate { retained }?.release()
     }
 
     /** Releases the retained page frame if one is held. Idempotent under concurrent callers. */
@@ -1444,9 +1432,16 @@ abstract class TilingReaderImage(
     /**
      * The fit-zoom page frame of one render generation and the references keeping it alive. An
      * animated page resizes to several frames, so every one of them is held.
+     *
+     * The fitted geometry it was rendered with is kept alongside it, because republishing it as
+     * the painter has to reproduce the frame exactly rather than derive it again.
      */
     private class RetainedPageFrame(
         val generation: Long,
+        val handles: List<TileHandle>,
+        val frames: List<ImageFrame>,
+        val displaySize: IntSize,
+        val scaleFactor: Double,
         private val ownership: List<TileOwnership>,
     ) {
         fun release() = ownership.forEach { it.close() }

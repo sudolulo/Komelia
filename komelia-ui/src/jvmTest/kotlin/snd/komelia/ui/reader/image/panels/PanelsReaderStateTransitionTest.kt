@@ -3,9 +3,12 @@ package snd.komelia.ui.reader.image.panels
 import androidx.compose.runtime.saveable.SaveableStateHolder
 import androidx.compose.runtime.MonotonicFrameClock
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.toIntSize
 import androidx.compose.ui.unit.toSize
 import cafe.adriel.voyager.core.annotation.InternalVoyagerApi
 import cafe.adriel.voyager.core.screen.Screen
@@ -17,12 +20,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import snd.komelia.AppNotifications
@@ -33,11 +38,9 @@ import snd.komelia.image.KomeliaImage
 import snd.komelia.image.KomeliaImageDecoder
 import snd.komelia.image.KomeliaPanelDetector
 import snd.komelia.image.ReaderImage
-import snd.komelia.image.PreparedTransitionCoverage
 import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImageFactory
 import snd.komelia.image.ReaderImageResult
-import snd.komelia.image.TransitionRenderStats
 import snd.komelia.image.ViewportRenderRequirement
 import snd.komelia.komga.api.KomgaBookApi
 import snd.komelia.komga.api.KomgaReadListApi
@@ -59,10 +62,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
-import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 private val fixtureAreaSize = IntSize(100, 100)
@@ -77,22 +78,15 @@ private val defaultPanels = listOf(
     ImageRect(200, 200, 300, 300),
 )
 
+/** the fitted page in display coordinates; the retained page frame covers exactly this */
+private val pageRegion = IntRect(0, 0, 100, 100)
+
 private val sourceRegion = IntRect(33, 33, 66, 66)
+private val nextDestinationRegion = IntRect(67, 67, 100, 100)
+private val previousDestinationRegion = IntRect(0, 0, 33, 33)
 
-// source, zoom start, destination, swept
-private val nextPanelRegions = listOf(
-    sourceRegion,
-    sourceRegion,
-    IntRect(67, 67, 100, 100),
-    IntRect(33, 33, 100, 100),
-)
-
-private val previousPanelRegions = listOf(
-    sourceRegion,
-    sourceRegion,
-    IntRect(0, 0, 33, 33),
-    IntRect(0, 0, 66, 66),
-)
+private fun IntRect.containsRect(other: IntRect): Boolean =
+    left <= other.left && top <= other.top && right >= other.right && bottom >= other.bottom
 
 /**
  * The panel zoom is derived through float scale arithmetic, so it lands within rounding distance
@@ -121,134 +115,309 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `mode change during movement affects only the next transition`() = runBlocking {
-        val transitionMode = MutableStateFlow(PanelTransitionMode.CLASSIC)
-        val image = ControlledReaderImage(IntSize(300, 300))
-        val frameClock = ControlledFrameClock()
-        val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + frameClock)
-        val screenScaleState = ScreenScaleState().apply {
-            composeScope = animationScope
-            setAreaSize(IntSize(100, 100))
-            setTargetSize(IntSize(100, 100).toSize())
-            setZoom(3f)
-        }
-        val state = panelsReaderState(screenScaleState, transitionMode)
-        state.currentPage.value = PanelsReaderState.PanelsPage(
-            metadata = PageMetadata(KomgaBookId("book"), 1, IntSize(300, 300)),
-            imageResult = ReaderImageResult.Success(image),
-            panelData = PanelsReaderState.PanelData(
-                panels = listOf(
-                    ImageRect(100, 100, 200, 200),
-                    ImageRect(200, 200, 300, 300),
-                ),
-                originalImageSize = IntSize(300, 300),
-                panelCoversMajorityOfImage = false,
-            ),
-        )
-
+    fun `painter is never null during a panel transition`() = runBlocking {
+        val fixture = panelFixture()
         try {
-            state.initialize()
-            awaitViewportObserver(state, image)
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
 
-            state.nextPanel()
-            withTimeout(2_000) { image.preparationStarted.await() }
-            image.releasePreparation.complete(Unit)
-            withTimeout(2_000) {
-                while (state.currentPageIndex.value.panel != 1) delay(10)
+            val samples = CopyOnWriteArrayList<TransitionSample>()
+            val watcher = launch(Dispatchers.Default) {
+                fixture.screenScaleState.transformation.collect { transformation ->
+                    samples += TransitionSample(
+                        visibleRegion = visibleDisplayRegion(
+                            displaySize = fixture.screenScaleState.targetSize.value.toIntSize(),
+                            areaSize = fixture.screenScaleState.areaSize.value,
+                            transformation = transformation,
+                        ),
+                        painterInstalled = fixture.image.painter.value != null,
+                        installedCoverage = fixture.image.installedCoverage,
+                    )
+                }
             }
 
-            frameClock.sendFrame(0L)
-            frameClock.sendFrame(250_000_000L)
-            delay(50)
-            transitionMode.value = PanelTransitionMode.SNAPPY
-            assertEquals(emptyList(), image.viewportUpdates.toList())
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            withTimeout(2_000) {
+                while (fixture.image.viewportUpdates.isEmpty()) delay(10)
+            }
+            watcher.cancelAndJoin()
 
-            frameClock.sendFrame(1_000_000_000L)
-            withTimeout(2_000) {
-                while (image.viewportUpdates.isEmpty()) delay(10)
+            assertTrue(
+                samples.any { it.visibleRegion != sourceRegion },
+                "the transition must have moved the viewport, sampled ${samples.map { it.visibleRegion }}",
+            )
+            assertTrue(
+                samples.all { it.painterInstalled },
+                "painter was null during the transition at some viewport",
+            )
+            val uncovered = samples.filterNot { sample ->
+                sample.installedCoverage?.containsRect(sample.visibleRegion) == true
             }
-            val completedTransitions = image.viewportUpdates.size
-
-            state.previousPanel()
-            withTimeout(2_000) {
-                while (state.currentPageIndex.value.panel != 0) delay(10)
-            }
-            frameClock.sendFrame(1_100_000_000L)
-            frameClock.sendFrame(1_350_000_000L)
-            withTimeout(2_000) {
-                while (image.viewportUpdates.size == completedTransitions) delay(10)
-            }
+            assertTrue(
+                uncovered.isEmpty(),
+                "the installed frame left a swept viewport uncovered: $uncovered",
+            )
         } finally {
-            state.stop()
-            animationScope.cancel()
+            fixture.close()
         }
     }
 
     @Test
-    fun `real panel transition prepares corridor and suppresses animation viewport updates`() = runBlocking {
-        val image = ControlledReaderImage(IntSize(300, 300))
-        val frameClock = ControlledFrameClock()
-        val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + frameClock)
-        val screenScaleState = ScreenScaleState().apply {
-            composeScope = animationScope
-            setAreaSize(IntSize(100, 100))
-            setTargetSize(IntSize(100, 100).toSize())
-            setZoom(3f)
-        }
-        val state = panelsReaderState(screenScaleState)
-        state.currentPage.value = PanelsReaderState.PanelsPage(
-            metadata = PageMetadata(KomgaBookId("book"), 1, IntSize(300, 300)),
-            imageResult = ReaderImageResult.Success(image),
-            panelData = PanelsReaderState.PanelData(
-                panels = listOf(
-                    ImageRect(100, 100, 200, 200),
-                    ImageRect(200, 200, 300, 300),
-                ),
-                originalImageSize = IntSize(300, 300),
-                panelCoversMajorityOfImage = false,
-            ),
-        )
-
+    fun `transition publishes the page frame before changing zoom or offset`() = runBlocking {
+        val fixture = panelFixture()
         try {
-            state.initialize()
-            awaitViewportObserver(state, image)
-            val startTransformation = screenScaleState.transformation.value
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+            fixture.image.blockPageFramePublication()
+            val startTransformation = fixture.screenScaleState.transformation.value
 
-            state.nextPanel()
-            val preparation = withTimeout(2_000) { image.preparationStarted.await() }
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.pageFramePublicationStarted.await() }
 
-            assertEquals(IntSize(100, 100), preparation.maxDisplaySize)
-            assertRequirements(nextPanelRegions, 3f, preparation.animatedRequirements)
-            assertRequirements(
-                listOf(sourceRegion, IntRect(67, 67, 100, 100)),
-                3f,
-                preparation.endpointRequirements,
-            )
-            assertEquals(PanelsReaderState.PageIndex(0, 0, false), state.currentPageIndex.value)
-            assertEquals(startTransformation, screenScaleState.transformation.value)
+            assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
+            assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
 
-            image.releasePreparation.complete(Unit)
+            fixture.image.releasePageFramePublication()
             withTimeout(2_000) {
-                while (state.currentPageIndex.value.panel != 1) delay(10)
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
             }
 
-            repeat(10) { frameClock.sendFrame(it * 16_000_000L) }
-            delay(50)
-            assertEquals(emptyList(), image.viewportUpdates.toList())
+            assertEquals(listOf(Publication.PAGE_FRAME), fixture.image.publications.toList())
+            assertEquals(pageRegion, fixture.image.installedCoverage)
+        } finally {
+            fixture.close()
+        }
+    }
 
-            repeat(60) { frameClock.sendFrame((it + 10) * 16_000_000L) }
+    @Test
+    fun `transition performs zero native renders before movement starts`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+            val rendersBeforeTransition = fixture.image.nativeRenders
+
+            fixture.state.nextPanel()
             withTimeout(2_000) {
-                while (image.viewportUpdates.isEmpty()) delay(10)
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            assertEquals(
+                rendersBeforeTransition,
+                fixture.image.nativeRenders,
+                "movement must start without rendering anything",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `destination viewport is rendered after movement and published as a second frame`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            // the movement is still running, so nothing but the page frame may be installed
+            repeat(10) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            delay(50)
+            assertEquals(emptyList(), fixture.image.viewportUpdates.toList())
+            assertEquals(listOf(Publication.PAGE_FRAME), fixture.image.publications.toList())
+
+            repeat(60) { fixture.frameClock.sendFrame((it + 10) * 16_000_000L) }
+            withTimeout(2_000) {
+                while (fixture.image.viewportUpdates.isEmpty()) delay(10)
             }
             delay(250)
 
-            val destinationUpdate = image.viewportUpdates.single()
-            assertEquals(IntSize(100, 100), destinationUpdate.maxDisplaySize)
-            assertEquals(IntRect(67, 67, 100, 100), destinationUpdate.visibleDisplaySize)
-            assertEquals(3f, destinationUpdate.zoomFactor, 0.0001f)
+            val destination = fixture.image.viewportUpdates.single()
+            assertEquals(fixtureAreaSize, destination.maxDisplaySize)
+            assertEquals(nextDestinationRegion, destination.visibleDisplaySize)
+            assertEquals(3f, destination.zoomFactor, 0.0001f)
+            assertEquals(
+                listOf(Publication.PAGE_FRAME, Publication.TILED),
+                fixture.image.publications.toList(),
+                "the destination must arrive as a second frame after the page frame",
+            )
         } finally {
-            state.stop()
-            animationScope.cancel()
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `an ordinary requestUpdate mid animation does not publish over the page frame`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            // every animation frame publishes a new transformation, which is exactly the input
+            // the conflated viewport observer turns into an ordinary update when it is not held
+            repeat(10) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            delay(100)
+
+            assertEquals(
+                emptyList(),
+                fixture.image.viewportUpdates.toList(),
+                "no ordinary viewport update may be issued while the page frame lease is held",
+            )
+            assertEquals(pageRegion, fixture.image.installedCoverage)
+            assertEquals(0, fixture.image.pageFrameLeaseReleases)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `cancelling mid animation leaves the page frame published and releases ownership once`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+
+            val samples = CopyOnWriteArrayList<TransitionSample>()
+            val watcher = launch(Dispatchers.Default) {
+                fixture.screenScaleState.transformation.collect { transformation ->
+                    samples += TransitionSample(
+                        visibleRegion = visibleDisplayRegion(
+                            displaySize = fixture.screenScaleState.targetSize.value.toIntSize(),
+                            areaSize = fixture.screenScaleState.areaSize.value,
+                            transformation = transformation,
+                        ),
+                        painterInstalled = fixture.image.painter.value != null,
+                        installedCoverage = fixture.image.installedCoverage,
+                    )
+                }
+            }
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+            repeat(4) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            // no further frames arrive, so the movement quiesces part way; the watcher lags the
+            // transformation flow, so the stop point has to be read from the flow itself
+            val stoppedAt = visibleDisplayRegion(
+                displaySize = fixture.screenScaleState.targetSize.value.toIntSize(),
+                areaSize = fixture.screenScaleState.areaSize.value,
+                transformation = fixture.awaitStableTransformation(),
+            )
+            assertNotEquals(sourceRegion, stoppedAt, "the movement must have started before it is cancelled")
+
+            fixture.state.stop()
+            delay(250)
+            watcher.cancelAndJoin()
+
+            // the page frame stayed installed for every swept viewport, cancellation included
+            assertTrue(
+                samples.all { it.painterInstalled },
+                "painter was null while the cancelled transition unwound",
+            )
+            val uncovered = samples.filterNot { sample ->
+                sample.installedCoverage?.containsRect(sample.visibleRegion) == true
+            }
+            assertTrue(uncovered.isEmpty(), "a cancelled transition left a viewport uncovered: $uncovered")
+
+            assertEquals(
+                1,
+                fixture.image.pageFrameLeaseReleases,
+                "the page frame lease must be released exactly once",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a transition before the initial paint takes the waiting fallback`() = runBlocking {
+        val fixture = panelFixture(pageFrameAvailable = false)
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+            val startTransformation = fixture.screenScaleState.transformation.value
+
+            fixture.state.nextPanel()
+            val fallback = withTimeout(2_000) { fixture.image.preparationStarted.await() }
+
+            // the destination is rendered before anything moves, which is the one case where
+            // movement is allowed to wait
+            assertEquals(fixtureAreaSize, fallback.maxDisplaySize)
+            assertRequirements(listOf(nextDestinationRegion), 3f, fallback.requirements)
+            assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
+            assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
+
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            assertEquals(listOf(Publication.TILED), fixture.image.publications.toList())
+            assertEquals(0, fixture.image.pageFramePublications)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `snappy requests 250ms and classic requests 1000ms, snapshotted at input`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val transitionMode = MutableStateFlow(PanelTransitionMode.CLASSIC)
+        val fixture = panelFixture(transitionMode = transitionMode, diagnostics = { events += it })
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            // a mode change after the input was accepted must not shorten the movement already
+            // under way: 250 ms of frames leave a 1000 ms animation unfinished
+            fixture.frameClock.sendFrame(0L)
+            fixture.frameClock.sendFrame(250_000_000L)
+            delay(50)
+            transitionMode.value = PanelTransitionMode.SNAPPY
+            assertEquals(emptyList(), events.toList())
+
+            fixture.frameClock.sendFrame(1_000_000_000L)
+            withTimeout(2_000) {
+                while (events.isEmpty()) delay(10)
+            }
+            assertEquals(1000, events.single().durationMillis)
+
+            // the event is emitted before the controller returns to idle, so the next input can
+            // still be refused as a repeated tap; retry it until it is accepted
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 1) {
+                    fixture.state.previousPanel()
+                    delay(20)
+                }
+            }
+            fixture.frameClock.sendFrame(1_100_000_000L)
+            fixture.frameClock.sendFrame(1_350_000_000L)
+            withTimeout(2_000) {
+                while (events.size < 2) delay(10)
+            }
+
+            assertEquals(250, events[1].durationMillis)
+        } finally {
+            fixture.close()
         }
     }
 
@@ -260,60 +429,9 @@ class PanelsReaderStateTransitionTest {
 
             val requests = fixture.image.prefetchRequests.toList()
             assertEquals(2, requests.size)
-            assertRequirements(nextPanelRegions, 3f, requests[0].requirements)
-            assertRequirements(previousPanelRegions, 3f, requests[1].requirements)
+            assertRequirements(listOf(nextDestinationRegion), 3f, requests[0].requirements)
+            assertRequirements(listOf(previousDestinationRegion), 3f, requests[1].requirements)
             assertTrue(requests.all { it.maxDisplaySize == fixtureAreaSize })
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `warm next panel renders zero tiles before movement`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            fixture.settle()
-            val rendersBeforeTransition = fixture.image.nativeRenders
-
-            fixture.state.nextPanel()
-            withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            fixture.image.releasePreparation.complete(Unit)
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
-            }
-
-            assertEquals(
-                rendersBeforeTransition,
-                fixture.image.nativeRenders,
-                "a warm neighbour transition must render no tiles before movement",
-            )
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `cold next panel renders its coverage before movement`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            // never let a prefetch complete, so the transition finds nothing warm
-            fixture.image.blockPrefetch()
-            fixture.awaitViewportObserver()
-            val rendersBeforeTransition = fixture.image.nativeRenders
-
-            fixture.state.nextPanel()
-            val preparation = withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            fixture.image.releasePreparation.complete(Unit)
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
-            }
-
-            assertRequirements(nextPanelRegions, 3f, preparation.animatedRequirements)
-            assertEquals(
-                rendersBeforeTransition + preparation.animatedRequirements.toSet().size,
-                fixture.image.nativeRenders,
-                "a cold transition must render its complete coverage before movement",
-            )
         } finally {
             fixture.close()
         }
@@ -357,8 +475,6 @@ class PanelsReaderStateTransitionTest {
             }
 
             fixture.state.nextPanel()
-            withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            fixture.image.releasePreparation.complete(Unit)
             withTimeout(2_000) {
                 while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
             }
@@ -381,108 +497,10 @@ class PanelsReaderStateTransitionTest {
 
             fixture.state.nextPanel()
 
-            // the transition prepares while the prefetch is still suspended
-            withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            fixture.image.releasePreparation.complete(Unit)
+            // the transition publishes and moves while the prefetch is still suspended
             withTimeout(2_000) {
                 while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
             }
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `over budget animation publishes complete endpoints before transform jump`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            fixture.image.transitionOutcome = TransitionOutcome.ENDPOINT_ONLY
-            fixture.image.blockPrefetch()
-            fixture.awaitViewportObserver()
-            val startTransformation = fixture.screenScaleState.transformation.value
-
-            fixture.state.nextPanel()
-            val preparation = withTimeout(2_000) { fixture.image.preparationStarted.await() }
-
-            assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
-            assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
-
-            fixture.image.releasePreparation.complete(Unit)
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
-            }
-            // the destination offset is computed in float scale arithmetic, so it lands within
-            // rounding distance of (-100, -100) rather than exactly on it
-            withTimeout(2_000) {
-                while (fixture.screenScaleState.transformation.value.offset.x > -99.9f) delay(10)
-            }
-
-            // both endpoints are complete, the swept path was never rendered
-            assertEquals(2, preparation.endpointRequirements.size)
-            assertTrue(preparation.endpointRequirements.all { fixture.image.hasCoverage(it) })
-            assertFalse(fixture.image.hasCoverage(preparation.animatedRequirements.last()))
-
-            // the destination is reached without a single animation frame, so scrollTo was not used
-            assertEquals(0, fixture.frameClock.awaitedFrames)
-            assertEquals(3f, fixture.screenScaleState.zoom.value, 0.0001f)
-            val destination = fixture.screenScaleState.transformation.value.offset
-            assertEquals(-100f, destination.x, 0.01f)
-            assertEquals(-100f, destination.y, 0.01f)
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `overlapping endpoints stay separate requirements in fallback`() = runBlocking {
-        val fixture = panelFixture(
-            panels = listOf(
-                ImageRect(100, 100, 200, 200),
-                ImageRect(120, 120, 220, 220),
-            ),
-            startPanel = 0,
-        )
-        try {
-            fixture.image.transitionOutcome = TransitionOutcome.ENDPOINT_ONLY
-            fixture.image.blockPrefetch()
-            fixture.awaitViewportObserver()
-
-            fixture.state.nextPanel()
-            val preparation = withTimeout(2_000) { fixture.image.preparationStarted.await() }
-
-            val (source, destination) = preparation.endpointRequirements
-            assertEquals(2, preparation.endpointRequirements.size)
-            assertTrue(
-                source.region.overlaps(destination.region),
-                "expected overlapping endpoints, got ${source.region} and ${destination.region}",
-            )
-            assertNotEquals(source, destination, "overlapping endpoints must stay two requirements")
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `endpoint admission failure preserves frame index zoom and offset`() = runBlocking {
-        val fixture = panelFixture()
-        try {
-            fixture.image.transitionOutcome = TransitionOutcome.REJECTED
-            fixture.image.blockPrefetch()
-            fixture.awaitViewportObserver()
-            val startTransformation = fixture.screenScaleState.transformation.value
-            val startPainter = fixture.image.painter.value
-
-            fixture.state.nextPanel()
-            withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            fixture.image.releasePreparation.complete(Unit)
-            delay(300)
-
-            assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
-            assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
-            assertEquals(3f, fixture.screenScaleState.zoom.value, 0.0001f)
-            assertSame(startPainter, fixture.image.painter.value)
-            assertEquals(0, fixture.frameClock.awaitedFrames)
-            assertEquals(emptyList(), fixture.image.viewportUpdates.toList())
         } finally {
             fixture.close()
         }
@@ -496,8 +514,6 @@ class PanelsReaderStateTransitionTest {
             fixture.settle()
 
             fixture.state.nextPanel()
-            withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            fixture.image.releasePreparation.complete(Unit)
             withTimeout(2_000) {
                 while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
             }
@@ -510,9 +526,9 @@ class PanelsReaderStateTransitionTest {
             val event = events.single()
             assertEquals(PanelTransitionMode.SNAPPY, event.mode)
             assertEquals(250, event.durationMillis)
-            assertEquals(0, event.renderedTiles)
+            assertEquals(PanelTransitionOutcome.ANIMATED, event.outcome)
+            assertTrue(event.pageFrameAvailable)
             assertTrue(event.generation > 0)
-            assertTrue(event.requirementCount > 0)
             assertTrue(event.readinessMillis >= 0)
             assertTrue(event.movementEndMillis >= event.movementStartMillis)
         } finally {
@@ -523,14 +539,14 @@ class PanelsReaderStateTransitionTest {
     @Test
     fun `cancelled transition emits a cancellation event and no error event`() = runBlocking {
         val events = CopyOnWriteArrayList<PanelTransitionEvent>()
-        val fixture = panelFixture(diagnostics = { events += it })
+        val fixture = panelFixture(pageFrameAvailable = false, diagnostics = { events += it })
         try {
             fixture.image.blockPrefetch()
             fixture.awaitViewportObserver()
 
             fixture.state.nextPanel()
             withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            // the coverage is never released, so the transition is cancelled while preparing
+            // the fallback render never completes, so the transition is cancelled while preparing
             fixture.state.stop()
 
             withTimeout(2_000) {
@@ -547,46 +563,24 @@ class PanelsReaderStateTransitionTest {
             fixture.close()
         }
     }
-
-    private suspend fun awaitViewportObserver(
-        state: PanelsReaderState,
-        image: ControlledReaderImage,
-    ) {
-        withTimeout(2_000) {
-            var offset = 1f
-            while (image.viewportUpdates.isEmpty()) {
-                state.screenScaleState.setOffset(Offset(offset, offset))
-                offset = if (offset == 1f) 2f else 1f
-                delay(10)
-            }
-        }
-        delay(150)
-        image.viewportUpdates.clear()
-        state.screenScaleState.setOffset(Offset.Zero)
-        withTimeout(2_000) {
-            while (image.viewportUpdates.isEmpty()) delay(10)
-        }
-        delay(150)
-        image.viewportUpdates.clear()
-    }
 }
 
 private class ControlledFrameClock : MonotonicFrameClock {
     private val frames = Channel<Long>(Channel.UNLIMITED)
-    private val requested = AtomicInteger()
-
-    /** how many times an animation asked for a frame; zero means nothing animated at all */
-    val awaitedFrames: Int get() = requested.get()
 
     suspend fun sendFrame(timeNanos: Long) {
         frames.send(timeNanos)
     }
 
-    override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R {
-        requested.incrementAndGet()
-        return onFrame(frames.receive())
-    }
+    override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R = onFrame(frames.receive())
 }
+
+/** one sampled point of a transition: where the viewport was and what was drawable there */
+private data class TransitionSample(
+    val visibleRegion: IntRect,
+    val painterInstalled: Boolean,
+    val installedCoverage: IntRect?,
+)
 
 private class PanelFixture(
     val state: PanelsReaderState,
@@ -613,6 +607,20 @@ private class PanelFixture(
         }
         delay(150)
         image.viewportUpdates.clear()
+        image.publications.clear()
+    }
+
+    /** the transformation the movement has settled on, once no further frame changes it */
+    suspend fun awaitStableTransformation(): ScreenScaleState.Transformation = withTimeout(2_000) {
+        var last = screenScaleState.transformation.value
+        while (true) {
+            delay(100)
+            val current = screenScaleState.transformation.value
+            if (current == last) return@withTimeout current
+            last = current
+        }
+        @Suppress("UNREACHABLE_CODE")
+        last
     }
 
     /**
@@ -629,6 +637,8 @@ private class PanelFixture(
             while (image.prefetchRequests.size < 2) delay(10)
         }
         delay(150)
+        image.viewportUpdates.clear()
+        image.publications.clear()
     }
 
     fun close() {
@@ -641,9 +651,11 @@ private class PanelFixture(
 private suspend fun CoroutineScope.panelFixture(
     panels: List<ImageRect> = defaultPanels,
     startPanel: Int = 1,
+    pageFrameAvailable: Boolean = true,
+    transitionMode: MutableStateFlow<PanelTransitionMode> = MutableStateFlow(PanelTransitionMode.SNAPPY),
     diagnostics: PanelTransitionDiagnostics = PanelTransitionDiagnostics {},
 ): PanelFixture {
-    val image = ControlledReaderImage(fixtureImageSize)
+    val image = ControlledReaderImage(fixtureImageSize, pageFrameAvailable)
     val frameClock = ControlledFrameClock()
     val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + frameClock)
     val screenScaleState = ScreenScaleState().apply {
@@ -652,7 +664,7 @@ private suspend fun CoroutineScope.panelFixture(
         setTargetSize(fixtureAreaSize.toSize())
         setZoom(3f)
     }
-    val state = panelsReaderState(screenScaleState, diagnostics = diagnostics)
+    val state = panelsReaderState(screenScaleState, transitionMode, diagnostics)
     state.currentPage.value = PanelsReaderState.PanelsPage(
         metadata = PageMetadata(KomgaBookId("book"), 1, fixtureImageSize),
         imageResult = ReaderImageResult.Success(image),
@@ -678,48 +690,76 @@ private data class PrefetchRequest(
     val requirements: List<ViewportRenderRequirement>,
 )
 
-private data class TransitionRequest(
+private data class PrepareRequest(
     val maxDisplaySize: IntSize,
-    val animatedRequirements: List<ViewportRenderRequirement>,
-    val endpointRequirements: List<ViewportRenderRequirement>,
+    val requirements: List<ViewportRenderRequirement>,
 )
 
-private enum class TransitionOutcome { ANIMATED, ENDPOINT_ONLY, REJECTED }
+/** which kind of frame a publication installed, in the order the renderer installed them */
+private enum class Publication { PAGE_FRAME, TILED }
+
+private class FixturePainter(private val name: String) : Painter() {
+    override val intrinsicSize = Size.Zero
+    override fun DrawScope.onDraw() = Unit
+    override fun toString() = name
+}
 
 /**
- * Models the renderer well enough to count native work: a requirement whose coverage was
- * already rendered costs nothing, anything else costs one render. Prefetch fills that coverage,
- * so a warm neighbour transition can be observed to render zero tiles.
+ * Models a replacement-based renderer closely enough to observe what a transition draws: exactly
+ * one frame is installed at a time, it covers a known region of the fitted page, and installing a
+ * region that was never rendered costs one native render.
+ *
+ * The double is deliberately naive about ordering: it installs whatever it is told to install, so
+ * an update the transition should not have issued shows up as a shrunken coverage rather than
+ * being silently absorbed.
  */
 private class ControlledReaderImage(
     imageSize: IntSize,
+    pageFrameAvailable: Boolean,
 ) : ReaderImage {
-    val preparationStarted = CompletableDeferred<TransitionRequest>()
+    val preparationStarted = CompletableDeferred<PrepareRequest>()
     val releasePreparation = CompletableDeferred<Unit>()
+    val pageFramePublicationStarted = CompletableDeferred<Unit>()
+
     val viewportUpdates = Collections.synchronizedList(mutableListOf<ImageUpdate>())
     val prefetchRequests = CopyOnWriteArrayList<PrefetchRequest>()
-    val transitionRequests = CopyOnWriteArrayList<TransitionRequest>()
+    val prepareRequests = CopyOnWriteArrayList<PrepareRequest>()
+    val publications = CopyOnWriteArrayList<Publication>()
 
     private val renderedCoverage = Collections.synchronizedSet(mutableSetOf<ViewportRenderRequirement>())
     private val renders = AtomicInteger()
     private val prefetchCancels = AtomicInteger()
+    private val pageFramePublishCount = AtomicInteger()
+    private val pageFrameReleases = AtomicInteger()
+    private val coverage = AtomicReference<IntRect?>(null)
     private val prefetchGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
+    private val pageFrameGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
+    private val pageFramePainter = FixturePainter("page-frame")
 
     @Volatile
-    var transitionOutcome: TransitionOutcome = TransitionOutcome.ANIMATED
+    var pageFrameAvailable: Boolean = pageFrameAvailable
 
     @Volatile
     var prefetchFailure: Throwable? = null
 
     val nativeRenders: Int get() = renders.get()
     val prefetchCancellations: Int get() = prefetchCancels.get()
+    val pageFramePublications: Int get() = pageFramePublishCount.get()
+    val pageFrameLeaseReleases: Int get() = pageFrameReleases.get()
+
+    /** the fitted display region the currently installed frame can draw */
+    val installedCoverage: IntRect? get() = coverage.get()
 
     fun blockPrefetch() {
         prefetchGate.set(CompletableDeferred())
     }
 
-    fun releasePrefetch() {
-        prefetchGate.get().complete(Unit)
+    fun blockPageFramePublication() {
+        pageFrameGate.set(CompletableDeferred())
+    }
+
+    fun releasePageFramePublication() {
+        pageFrameGate.get().complete(Unit)
     }
 
     override val pageId = ReaderImage.PageId("book", 1)
@@ -735,35 +775,40 @@ private class ControlledReaderImage(
         visibleDisplaySize: IntRect,
     ) {
         viewportUpdates += ImageUpdate(maxDisplaySize, zoomFactor, visibleDisplaySize)
+        render(listOf(ViewportRenderRequirement(visibleDisplaySize, zoomFactor)))
+        install(Publication.TILED, visibleDisplaySize, FixturePainter("tiled $visibleDisplaySize"))
+    }
+
+    override suspend fun publishPageFrame(): PreparedUpdateLease? {
+        pageFramePublicationStarted.complete(Unit)
+        pageFrameGate.get().await()
+        if (!pageFrameAvailable) return null
+
+        pageFramePublishCount.incrementAndGet()
+        install(Publication.PAGE_FRAME, pageRegion, pageFramePainter)
+        return PreparedUpdateLease { pageFrameReleases.incrementAndGet() }
     }
 
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         requirements: List<ViewportRenderRequirement>,
     ): PreparedUpdateLease {
-        render(requirements)
-        return PreparedUpdateLease {}
-    }
-
-    override suspend fun prepareTransitionUpdate(
-        maxDisplaySize: IntSize,
-        animatedRequirements: List<ViewportRenderRequirement>,
-        endpointRequirements: List<ViewportRenderRequirement>,
-    ): PreparedTransitionCoverage {
-        val request = TransitionRequest(maxDisplaySize, animatedRequirements, endpointRequirements)
-        transitionRequests += request
+        val request = PrepareRequest(maxDisplaySize, requirements)
+        prepareRequests += request
         preparationStarted.complete(request)
         releasePreparation.await()
 
-        return when (transitionOutcome) {
-            TransitionOutcome.ANIMATED ->
-                PreparedTransitionCoverage.Animated(PreparedUpdateLease {}, render(animatedRequirements))
-
-            TransitionOutcome.ENDPOINT_ONLY ->
-                PreparedTransitionCoverage.EndpointOnly(PreparedUpdateLease {}, render(endpointRequirements))
-
-            TransitionOutcome.REJECTED -> PreparedTransitionCoverage.Rejected
+        render(requirements)
+        val installed = requirements.map { it.region }.reduce { left, right ->
+            IntRect(
+                left = minOf(left.left, right.left),
+                top = minOf(left.top, right.top),
+                right = maxOf(left.right, right.right),
+                bottom = maxOf(left.bottom, right.bottom),
+            )
         }
+        install(Publication.TILED, installed, FixturePainter("tiled $installed"))
+        return PreparedUpdateLease {}
     }
 
     override suspend fun prefetchUpdate(
@@ -781,29 +826,17 @@ private class ControlledReaderImage(
         render(requirements)
     }
 
-    fun hasCoverage(requirement: ViewportRenderRequirement): Boolean =
-        renderedCoverage.contains(requirement)
+    private fun install(publication: Publication, region: IntRect, frame: Painter) {
+        coverage.set(region)
+        painter.value = frame
+        publications += publication
+    }
 
     /** one requirement stands in for one tile here, so the counts are directly assertable */
-    private fun render(requirements: List<ViewportRenderRequirement>): TransitionRenderStats {
-        var rendered = 0
-        var reused = 0
+    private fun render(requirements: List<ViewportRenderRequirement>) {
         for (requirement in requirements.toSet()) {
-            if (renderedCoverage.add(requirement)) {
-                renders.incrementAndGet()
-                rendered += 1
-            } else {
-                reused += 1
-            }
+            if (renderedCoverage.add(requirement)) renders.incrementAndGet()
         }
-        return TransitionRenderStats(
-            reusedTiles = reused,
-            upgradedTiles = 0,
-            renderedTiles = rendered,
-            evictedTiles = 0,
-            uniqueRetainedPixels = renderedCoverage.size.toLong(),
-            reservedPixels = rendered.toLong(),
-        )
     }
 
     override suspend fun getOriginalImageSize(): Result<IntSize> =

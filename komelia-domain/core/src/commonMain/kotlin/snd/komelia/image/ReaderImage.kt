@@ -49,26 +49,16 @@ interface ReaderImage : AutoCloseable {
     ): PreparedUpdateLease
 
     /**
-     * Prepare the coverage a panel transition needs, degrading instead of failing when the
-     * hard peak cannot hold all of it.
+     * Publish the retained fit-zoom page frame and lock publication until the lease closes.
      *
-     * The renderer publishes [animatedRequirements] when they fit, otherwise retries with
-     * [endpointRequirements], otherwise rejects the transition before rendering anything.
+     * The frame covers the whole page, so once it is installed no viewport position over that
+     * page can be uncovered and movement never has to wait on rendering. Nothing is rendered
+     * here: the frame already exists.
      *
-     * The default implementation always animates: a renderer without a native pixel budget has
-     * nothing to degrade to. [TilingReaderImage] overrides it with real admission.
-     *
-     * It also reports no [TransitionRenderStats]: a renderer with no native pixel budget has
-     * nothing to account for, and reporting zeroes would read as "did no work" instead.
+     * Returns null when no page frame is available, in which case the caller must not move over
+     * unrendered space and has to render its destination first instead.
      */
-    suspend fun prepareTransitionUpdate(
-        maxDisplaySize: IntSize,
-        animatedRequirements: List<ViewportRenderRequirement>,
-        endpointRequirements: List<ViewportRenderRequirement>,
-    ): PreparedTransitionCoverage = PreparedTransitionCoverage.Animated(
-        lease = prepareUpdate(maxDisplaySize = maxDisplaySize, requirements = animatedRequirements),
-        stats = null,
-    )
+    suspend fun publishPageFrame(): PreparedUpdateLease?
 
     /**
      * Populate reusable tile coverage for [requirements] without publishing it.
