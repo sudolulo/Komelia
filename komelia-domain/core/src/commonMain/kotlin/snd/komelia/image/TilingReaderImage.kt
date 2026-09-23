@@ -30,8 +30,6 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.selects.select
 import snd.komelia.image.processing.ImageProcessingPipeline
 import kotlin.concurrent.Volatile
@@ -47,6 +45,12 @@ private const val tileThreshold3 = 6144 * 6144
  * The hard peak is expressed in fitted display areas; see the panel transition design doc.
  */
 private const val hardPeakDisplayAreas = 8L
+
+/**
+ * The normal retained working set holds one viewport equivalent each for the current, next and
+ * previous coverage; see the panel transition design doc.
+ */
+private const val normalWorkingSetDisplayAreas = 3L
 
 /**
  * A render input change invalidates an in-flight pass and the pass restarts. Restarting forever
@@ -94,18 +98,35 @@ abstract class TilingReaderImage(
     private val animationScope = CoroutineScope(Dispatchers.Default.limitedParallelism(1) + SupervisorJob())
     protected val processingScope = CoroutineScope(Dispatchers.Default.limitedParallelism(1) + SupervisorJob())
 
+    /**
+     * Owns the single processing lane. Demand work is always selected ahead of prefetch, so
+     * the previous first-come-first-served launch order can no longer let neighbour prefetch
+     * delay a transition the user is waiting for.
+     */
+    private val arbiter = ImageUpdateArbiter(processingScope) { failure ->
+        // prefetch is an optimization; a failed pass must not become visible renderer error state
+        logger.warn { "page ${pageId.pageNumber} prefetch failed: $failure" }
+    }
+
     private val jobFlow = MutableSharedFlow<UpdateRequest>(1, 0, BufferOverflow.DROP_OLDEST)
     private val frameData = MutableStateFlow<FrameData?>(null)
-    private val updateMutex = Mutex()
     protected val image = MutableStateFlow<KomeliaImage?>(null)
     protected val defaultFrameDelay = 100L
 
     private val retainedTiles = MutableStateFlow<Map<TileCacheKey, RetainedTile>>(emptyMap())
 
+    /**
+     * Mutated only from the processing lane, but read off it when a prefetch request is keyed,
+     * so the read has to see the latest published value.
+     */
+    @Volatile
+    private var renderGeneration = 0L
+
     // all of the fields below are mutated only from the single threaded processing scope
     private var pixelBudget: TilePixelBudget? = null
     private var pixelBudgetPeak = 0L
-    private var renderGeneration = 0L
+    private var pixelBudgetNormal = 0L
+    private var retainedSequence = 0L
     private var renderFingerprint: RenderFingerprint? = null
     private var imageEpoch = 0L
     private var rendererEpoch = 0L
@@ -130,7 +151,7 @@ abstract class TilingReaderImage(
     init {
         jobFlow.conflate()
             .onEach { request ->
-                processUpdate(request)
+                arbiter.submitDemand { processUpdate(request) }
                 delay(50)
             }.launchIn(processingScope)
 
@@ -222,9 +243,7 @@ abstract class TilingReaderImage(
 
     private suspend fun processUpdate(request: UpdateRequest) {
         try {
-            updateMutex.withLock {
-                processUpdateLocked(request)
-            }
+            processUpdateLocked(request)
             error.value = null
         } catch (e: Throwable) {
             currentCoroutineContext().ensureActive()
@@ -337,33 +356,32 @@ abstract class TilingReaderImage(
         val readiness = CompletableDeferred<Unit>()
         val lease = PreparedUpdateLeaseImpl()
         val prepared = CompletableDeferred<PreparedUpdateLease>()
-        val owner = Any()
         val job = processingScope.launch {
-            var gateAcquired = false
-            var leaseOwnership: List<TileOwnership> = emptyList()
-            try {
-                updateMutex.lock(owner)
-                gateAcquired = true
-                val request = UpdateRequest(
-                    requirements = requirements,
-                    maxDisplaySize = maxDisplaySize,
-                    readiness = readiness,
-                )
-                processUpdateLocked(request)
-                error.value = null
-                // the lease owns the exact handle set that satisfied readiness
-                leaseOwnership = frameData.value?.retainHandles() ?: emptyList()
-                prepared.complete(lease)
-                lease.awaitRelease()
-            } catch (e: Throwable) {
-                currentCoroutineContext().ensureActive()
-                logger.catching(e)
-                error.value = e
-                readiness.completeExceptionally(e)
-                prepared.completeExceptionally(e)
-            } finally {
-                leaseOwnership.forEach { it.close() }
-                if (gateAcquired) updateMutex.unlock(owner)
+            // the lane is held for the whole lease lifetime, so no other update can publish
+            // over the prepared coverage while a caller still depends on it
+            arbiter.submitDemand {
+                var leaseOwnership: List<TileOwnership> = emptyList()
+                try {
+                    val request = UpdateRequest(
+                        requirements = requirements,
+                        maxDisplaySize = maxDisplaySize,
+                        readiness = readiness,
+                    )
+                    processUpdateLocked(request)
+                    error.value = null
+                    // the lease owns the exact handle set that satisfied readiness
+                    leaseOwnership = frameData.value?.retainHandles() ?: emptyList()
+                    prepared.complete(lease)
+                    lease.awaitRelease()
+                } catch (e: Throwable) {
+                    currentCoroutineContext().ensureActive()
+                    logger.catching(e)
+                    error.value = e
+                    readiness.completeExceptionally(e)
+                    prepared.completeExceptionally(e)
+                } finally {
+                    leaseOwnership.forEach { it.close() }
+                }
             }
         }
         job.invokeOnCompletion { cause ->
@@ -379,6 +397,122 @@ abstract class TilingReaderImage(
             currentCoroutineContext().ensureActive()
             throw e
         }
+    }
+
+    final override suspend fun prefetchUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    ) {
+        require(requirements.isNotEmpty()) { "prefetchUpdate needs at least one viewport requirement" }
+        if (maxDisplaySize.width <= 0 || maxDisplaySize.height <= 0) {
+            logger.debug { "page ${pageId.pageNumber} skipped prefetch for empty area $maxDisplaySize" }
+            return
+        }
+
+        val key = PrefetchKey(
+            generation = renderGeneration,
+            maxDisplaySize = maxDisplaySize,
+            requirements = requirements,
+        )
+        arbiter.submitPrefetch(key) { doPrefetch(key) }
+    }
+
+    final override suspend fun prepareTransitionUpdate(
+        maxDisplaySize: IntSize,
+        animatedRequirements: List<ViewportRenderRequirement>,
+        endpointRequirements: List<ViewportRenderRequirement>,
+    ): PreparedTransitionCoverage {
+        require(animatedRequirements.isNotEmpty()) { "a transition needs at least one animated requirement" }
+        require(endpointRequirements.isNotEmpty()) { "a transition needs at least one endpoint requirement" }
+
+        if (fitsHardPeak(maxDisplaySize, animatedRequirements)) {
+            try {
+                return PreparedTransitionCoverage.Animated(
+                    prepareUpdate(maxDisplaySize, animatedRequirements)
+                )
+            } catch (e: TilePixelBudgetExceededException) {
+                // concurrent work took pixels the admission estimate assumed were free
+                logger.info { "page ${pageId.pageNumber} lost the animated coverage race: ${e.message}" }
+            }
+        }
+
+        if (!fitsHardPeak(maxDisplaySize, endpointRequirements)) {
+            logger.warn {
+                "page ${pageId.pageNumber} rejected a transition: even its endpoints exceed the hard peak"
+            }
+            return PreparedTransitionCoverage.Rejected
+        }
+
+        logger.info { "page ${pageId.pageNumber} degraded a transition to endpoint only coverage" }
+        return try {
+            PreparedTransitionCoverage.EndpointOnly(prepareUpdate(maxDisplaySize, endpointRequirements))
+        } catch (e: TilePixelBudgetExceededException) {
+            logger.warn { "page ${pageId.pageNumber} rejected a transition: ${e.message}" }
+            // a budget rejection is a graceful refusal handled by the caller, not a failed
+            // render, so it must not leave the renderer showing error state
+            error.value = null
+            PreparedTransitionCoverage.Rejected
+        }
+    }
+
+    /**
+     * Whether the native bitmaps [requirements] need can all be live at once inside the hard peak.
+     *
+     * Counts every source tile once at the densest requirement covering it, exactly the way a
+     * render pass allocates, so overlapping requirements share their tiles here too. An estimate
+     * that cannot be computed yet is treated as admissible and left to the pass itself to enforce.
+     */
+    private suspend fun fitsHardPeak(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    ): Boolean {
+        val required = requiredNativePixels(maxDisplaySize, requirements) ?: return true
+        val peak = checkedDisplayAreas(checkedPixelCount(maxDisplaySize), hardPeakDisplayAreas)
+        return required <= peak
+    }
+
+    private suspend fun requiredNativePixels(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    ): Long? {
+        if (maxDisplaySize.width <= 0 || maxDisplaySize.height <= 0) return null
+
+        val image = getCurrentImage()
+        val displaySize = calculateSizeForArea(maxDisplaySize, stretchImages.value) ?: return null
+        if (displaySize.width <= 0 || displaySize.height <= 0) return null
+
+        val widthRatio = displaySize.width.toDouble() / image.width
+        val heightRatio = displaySize.height.toDouble() / image.pageHeight
+        val displayScaleFactor = widthRatio.coerceAtMost(heightRatio)
+        if (displayScaleFactor <= 0.0) return null
+
+        val zoomFactor = requirements.maxOf { it.zoomFactor }
+        val dstWidth = displaySize.width * zoomFactor
+        val dstHeight = displaySize.height * zoomFactor
+        val tileSize = tileSizeFor((dstWidth * dstHeight).roundToInt())
+
+        if (image.pagesLoaded > 1 || tileSize == null) {
+            val actualScaleFactor = displayScaleFactor * zoomFactor
+            return checkedPixelCount(
+                IntSize(
+                    checkedRenderDimension(image.width, actualScaleFactor),
+                    checkedRenderDimension(image.pageHeight, actualScaleFactor),
+                )
+            ) * image.pagesLoaded
+        }
+
+        var pixels = 0L
+        for (geometry in tileGeometries(image, tileSize, displayScaleFactor)) {
+            val requiredSize = requiredTileRenderSize(
+                tileSourceBounds = geometry.sourceBounds,
+                tileDisplayRegion = geometry.displayRegion,
+                displayScaleFactor = displayScaleFactor,
+                displayArea = displaySize,
+                requirements = requirements,
+            ) ?: continue
+            pixels += checkedPixelCount(requiredSize)
+        }
+        return pixels
     }
 
     private class PreparedUpdateLeaseImpl : PreparedUpdateLease {
@@ -426,13 +560,7 @@ abstract class TilingReaderImage(
         this.displaySize.value = displaySize
         this.currentSize.value = IntSize(dstWidth.roundToInt(), dstHeight.roundToInt())
 
-        val displayPixCount = (dstWidth * dstHeight).roundToInt()
-        val tileSize = when (displayPixCount) {
-            in 0..tileThreshold1 -> null
-            in tileThreshold1..tileThreshold2 -> 1024
-            in tileThreshold2..tileThreshold3 -> 512
-            else -> 256
-        }
+        val tileSize = tileSizeFor((dstWidth * dstHeight).roundToInt())
 
         val budget = budgetFor(request.maxDisplaySize)
 
@@ -602,106 +730,96 @@ abstract class TilingReaderImage(
         var addedNewTiles = false
         var succeeded = false
         try {
-            var yTaken = 0
-            while (yTaken != image.height) {
-                var xTaken = 0
-                while (xTaken != image.width) {
-                    val tileRegion = IntRect(
-                        top = yTaken.coerceAtMost(image.height),
-                        bottom = (yTaken + tileSize).coerceAtMost(image.height),
-                        left = (xTaken).coerceAtMost(image.width),
-                        right = (xTaken + tileSize).coerceAtMost(image.width),
-                    )
-                    val tileDisplayRegion = Rect(
-                        (tileRegion.left * displayScaleFactor).toFloat(),
-                        (tileRegion.top * displayScaleFactor).toFloat(),
-                        (tileRegion.right * displayScaleFactor).toFloat(),
-                        (tileRegion.bottom * displayScaleFactor).toFloat()
-                    )
-                    xTaken = (xTaken + tileSize).coerceAtMost(image.width)
+            for (geometry in tileGeometries(image, tileSize, displayScaleFactor)) {
+                val tileRegion = geometry.sourceBounds
+                val tileDisplayRegion = geometry.displayRegion
 
-                    val requiredSize = requiredTileRenderSize(
-                        tileSourceBounds = tileRegion,
-                        tileDisplayRegion = tileDisplayRegion,
-                        displayScaleFactor = displayScaleFactor,
-                        displayArea = displayArea,
-                        requirements = requirements,
-                    ) ?: continue
+                val requiredSize = requiredTileRenderSize(
+                    tileSourceBounds = tileRegion,
+                    tileDisplayRegion = tileDisplayRegion,
+                    displayScaleFactor = displayScaleFactor,
+                    displayArea = displayArea,
+                    requirements = requirements,
+                ) ?: continue
 
-                    val key = TileCacheKey(tileRegion, tileDisplayRegion, generation)
-                    val retained = retainedTiles.value[key]
-                    if (retained != null && retained.handle.isSufficientFor(requiredSize)) {
-                        val frameOwnership = budget.retain(retained.handle)
-                        if (frameOwnership != null) {
-                            passTiles += PassTile(
-                                key = key,
-                                handle = retained.handle,
-                                frameOwnership = frameOwnership,
-                                insertedOwnership = null,
-                                tile = readerTileOf(retained.handle),
-                            )
-                            continue
-                        }
-                        // the native image died under us; drop the record and render again
-                        dropRetainedTile(key)
-                    }
-
-                    val reservation = budget.reserve(requiredSize.width, requiredSize.height)
-                        ?: throw TilePixelBudgetExceededException(
-                            "page ${pageId.pageNumber} cannot admit a " +
-                                "${requiredSize.width}x${requiredSize.height} tile at $tileRegion"
+                val key = TileCacheKey(tileRegion, tileDisplayRegion, generation)
+                val retained = retainedTiles.value[key]
+                if (retained != null && retained.handle.isSufficientFor(requiredSize)) {
+                    val frameOwnership = budget.retain(retained.handle)
+                    if (frameOwnership != null) {
+                        passTiles += PassTile(
+                            key = key,
+                            handle = retained.handle,
+                            frameOwnership = frameOwnership,
+                            insertedOwnership = null,
+                            tile = readerTileOf(retained.handle),
                         )
-
-                    val rendered = try {
-                        getImageRegion(image, tileRegion, requiredSize.width, requiredSize.height)
-                    } catch (e: Throwable) {
-                        reservation.close()
-                        throw e
+                        continue
                     }
-
-                    if (generationFor(displayArea) != generation) {
-                        reservation.close()
-                        rendered.frames.forEach { closeRenderImage(it) }
-                        return UpdateResult.STALE
-                    }
-
-                    // the tiled path draws a single frame; any extra frame is ours to close
-                    rendered.frames.drop(1).forEach { closeRenderImage(it) }
-                    val owned = TileHandle.create(
-                        renderImage = rendered.frames.first(),
-                        sourceBounds = tileRegion,
-                        displayRegion = tileDisplayRegion,
-                        renderSize = IntSize(rendered.width, rendered.height),
-                        renderGeneration = generation,
-                        closeImage = { closeRenderImage(it) },
-                    )
-                    val admitted = budget.attach(reservation, owned)
-                        ?: throw IllegalStateException(
-                            "page ${pageId.pageNumber} tile render exceeded its " +
-                                "${requiredSize.width}x${requiredSize.height} reservation"
-                        )
-
-                    val insertedOwnership = budget.retain(admitted.handle)
-                    val frameOwnership = insertedOwnership?.let { budget.retain(admitted.handle) }
-                    admitted.ownership.close()
-                    if (insertedOwnership == null || frameOwnership == null) {
-                        insertedOwnership?.close()
-                        throw IllegalStateException(
-                            "page ${pageId.pageNumber} could not take ownership of a rendered tile"
-                        )
-                    }
-
-                    putRetainedTile(key, RetainedTile(admitted.handle, insertedOwnership))
-                    passTiles += PassTile(
-                        key = key,
-                        handle = admitted.handle,
-                        frameOwnership = frameOwnership,
-                        insertedOwnership = insertedOwnership,
-                        tile = readerTileOf(admitted.handle),
-                    )
-                    addedNewTiles = true
+                    // the native image died under us; drop the record and render again
+                    dropRetainedTile(key)
                 }
-                yTaken = (yTaken + tileSize).coerceAtMost(image.height)
+
+                val reservation = budget.reserve(requiredSize.width, requiredSize.height)
+                    ?: run {
+                        // demand may take pixels back from prefetched neighbour coverage; the
+                        // tiles this pass already owns are protected
+                        evictPrefetched(protectedKeys = passTiles.mapTo(mutableSetOf()) { it.key })
+                        budget.reserve(requiredSize.width, requiredSize.height)
+                    }
+                    ?: throw TilePixelBudgetExceededException(
+                        "page ${pageId.pageNumber} cannot admit a " +
+                            "${requiredSize.width}x${requiredSize.height} tile at $tileRegion"
+                    )
+
+                val rendered = try {
+                    getImageRegion(image, tileRegion, requiredSize.width, requiredSize.height)
+                } catch (e: Throwable) {
+                    reservation.close()
+                    throw e
+                }
+
+                if (generationFor(displayArea) != generation) {
+                    reservation.close()
+                    rendered.frames.forEach { closeRenderImage(it) }
+                    return UpdateResult.STALE
+                }
+
+                // the tiled path draws a single frame; any extra frame is ours to close
+                rendered.frames.drop(1).forEach { closeRenderImage(it) }
+                val owned = TileHandle.create(
+                    renderImage = rendered.frames.first(),
+                    sourceBounds = tileRegion,
+                    displayRegion = tileDisplayRegion,
+                    renderSize = IntSize(rendered.width, rendered.height),
+                    renderGeneration = generation,
+                    closeImage = { closeRenderImage(it) },
+                )
+                val admitted = budget.attach(reservation, owned)
+                    ?: throw IllegalStateException(
+                        "page ${pageId.pageNumber} tile render exceeded its " +
+                            "${requiredSize.width}x${requiredSize.height} reservation"
+                    )
+
+                val insertedOwnership = budget.retain(admitted.handle)
+                val frameOwnership = insertedOwnership?.let { budget.retain(admitted.handle) }
+                admitted.ownership.close()
+                if (insertedOwnership == null || frameOwnership == null) {
+                    insertedOwnership?.close()
+                    throw IllegalStateException(
+                        "page ${pageId.pageNumber} could not take ownership of a rendered tile"
+                    )
+                }
+
+                putRetainedTile(key, admitted.handle, insertedOwnership, isPrefetch = false)
+                passTiles += PassTile(
+                    key = key,
+                    handle = admitted.handle,
+                    frameOwnership = frameOwnership,
+                    insertedOwnership = insertedOwnership,
+                    tile = readerTileOf(admitted.handle),
+                )
+                addedNewTiles = true
             }
 
             val activeKeys = passTiles.mapTo(mutableSetOf()) { it.key }
@@ -731,7 +849,8 @@ abstract class TilingReaderImage(
                 passTiles.forEach { it.frameOwnership.close() }
             }
 
-            releaseRetainedTilesExcept(activeKeys)
+            retainDemandTiles(activeKeys)
+            evictToNormalBudget(protectedKeys = activeKeys, generation = generation)
             lastUsedScaleFactor = scaleFactor
             succeeded = true
             return if (shouldPublish) UpdateResult.PUBLISHED else UpdateResult.UNCHANGED
@@ -750,6 +869,159 @@ abstract class TilingReaderImage(
         }
     }
 
+    /**
+     * Renders the coverage [key] describes into the retained working set without publishing it.
+     *
+     * The pass touches no publication state at all: no `FrameData`, no size flows, no lease. It
+     * checks the arbiter after every native render so demand work waits at most one tile, and it
+     * stops before the retained working set would leave its normal budget.
+     */
+    private suspend fun doPrefetch(key: PrefetchKey) {
+        val image = getCurrentImage()
+        val displaySize = calculateSizeForArea(key.maxDisplaySize, stretchImages.value) ?: return
+        if (displaySize.width <= 0 || displaySize.height <= 0) return
+
+        val widthRatio = displaySize.width.toDouble() / image.width
+        val heightRatio = displaySize.height.toDouble() / image.pageHeight
+        val displayScaleFactor = widthRatio.coerceAtMost(heightRatio)
+        if (displayScaleFactor <= 0.0) return
+
+        val zoomFactor = key.requirements.maxOf { it.zoomFactor }
+        val dstWidth = displaySize.width * zoomFactor
+        val dstHeight = displaySize.height * zoomFactor
+        // a page that renders as a single full resize has no independently retainable tiles
+        val tileSize = tileSizeFor((dstWidth * dstHeight).roundToInt()) ?: return
+
+        val budget = budgetFor(key.maxDisplaySize)
+        val normalBudget = pixelBudgetNormal
+        val generation = generationFor(displaySize)
+        var renderedTiles = 0
+
+        for (geometry in tileGeometries(image, tileSize, displayScaleFactor)) {
+            if (arbiter.shouldYieldPrefetch(key.generation)) {
+                logger.debug {
+                    "page ${pageId.pageNumber} prefetch yielded after $renderedTiles tiles"
+                }
+                return
+            }
+
+            val requiredSize = requiredTileRenderSize(
+                tileSourceBounds = geometry.sourceBounds,
+                tileDisplayRegion = geometry.displayRegion,
+                displayScaleFactor = displayScaleFactor,
+                displayArea = displaySize,
+                requirements = key.requirements,
+            ) ?: continue
+
+            val cacheKey = TileCacheKey(geometry.sourceBounds, geometry.displayRegion, generation)
+            val retained = retainedTiles.value[cacheKey]
+            if (retained != null && retained.handle.isSufficientFor(requiredSize)) continue
+
+            if (retainedPixels() + checkedPixelCount(requiredSize) > normalBudget) {
+                logger.debug {
+                    "page ${pageId.pageNumber} prefetch stopped at the normal working set " +
+                        "budget after $renderedTiles tiles"
+                }
+                return
+            }
+
+            val reservation = budget.reserve(requiredSize.width, requiredSize.height)
+            if (reservation == null) {
+                logger.debug { "page ${pageId.pageNumber} prefetch stopped at the hard peak" }
+                return
+            }
+
+            val rendered = try {
+                getImageRegion(image, geometry.sourceBounds, requiredSize.width, requiredSize.height)
+            } catch (e: Throwable) {
+                reservation.close()
+                throw e
+            }
+
+            // a producing input change or an arriving demand request makes this output useless
+            if (generationFor(displaySize) != generation || arbiter.shouldYieldPrefetch(key.generation)) {
+                reservation.close()
+                rendered.frames.forEach { closeRenderImage(it) }
+                return
+            }
+
+            rendered.frames.drop(1).forEach { closeRenderImage(it) }
+            val owned = TileHandle.create(
+                renderImage = rendered.frames.first(),
+                sourceBounds = geometry.sourceBounds,
+                displayRegion = geometry.displayRegion,
+                renderSize = IntSize(rendered.width, rendered.height),
+                renderGeneration = generation,
+                closeImage = { closeRenderImage(it) },
+            )
+            // attach and retain already release the tile on refusal, so an unadmitted
+            // prefetch tile closes its native image without reaching the working set
+            val admitted = budget.attach(reservation, owned)
+            if (admitted == null) {
+                logger.warn { "page ${pageId.pageNumber} discarded an oversized prefetch tile" }
+                return
+            }
+            val ownership = budget.retain(admitted.handle)
+            admitted.ownership.close()
+            if (ownership == null) return
+
+            putRetainedTile(cacheKey, admitted.handle, ownership, isPrefetch = true)
+            renderedTiles += 1
+        }
+
+        logger.debug { "page ${pageId.pageNumber} prefetched $renderedTiles tiles" }
+    }
+
+    private fun tileSizeFor(displayPixCount: Int): Int? = when (displayPixCount) {
+        in 0..tileThreshold1 -> null
+        in tileThreshold1..tileThreshold2 -> 1024
+        in tileThreshold2..tileThreshold3 -> 512
+        else -> 256
+    }
+
+    /** Source tile grid and its fitted display rectangles, shared by demand and prefetch passes. */
+    private fun tileGeometries(
+        image: KomeliaImage,
+        tileSize: Int,
+        displayScaleFactor: Double,
+    ): List<TileGeometry> {
+        val geometries = mutableListOf<TileGeometry>()
+        var yTaken = 0
+        while (yTaken != image.height) {
+            var xTaken = 0
+            while (xTaken != image.width) {
+                val tileRegion = IntRect(
+                    top = yTaken.coerceAtMost(image.height),
+                    bottom = (yTaken + tileSize).coerceAtMost(image.height),
+                    left = (xTaken).coerceAtMost(image.width),
+                    right = (xTaken + tileSize).coerceAtMost(image.width),
+                )
+                geometries += TileGeometry(
+                    sourceBounds = tileRegion,
+                    displayRegion = Rect(
+                        (tileRegion.left * displayScaleFactor).toFloat(),
+                        (tileRegion.top * displayScaleFactor).toFloat(),
+                        (tileRegion.right * displayScaleFactor).toFloat(),
+                        (tileRegion.bottom * displayScaleFactor).toFloat()
+                    ),
+                )
+                xTaken = (xTaken + tileSize).coerceAtMost(image.width)
+            }
+            yTaken = (yTaken + tileSize).coerceAtMost(image.height)
+        }
+        return geometries
+    }
+
+    /** Unique live native pixels the retained working set holds; a shared handle counts once. */
+    private fun retainedPixels(): Long {
+        val counted = mutableSetOf<TileHandle>()
+        var pixels = 0L
+        for (tile in retainedTiles.value.values) {
+            if (counted.add(tile.handle)) pixels += tile.handle.pixelCount
+        }
+        return pixels
+    }
+
     private fun readerTileOf(handle: TileHandle) = ReaderImageTile(
         size = handle.renderSize,
         displayRegion = handle.displayRegion,
@@ -758,7 +1030,8 @@ abstract class TilingReaderImage(
     )
 
     private fun budgetFor(maxDisplaySize: IntSize): TilePixelBudget {
-        val peak = hardPeakDisplayAreas * checkedPixelCount(maxDisplaySize)
+        val displayPixels = checkedPixelCount(maxDisplaySize)
+        val peak = checkedDisplayAreas(displayPixels, hardPeakDisplayAreas)
         val existing = pixelBudget
         if (existing != null && peak == pixelBudgetPeak) return existing
 
@@ -768,7 +1041,15 @@ abstract class TilingReaderImage(
         val created = TilePixelBudget(peak)
         pixelBudget = created
         pixelBudgetPeak = peak
+        pixelBudgetNormal = checkedDisplayAreas(displayPixels, normalWorkingSetDisplayAreas)
         return created
+    }
+
+    private fun checkedDisplayAreas(displayPixels: Long, areas: Long): Long {
+        check(displayPixels <= Long.MAX_VALUE / areas) {
+            "page ${pageId.pageNumber} display area $displayPixels overflows a $areas area budget"
+        }
+        return areas * displayPixels
     }
 
     private fun generationFor(displaySize: IntSize): Long {
@@ -783,9 +1064,13 @@ abstract class TilingReaderImage(
             rendererEpoch = rendererEpoch,
         )
         if (fingerprint != renderFingerprint) {
+            // the very first fingerprint is not a change, so it must not cancel prefetch that
+            // was queued before this page ever rendered
+            val hadFingerprint = renderFingerprint != null
             renderFingerprint = fingerprint
             renderGeneration += 1
             lastUsedScaleFactor = null
+            if (hadFingerprint) arbiter.invalidatePrefetchBefore(renderGeneration)
         }
         return renderGeneration
     }
@@ -798,9 +1083,92 @@ abstract class TilingReaderImage(
         rendererEpoch += 1
     }
 
-    private fun putRetainedTile(key: TileCacheKey, tile: RetainedTile) {
+    private fun putRetainedTile(
+        key: TileCacheKey,
+        handle: TileHandle,
+        ownership: TileOwnership,
+        isPrefetch: Boolean,
+    ) {
+        retainedSequence += 1
+        // a demand-class entry stays demand-class: prefetch raising the resolution of a tile the
+        // current viewport uses must not turn that coverage into the first eviction candidate
+        val replacedDemandEntry = retainedTiles.value[key]?.isPrefetch == false
+        val tile = RetainedTile(
+            handle = handle,
+            ownership = ownership,
+            isPrefetch = isPrefetch && !replacedDemandEntry,
+            sequence = retainedSequence,
+        )
         val previous = retainedTiles.getAndUpdate { it + (key to tile) }[key]
         previous?.ownership?.close()
+    }
+
+    /**
+     * Keeps the coverage this pass published as demand-class working set, releases demand-class
+     * coverage the pass no longer needs, and leaves prefetched neighbour coverage in place for
+     * [evictToNormalBudget] to arbitrate.
+     */
+    private fun retainDemandTiles(activeKeys: Set<TileCacheKey>) {
+        val retired = mutableListOf<TileOwnership>()
+        retainedTiles.update { current ->
+            retired.clear()
+            val next = LinkedHashMap<TileCacheKey, RetainedTile>(current.size)
+            for ((key, tile) in current) {
+                if (key in activeKeys || tile.isPrefetch) next[key] = tile
+                else retired += tile.ownership
+            }
+            next
+        }
+        for (key in activeKeys) retainedTiles.value[key]?.isPrefetch = false
+        retired.forEach { it.close() }
+    }
+
+    /**
+     * Brings the retained working set back inside its normal budget. Stale coverage goes first,
+     * then prefetched coverage in reverse fill order, so the opposite-direction neighbour is
+     * dropped before the preferred one that was filled first.
+     *
+     * Eviction only removes working-set eligibility. Frame and lease references are counted
+     * separately, so a visible or leased tile survives losing its working-set entry.
+     */
+    private fun evictToNormalBudget(protectedKeys: Set<TileCacheKey>, generation: Long) {
+        var pixels = retainedPixels()
+        if (pixels <= pixelBudgetNormal) return
+
+        val victims = retainedTiles.value.entries
+            .filter { it.key !in protectedKeys }
+            .sortedWith(
+                compareBy<Map.Entry<TileCacheKey, RetainedTile>> {
+                    if (it.key.generation != generation) 0 else 1
+                }
+                    .thenBy { if (it.value.isPrefetch) 0 else 1 }
+                    .thenByDescending { it.value.sequence }
+            )
+
+        var evicted = 0
+        for (victim in victims) {
+            if (pixels <= pixelBudgetNormal) break
+            dropRetainedTile(victim.key)
+            pixels = retainedPixels()
+            evicted += 1
+        }
+
+        if (evicted > 0) {
+            logger.debug {
+                "page ${pageId.pageNumber} evicted $evicted retained tiles, " +
+                    "working set now $pixels pixels against $pixelBudgetNormal"
+            }
+        }
+    }
+
+    /** Releases every prefetched working-set entry outside [protectedKeys]. */
+    private fun evictPrefetched(protectedKeys: Set<TileCacheKey>) {
+        val evictable = { key: TileCacheKey, tile: RetainedTile -> tile.isPrefetch && key !in protectedKeys }
+        val previous = retainedTiles.getAndUpdate { current ->
+            current.filterNot { (key, tile) -> evictable(key, tile) }
+        }
+        previous.filter { (key, tile) -> evictable(key, tile) }
+            .values.forEach { it.ownership.close() }
     }
 
     private fun dropRetainedTile(key: TileCacheKey) {
@@ -813,6 +1181,9 @@ abstract class TilingReaderImage(
     }
 
     override fun close() {
+        // draining first unblocks callers awaiting queued work that the cancelled lane will
+        // never run
+        arbiter.close()
         processingScope.cancel()
         animationScope.cancel()
         imageAwaitScope.cancel()
@@ -926,6 +1297,15 @@ abstract class TilingReaderImage(
     private class RetainedTile(
         val handle: TileHandle,
         val ownership: TileOwnership,
+        /** working-set class; a published pass adopts its own coverage as demand-class */
+        var isPrefetch: Boolean,
+        /** fill order, so the most recently prefetched coverage is evicted first */
+        val sequence: Long,
+    )
+
+    private data class TileGeometry(
+        val sourceBounds: IntRect,
+        val displayRegion: Rect,
     )
 
     private class PassTile(

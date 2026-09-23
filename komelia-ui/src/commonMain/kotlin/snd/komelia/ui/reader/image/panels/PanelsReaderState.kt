@@ -6,8 +6,10 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.toIntSize
 import androidx.compose.ui.unit.toSize
 import io.github.oshai.kotlinlogging.KotlinLogging
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
@@ -33,6 +35,8 @@ import snd.komelia.AppNotifications
 import snd.komelia.image.BookImageLoader
 import snd.komelia.image.ImageRect
 import snd.komelia.image.KomeliaPanelDetector
+import snd.komelia.image.PreparedTransitionCoverage
+import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.ReaderImage.PageId
 import snd.komelia.image.ReaderImageResult
@@ -53,6 +57,7 @@ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookEnd
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookStart
 import snd.komga.client.common.KomgaReadingDirection
+import kotlin.concurrent.Volatile
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.time.measureTimedValue
@@ -96,6 +101,10 @@ class PanelsReaderState(
         closeValue = { it.imageResult?.image?.close() },
     )
     private val pendingPageIndex = MutableStateFlow<Int?>(null)
+
+    /** generation-scoped neighbour prefetch; replaced or cancelled whenever its inputs change */
+    @Volatile
+    private var prefetchJob: Job? = null
     // The final animation value can reach the conflated observer after the controller returns to Idle.
     // Suppress only that exact duplicate of the explicit post-lease destination update.
     private val suppressedViewportUpdate = MutableStateFlow<ViewportUpdateSnapshot?>(null)
@@ -125,6 +134,8 @@ class PanelsReaderState(
                 panelTransitionController.onViewportChanged(change) {
                     currentPage.value?.let { page ->
                         updateImageState(page, screenScaleState)
+                        // the viewport this prefetch was keyed on just changed
+                        scheduleAdjacentPrefetch()
                     }
                 }
                 delay(100)
@@ -135,15 +146,23 @@ class PanelsReaderState(
             .drop(1)
             .conflate()
             .onEach {
+                // the fitted geometry changed, so nothing keyed on the old one is reusable
+                cancelAdjacentPrefetch()
                 when (panelTransitionController.phase.value) {
                     PanelTransitionPhase.Animating -> cancelPanelTransition()
                     PanelTransitionPhase.Preparing -> {
                         cancelPanelTransition()
-                        currentPage.value?.let { page -> updateImageState(page, screenScaleState) }
+                        currentPage.value?.let { page ->
+                            updateImageState(page, screenScaleState)
+                            scheduleAdjacentPrefetch()
+                        }
                     }
 
                     PanelTransitionPhase.Idle -> {
-                        currentPage.value?.let { page -> updateImageState(page, screenScaleState) }
+                        currentPage.value?.let { page ->
+                            updateImageState(page, screenScaleState)
+                            scheduleAdjacentPrefetch()
+                        }
                     }
                 }
                 delay(100)
@@ -372,7 +391,10 @@ class PanelsReaderState(
                 pendingPageIndex.compareAndSet(pageIndex, null)
                 true
             },
-            afterReady = { preloadImagesBetween(pageIndex) },
+            afterReady = {
+                scheduleAdjacentPrefetch()
+                preloadImagesBetween(pageIndex)
+            },
         )
     }
 
@@ -532,46 +554,48 @@ class PanelsReaderState(
         val areaSize = screenScaleState.areaSize.value
         val targetSize = screenScaleState.targetSize.value.toIntSize()
         val sourceTransformation = screenScaleState.transformation.value
-        val (targetOffset, targetZoom) = getPanelOffsetAndZoom(
-            imageSize = panelData.originalImageSize,
+        val target = panelTarget(
+            panelData = panelData,
             areaSize = areaSize,
             targetSize = targetSize,
+            sourceTransformation = sourceTransformation,
             panel = panel,
-        )
-        val targetZoomStartTransformation = screenScaleState.transformationForZoom(targetZoom)
-        val targetTransformation = ScreenScaleState.Transformation(
-            offset = targetOffset,
-            scale = targetZoomStartTransformation.scale,
-        )
-        val corridor = transitionCorridor(
-            regions = listOf(
-                visibleDisplayRegion(targetSize, areaSize, sourceTransformation),
-                visibleDisplayRegion(targetSize, areaSize, targetZoomStartTransformation),
-                visibleDisplayRegion(targetSize, areaSize, targetTransformation),
-            ),
-            displaySize = targetSize,
-        )
+        ) ?: return false
+
+        // the neighbour prefetch was keyed on the viewport this transition is about to leave
+        cancelAdjacentPrefetch()
+
         val transition = PreparedPanelTransition(
             sourcePage = sourcePage,
             sourceIndex = sourceIndex,
             areaSize = areaSize,
             targetSize = targetSize,
             targetPanelIndex = targetPanelIndex,
-            targetZoom = targetZoom,
-            targetOffset = targetOffset,
-            corridor = corridor,
+            targetZoom = target.targetZoom,
+            targetOffset = target.targetOffset,
+            requirements = target.requirements,
         )
+        var coverage: PreparedTransitionCoverage = PreparedTransitionCoverage.Rejected
 
         return panelTransitionController.launch(
             prepare = {
-                image.prepareUpdate(
+                val prepared = image.prepareTransitionUpdate(
                     maxDisplaySize = transition.areaSize,
-                    zoomFactor = targetZoomStartTransformation.scale,
-                    visibleDisplaySize = transition.corridor,
+                    animatedRequirements = transition.requirements.animatedRequirements,
+                    endpointRequirements = transition.requirements.endpointRequirements,
                 )
+                coverage = prepared
+                when (prepared) {
+                    is PreparedTransitionCoverage.Animated -> prepared.lease
+                    is PreparedTransitionCoverage.EndpointOnly -> prepared.lease
+                    // nothing was rendered or published, so there is no coverage to hold
+                    PreparedTransitionCoverage.Rejected -> PreparedUpdateLease {}
+                }
             },
+            // a rejected transition must not activate: no movement, and no reconciliation either
             isStillValid = {
-                currentPage.value === transition.sourcePage &&
+                coverage != PreparedTransitionCoverage.Rejected &&
+                    currentPage.value === transition.sourcePage &&
                     currentPageIndex.value == transition.sourceIndex &&
                     screenScaleState.areaSize.value == transition.areaSize &&
                     screenScaleState.targetSize.value.toIntSize() == transition.targetSize &&
@@ -583,11 +607,22 @@ class PanelsReaderState(
                     panel = transition.targetPanelIndex,
                     isLastPanelZoomOutActive = false,
                 )
-                logger.info {
-                    "panel transition corridor ${transition.corridor} ready at scale " +
-                        targetZoomStartTransformation.scale
-                }
                 screenScaleState.setZoom(transition.targetZoom)
+
+                if (coverage is PreparedTransitionCoverage.EndpointOnly) {
+                    // only the endpoints are covered, so the path between them must not be drawn
+                    logger.info {
+                        "panel transition jumped to ${transition.requirements.destination.region}: " +
+                            "animated coverage did not fit the render budget"
+                    }
+                    screenScaleState.setOffset(transition.targetOffset)
+                    return@launch
+                }
+
+                logger.info {
+                    "panel transition coverage ${transition.requirements.swept.region} ready at " +
+                        "scale ${transition.requirements.targetTransformation.scale}"
+                }
                 val animation = screenScaleState.scrollTo(
                     offset = transition.targetOffset,
                     durationMillis = transitionDurationMillis,
@@ -603,8 +638,111 @@ class PanelsReaderState(
                     suppressedViewportUpdate.value = viewportUpdateSnapshot(page, screenScaleState)
                     updateImageState(page, screenScaleState, force = true)
                 }
+                scheduleAdjacentPrefetch()
             },
         )
+    }
+
+    /**
+     * Resolves what a transition to [panel] has to render and where it ends up, or null when the
+     * geometry is not usable yet.
+     */
+    private fun panelTarget(
+        panelData: PanelData,
+        areaSize: IntSize,
+        targetSize: IntSize,
+        sourceTransformation: ScreenScaleState.Transformation,
+        panel: ImageRect,
+    ): PanelTarget? {
+        if (areaSize.width <= 0 || areaSize.height <= 0) return null
+        if (targetSize.width <= 0 || targetSize.height <= 0) return null
+        if (!sourceTransformation.scale.isFinite() || sourceTransformation.scale <= 0f) return null
+
+        val (targetOffset, targetZoom) = getPanelOffsetAndZoom(
+            imageSize = panelData.originalImageSize,
+            areaSize = areaSize,
+            targetSize = targetSize,
+            panel = panel,
+        )
+        if (!targetZoom.isFinite() || targetZoom <= 0f) return null
+
+        val targetZoomStartTransformation = screenScaleState.transformationForZoom(targetZoom)
+        val targetTransformation = ScreenScaleState.Transformation(
+            offset = targetOffset,
+            scale = targetZoomStartTransformation.scale,
+        )
+
+        return try {
+            PanelTarget(
+                requirements = panelTransitionRequirements(
+                    targetSize = targetSize,
+                    areaSize = areaSize,
+                    sourceTransformation = sourceTransformation,
+                    targetZoomStartTransformation = targetZoomStartTransformation,
+                    targetTransformation = targetTransformation,
+                ),
+                targetZoom = targetZoom,
+                targetOffset = targetOffset,
+            )
+        } catch (e: IllegalArgumentException) {
+            // a degenerate viewport has nothing to render; the caller keeps its current frame
+            logger.debug(e) { "panel transition geometry is not renderable" }
+            null
+        }
+    }
+
+    /**
+     * Fills the coverage the immediate reading-direction neighbour needs, then the opposite one,
+     * so a transition the user is about to ask for finds its tiles already rendered.
+     *
+     * Best effort and generation scoped: any page, image or geometry change cancels it, and a
+     * failure is logged rather than surfaced, because nothing on screen depends on it.
+     */
+    private fun scheduleAdjacentPrefetch() {
+        cancelAdjacentPrefetch()
+
+        val page = currentPage.value ?: return
+        val panelData = page.panelData ?: return
+        val image = (page.imageResult as? ReaderImageResult.Success)?.image ?: return
+        val panelIndex = currentPageIndex.value.panel
+        val areaSize = screenScaleState.areaSize.value
+        val targetSize = screenScaleState.targetSize.value.toIntSize()
+        val sourceTransformation = screenScaleState.transformation.value
+
+        val neighbours = listOfNotNull(
+            panelData.panels.getOrNull(panelIndex + 1),
+            panelData.panels.getOrNull(panelIndex - 1),
+        )
+        if (neighbours.isEmpty()) return
+
+        prefetchJob = stateScope.launch {
+            for (neighbour in neighbours) {
+                val target = panelTarget(
+                    panelData = panelData,
+                    areaSize = areaSize,
+                    targetSize = targetSize,
+                    sourceTransformation = sourceTransformation,
+                    panel = neighbour,
+                ) ?: continue
+
+                try {
+                    image.prefetchUpdate(
+                        maxDisplaySize = areaSize,
+                        requirements = target.requirements.animatedRequirements,
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    logger.warn(e) { "panel neighbour prefetch failed" }
+                    return@launch
+                }
+            }
+        }
+    }
+
+    private fun cancelAdjacentPrefetch() {
+        prefetchJob?.cancel()
+        prefetchJob = null
     }
 
     private fun consumeSuppressedViewportUpdate(
@@ -632,6 +770,7 @@ class PanelsReaderState(
     )
 
     private fun cancelPanelTransition() {
+        cancelAdjacentPrefetch()
         panelTransitionController.cancel()
         screenScaleState.cancelScroll()
     }

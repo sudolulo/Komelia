@@ -48,6 +48,36 @@ interface ReaderImage : AutoCloseable {
         requirements: List<ViewportRenderRequirement>,
     ): PreparedUpdateLease
 
+    /**
+     * Prepare the coverage a panel transition needs, degrading instead of failing when the
+     * hard peak cannot hold all of it.
+     *
+     * The renderer publishes [animatedRequirements] when they fit, otherwise retries with
+     * [endpointRequirements], otherwise rejects the transition before rendering anything.
+     *
+     * The default implementation always animates: a renderer without a native pixel budget has
+     * nothing to degrade to. [TilingReaderImage] overrides it with real admission.
+     */
+    suspend fun prepareTransitionUpdate(
+        maxDisplaySize: IntSize,
+        animatedRequirements: List<ViewportRenderRequirement>,
+        endpointRequirements: List<ViewportRenderRequirement>,
+    ): PreparedTransitionCoverage = PreparedTransitionCoverage.Animated(
+        prepareUpdate(maxDisplaySize = maxDisplaySize, requirements = animatedRequirements)
+    )
+
+    /**
+     * Populate reusable tile coverage for [requirements] without publishing it.
+     *
+     * Best effort and bounded: it never replaces the visible painter, never changes the size
+     * flows, never acquires a preparation lease, yields the processing lane to demand work at
+     * every tile boundary, and stops rather than pushing the retained working set over budget.
+     */
+    suspend fun prefetchUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    )
+
     /** normal-viewport convenience path over [prepareUpdate] with a single requirement */
     suspend fun prepareUpdate(
         maxDisplaySize: IntSize,

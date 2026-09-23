@@ -15,6 +15,7 @@ import kotlinx.coroutines.test.runTest
 import snd.komelia.image.KomeliaImage
 import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImage
+import snd.komelia.image.ViewportRenderRequirement
 import snd.komelia.ui.reader.image.ScreenScaleState
 import snd.komelia.ui.reader.image.ScreenScaleState.Transformation
 import kotlin.test.Test
@@ -348,10 +349,14 @@ private class TestReaderImage : ReaderImage {
         viewportUpdates++
     }
 
+    override suspend fun prefetchUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    ) = Unit
+
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
-        zoomFactor: Float,
-        visibleDisplaySize: IntRect,
+        requirements: List<ViewportRenderRequirement>,
     ): PreparedUpdateLease {
         preparation.await()
         preparedUpdateHeld = true

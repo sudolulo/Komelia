@@ -1,7 +1,6 @@
 package snd.komelia.ui.reader.image.panels
 
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -134,5 +133,12 @@ internal data class PreparedPanelTransition(
     val targetPanelIndex: Int,
     val targetZoom: Float,
     val targetOffset: Offset,
-    val corridor: IntRect,
+    val requirements: PanelTransitionRequirements,
+)
+
+/** Where a transition to a single panel ends up, and everything it has to render to get there. */
+internal data class PanelTarget(
+    val requirements: PanelTransitionRequirements,
+    val targetZoom: Float,
+    val targetOffset: Offset,
 )

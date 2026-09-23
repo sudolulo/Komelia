@@ -12,6 +12,7 @@ import kotlinx.coroutines.test.runTest
 import snd.komelia.image.KomeliaImage
 import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImage
+import snd.komelia.image.ViewportRenderRequirement
 import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -51,12 +52,16 @@ class PanelsReaderStateTest {
 
         override suspend fun prepareUpdate(
             maxDisplaySize: IntSize,
-            zoomFactor: Float,
-            visibleDisplaySize: IntRect,
+            requirements: List<ViewportRenderRequirement>,
         ): PreparedUpdateLease {
             preparation.await()
             return PreparedUpdateLease {}
         }
+
+        override suspend fun prefetchUpdate(
+            maxDisplaySize: IntSize,
+            requirements: List<ViewportRenderRequirement>,
+        ) = Unit
 
         fun releasePreparation() {
             preparation.complete(Unit)

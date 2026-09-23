@@ -11,6 +11,7 @@ import cafe.adriel.voyager.core.annotation.InternalVoyagerApi
 import cafe.adriel.voyager.core.screen.Screen
 import cafe.adriel.voyager.navigator.Navigator
 import cafe.adriel.voyager.navigator.NavigatorDisposeBehavior
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,9 +33,11 @@ import snd.komelia.image.KomeliaImage
 import snd.komelia.image.KomeliaImageDecoder
 import snd.komelia.image.KomeliaPanelDetector
 import snd.komelia.image.ReaderImage
+import snd.komelia.image.PreparedTransitionCoverage
 import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImageFactory
 import snd.komelia.image.ReaderImageResult
+import snd.komelia.image.ViewportRenderRequirement
 import snd.komelia.komga.api.KomgaBookApi
 import snd.komelia.komga.api.KomgaReadListApi
 import snd.komelia.komga.api.KomgaSeriesApi
@@ -50,8 +53,60 @@ import snd.komelia.ui.reader.image.ScreenScaleState
 import snd.komga.client.book.KomgaBookId
 import java.lang.reflect.Proxy
 import java.util.Collections
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
+import kotlin.test.assertSame
+import kotlin.test.assertTrue
+
+private val fixtureAreaSize = IntSize(100, 100)
+private val fixtureImageSize = IntSize(300, 300)
+
+// three non overlapping panels of a 300x300 page fitted into a 100x100 area; every panel fills
+// the area at zoom 3, so panel 1 sits at offset zero, panel 0 at (100, 100) and panel 2 at
+// (-100, -100)
+private val defaultPanels = listOf(
+    ImageRect(0, 0, 100, 100),
+    ImageRect(100, 100, 200, 200),
+    ImageRect(200, 200, 300, 300),
+)
+
+private val sourceRegion = IntRect(33, 33, 66, 66)
+
+// source, zoom start, destination, swept
+private val nextPanelRegions = listOf(
+    sourceRegion,
+    sourceRegion,
+    IntRect(67, 67, 100, 100),
+    IntRect(33, 33, 100, 100),
+)
+
+private val previousPanelRegions = listOf(
+    sourceRegion,
+    sourceRegion,
+    IntRect(0, 0, 33, 33),
+    IntRect(0, 0, 66, 66),
+)
+
+/**
+ * The panel zoom is derived through float scale arithmetic, so it lands within rounding distance
+ * of 3 rather than exactly on it. The fitted regions are integers and are compared exactly.
+ */
+private fun assertRequirements(
+    expectedRegions: List<IntRect>,
+    expectedZoom: Float,
+    actual: List<ViewportRenderRequirement>,
+) {
+    assertEquals(expectedRegions, actual.map { it.region })
+    for (requirement in actual) {
+        assertEquals(expectedZoom, requirement.zoomFactor, 0.0001f)
+    }
+}
 
 class PanelsReaderStateTransitionTest {
     @Test
@@ -162,8 +217,12 @@ class PanelsReaderStateTransitionTest {
             val preparation = withTimeout(2_000) { image.preparationStarted.await() }
 
             assertEquals(IntSize(100, 100), preparation.maxDisplaySize)
-            assertEquals(3f, preparation.zoomFactor, 0.00001f)
-            assertEquals(IntRect(33, 33, 100, 100), preparation.visibleDisplaySize)
+            assertRequirements(nextPanelRegions, 3f, preparation.animatedRequirements)
+            assertRequirements(
+                listOf(sourceRegion, IntRect(67, 67, 100, 100)),
+                3f,
+                preparation.endpointRequirements,
+            )
             assertEquals(PanelsReaderState.PageIndex(0, 0, false), state.currentPageIndex.value)
             assertEquals(startTransformation, screenScaleState.transformation.value)
 
@@ -182,19 +241,249 @@ class PanelsReaderStateTransitionTest {
             }
             delay(250)
 
-            assertEquals(
-                listOf(
-                    ImageUpdate(
-                        maxDisplaySize = IntSize(100, 100),
-                        zoomFactor = preparation.zoomFactor,
-                        visibleDisplaySize = IntRect(67, 67, 100, 100),
-                    ),
-                ),
-                image.viewportUpdates.toList(),
-            )
+            val destinationUpdate = image.viewportUpdates.single()
+            assertEquals(IntSize(100, 100), destinationUpdate.maxDisplaySize)
+            assertEquals(IntRect(67, 67, 100, 100), destinationUpdate.visibleDisplaySize)
+            assertEquals(3f, destinationUpdate.zoomFactor, 0.0001f)
         } finally {
             state.stop()
             animationScope.cancel()
+        }
+    }
+
+    @Test
+    fun `stable panel prefetches preferred next then previous`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.settle()
+
+            val requests = fixture.image.prefetchRequests.toList()
+            assertEquals(2, requests.size)
+            assertRequirements(nextPanelRegions, 3f, requests[0].requirements)
+            assertRequirements(previousPanelRegions, 3f, requests[1].requirements)
+            assertTrue(requests.all { it.maxDisplaySize == fixtureAreaSize })
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `warm next panel renders zero tiles before movement`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.settle()
+            val rendersBeforeTransition = fixture.image.nativeRenders
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            assertEquals(
+                rendersBeforeTransition,
+                fixture.image.nativeRenders,
+                "a warm neighbour transition must render no tiles before movement",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `cold next panel renders its coverage before movement`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            // never let a prefetch complete, so the transition finds nothing warm
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+            val rendersBeforeTransition = fixture.image.nativeRenders
+
+            fixture.state.nextPanel()
+            val preparation = withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            assertRequirements(nextPanelRegions, 3f, preparation.animatedRequirements)
+            assertEquals(
+                rendersBeforeTransition + preparation.animatedRequirements.toSet().size,
+                fixture.image.nativeRenders,
+                "a cold transition must render its complete coverage before movement",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `page or geometry change invalidates scheduled prefetch`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.settle()
+            fixture.image.blockPrefetch()
+            fixture.image.prefetchRequests.clear()
+            fixture.screenScaleState.setOffset(Offset(2f, 2f))
+            withTimeout(2_000) {
+                while (fixture.image.prefetchRequests.isEmpty()) delay(10)
+            }
+
+            fixture.screenScaleState.setAreaSize(IntSize(120, 120))
+
+            withTimeout(2_000) {
+                while (fixture.image.prefetchCancellations == 0) delay(10)
+            }
+            withTimeout(2_000) {
+                while (fixture.image.prefetchRequests.none { it.maxDisplaySize == IntSize(120, 120) }) {
+                    delay(10)
+                }
+            }
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `prefetch failure does not break current reader`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.prefetchFailure = IllegalStateException("prefetch render failed")
+            fixture.awaitViewportObserver()
+            withTimeout(2_000) {
+                while (fixture.image.prefetchRequests.isEmpty()) delay(10)
+            }
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+
+            assertNull(fixture.image.error.value)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `blocked prefetch does not delay a panel transition`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+            withTimeout(2_000) {
+                while (fixture.image.prefetchRequests.isEmpty()) delay(10)
+            }
+
+            fixture.state.nextPanel()
+
+            // the transition prepares while the prefetch is still suspended
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `over budget animation publishes complete endpoints before transform jump`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.transitionOutcome = TransitionOutcome.ENDPOINT_ONLY
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+            val startTransformation = fixture.screenScaleState.transformation.value
+
+            fixture.state.nextPanel()
+            val preparation = withTimeout(2_000) { fixture.image.preparationStarted.await() }
+
+            assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
+            assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
+
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+            // the destination offset is computed in float scale arithmetic, so it lands within
+            // rounding distance of (-100, -100) rather than exactly on it
+            withTimeout(2_000) {
+                while (fixture.screenScaleState.transformation.value.offset.x > -99.9f) delay(10)
+            }
+
+            // both endpoints are complete, the swept path was never rendered
+            assertEquals(2, preparation.endpointRequirements.size)
+            assertTrue(preparation.endpointRequirements.all { fixture.image.hasCoverage(it) })
+            assertFalse(fixture.image.hasCoverage(preparation.animatedRequirements.last()))
+
+            // the destination is reached without a single animation frame, so scrollTo was not used
+            assertEquals(0, fixture.frameClock.awaitedFrames)
+            assertEquals(3f, fixture.screenScaleState.zoom.value, 0.0001f)
+            val destination = fixture.screenScaleState.transformation.value.offset
+            assertEquals(-100f, destination.x, 0.01f)
+            assertEquals(-100f, destination.y, 0.01f)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `overlapping endpoints stay separate requirements in fallback`() = runBlocking {
+        val fixture = panelFixture(
+            panels = listOf(
+                ImageRect(100, 100, 200, 200),
+                ImageRect(120, 120, 220, 220),
+            ),
+            startPanel = 0,
+        )
+        try {
+            fixture.image.transitionOutcome = TransitionOutcome.ENDPOINT_ONLY
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+
+            fixture.state.nextPanel()
+            val preparation = withTimeout(2_000) { fixture.image.preparationStarted.await() }
+
+            val (source, destination) = preparation.endpointRequirements
+            assertEquals(2, preparation.endpointRequirements.size)
+            assertTrue(
+                source.region.overlaps(destination.region),
+                "expected overlapping endpoints, got ${source.region} and ${destination.region}",
+            )
+            assertNotEquals(source, destination, "overlapping endpoints must stay two requirements")
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `endpoint admission failure preserves frame index zoom and offset`() = runBlocking {
+        val fixture = panelFixture()
+        try {
+            fixture.image.transitionOutcome = TransitionOutcome.REJECTED
+            fixture.image.blockPrefetch()
+            fixture.awaitViewportObserver()
+            val startTransformation = fixture.screenScaleState.transformation.value
+            val startPainter = fixture.image.painter.value
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.releasePreparation.complete(Unit)
+            delay(300)
+
+            assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
+            assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
+            assertEquals(3f, fixture.screenScaleState.zoom.value, 0.0001f)
+            assertSame(startPainter, fixture.image.painter.value)
+            assertEquals(0, fixture.frameClock.awaitedFrames)
+            assertEquals(emptyList(), fixture.image.viewportUpdates.toList())
+        } finally {
+            fixture.close()
         }
     }
 
@@ -223,13 +512,97 @@ class PanelsReaderStateTransitionTest {
 
 private class ControlledFrameClock : MonotonicFrameClock {
     private val frames = Channel<Long>(Channel.UNLIMITED)
+    private val requested = AtomicInteger()
+
+    /** how many times an animation asked for a frame; zero means nothing animated at all */
+    val awaitedFrames: Int get() = requested.get()
 
     suspend fun sendFrame(timeNanos: Long) {
         frames.send(timeNanos)
     }
 
-    override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R =
-        onFrame(frames.receive())
+    override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R {
+        requested.incrementAndGet()
+        return onFrame(frames.receive())
+    }
+}
+
+private class PanelFixture(
+    val state: PanelsReaderState,
+    val image: ControlledReaderImage,
+    val screenScaleState: ScreenScaleState,
+    val frameClock: ControlledFrameClock,
+    private val animationScope: CoroutineScope,
+) {
+    /** drives the viewport until the reader's conflated observers are demonstrably running */
+    suspend fun awaitViewportObserver() {
+        withTimeout(2_000) {
+            var offset = 1f
+            while (image.viewportUpdates.isEmpty()) {
+                screenScaleState.setOffset(Offset(offset, offset))
+                offset = if (offset == 1f) 2f else 1f
+                delay(10)
+            }
+        }
+        delay(150)
+        image.viewportUpdates.clear()
+        screenScaleState.setOffset(Offset.Zero)
+        withTimeout(2_000) {
+            while (image.viewportUpdates.isEmpty()) delay(10)
+        }
+        delay(150)
+        image.viewportUpdates.clear()
+    }
+
+    /**
+     * Leaves the reader on a stable panel with both neighbours prefetched. The settled viewport
+     * offset of (1, 1) rounds to the same fitted regions as offset zero, so the recorded
+     * requirements are the ones the tests assert on.
+     */
+    suspend fun settle() {
+        awaitViewportObserver()
+        delay(400)
+        image.prefetchRequests.clear()
+        screenScaleState.setOffset(Offset(1f, 1f))
+        withTimeout(2_000) {
+            while (image.prefetchRequests.size < 2) delay(10)
+        }
+        delay(150)
+    }
+
+    fun close() {
+        state.stop()
+        animationScope.cancel()
+    }
+}
+
+@OptIn(InternalVoyagerApi::class)
+private suspend fun CoroutineScope.panelFixture(
+    panels: List<ImageRect> = defaultPanels,
+    startPanel: Int = 1,
+): PanelFixture {
+    val image = ControlledReaderImage(fixtureImageSize)
+    val frameClock = ControlledFrameClock()
+    val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + frameClock)
+    val screenScaleState = ScreenScaleState().apply {
+        composeScope = animationScope
+        setAreaSize(fixtureAreaSize)
+        setTargetSize(fixtureAreaSize.toSize())
+        setZoom(3f)
+    }
+    val state = panelsReaderState(screenScaleState)
+    state.currentPage.value = PanelsReaderState.PanelsPage(
+        metadata = PageMetadata(KomgaBookId("book"), 1, fixtureImageSize),
+        imageResult = ReaderImageResult.Success(image),
+        panelData = PanelsReaderState.PanelData(
+            panels = panels,
+            originalImageSize = fixtureImageSize,
+            panelCoversMajorityOfImage = false,
+        ),
+    )
+    state.currentPageIndex.value = PanelsReaderState.PageIndex(0, startPanel, false)
+    state.initialize()
+    return PanelFixture(state, image, screenScaleState, frameClock, animationScope)
 }
 
 private data class ImageUpdate(
@@ -238,12 +611,54 @@ private data class ImageUpdate(
     val visibleDisplaySize: IntRect,
 )
 
+private data class PrefetchRequest(
+    val maxDisplaySize: IntSize,
+    val requirements: List<ViewportRenderRequirement>,
+)
+
+private data class TransitionRequest(
+    val maxDisplaySize: IntSize,
+    val animatedRequirements: List<ViewportRenderRequirement>,
+    val endpointRequirements: List<ViewportRenderRequirement>,
+)
+
+private enum class TransitionOutcome { ANIMATED, ENDPOINT_ONLY, REJECTED }
+
+/**
+ * Models the renderer well enough to count native work: a requirement whose coverage was
+ * already rendered costs nothing, anything else costs one render. Prefetch fills that coverage,
+ * so a warm neighbour transition can be observed to render zero tiles.
+ */
 private class ControlledReaderImage(
     imageSize: IntSize,
 ) : ReaderImage {
-    val preparationStarted = CompletableDeferred<ImageUpdate>()
+    val preparationStarted = CompletableDeferred<TransitionRequest>()
     val releasePreparation = CompletableDeferred<Unit>()
     val viewportUpdates = Collections.synchronizedList(mutableListOf<ImageUpdate>())
+    val prefetchRequests = CopyOnWriteArrayList<PrefetchRequest>()
+    val transitionRequests = CopyOnWriteArrayList<TransitionRequest>()
+
+    private val renderedCoverage = Collections.synchronizedSet(mutableSetOf<ViewportRenderRequirement>())
+    private val renders = AtomicInteger()
+    private val prefetchCancels = AtomicInteger()
+    private val prefetchGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
+
+    @Volatile
+    var transitionOutcome: TransitionOutcome = TransitionOutcome.ANIMATED
+
+    @Volatile
+    var prefetchFailure: Throwable? = null
+
+    val nativeRenders: Int get() = renders.get()
+    val prefetchCancellations: Int get() = prefetchCancels.get()
+
+    fun blockPrefetch() {
+        prefetchGate.set(CompletableDeferred())
+    }
+
+    fun releasePrefetch() {
+        prefetchGate.get().complete(Unit)
+    }
 
     override val pageId = ReaderImage.PageId("book", 1)
     override val originalSize = MutableStateFlow<IntSize?>(imageSize)
@@ -262,12 +677,59 @@ private class ControlledReaderImage(
 
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
-        zoomFactor: Float,
-        visibleDisplaySize: IntRect,
+        requirements: List<ViewportRenderRequirement>,
     ): PreparedUpdateLease {
-        preparationStarted.complete(ImageUpdate(maxDisplaySize, zoomFactor, visibleDisplaySize))
-        releasePreparation.await()
+        render(requirements)
         return PreparedUpdateLease {}
+    }
+
+    override suspend fun prepareTransitionUpdate(
+        maxDisplaySize: IntSize,
+        animatedRequirements: List<ViewportRenderRequirement>,
+        endpointRequirements: List<ViewportRenderRequirement>,
+    ): PreparedTransitionCoverage {
+        val request = TransitionRequest(maxDisplaySize, animatedRequirements, endpointRequirements)
+        transitionRequests += request
+        preparationStarted.complete(request)
+        releasePreparation.await()
+
+        return when (transitionOutcome) {
+            TransitionOutcome.ANIMATED -> {
+                render(animatedRequirements)
+                PreparedTransitionCoverage.Animated(PreparedUpdateLease {})
+            }
+
+            TransitionOutcome.ENDPOINT_ONLY -> {
+                render(endpointRequirements)
+                PreparedTransitionCoverage.EndpointOnly(PreparedUpdateLease {})
+            }
+
+            TransitionOutcome.REJECTED -> PreparedTransitionCoverage.Rejected
+        }
+    }
+
+    override suspend fun prefetchUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    ) {
+        prefetchRequests += PrefetchRequest(maxDisplaySize, requirements)
+        try {
+            prefetchGate.get().await()
+        } catch (e: CancellationException) {
+            prefetchCancels.incrementAndGet()
+            throw e
+        }
+        prefetchFailure?.let { throw it }
+        render(requirements)
+    }
+
+    fun hasCoverage(requirement: ViewportRenderRequirement): Boolean =
+        renderedCoverage.contains(requirement)
+
+    private fun render(requirements: List<ViewportRenderRequirement>) {
+        for (requirement in requirements.toSet()) {
+            if (renderedCoverage.add(requirement)) renders.incrementAndGet()
+        }
     }
 
     override suspend fun getOriginalImageSize(): Result<IntSize> =
