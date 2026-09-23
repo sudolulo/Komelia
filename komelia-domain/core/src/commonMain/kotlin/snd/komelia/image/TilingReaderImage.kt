@@ -123,6 +123,22 @@ abstract class TilingReaderImage(
     internal val retainedWorkingSet: StateFlow<Map<TileCacheKey, RetainedTile>> get() = retainedTiles
 
     /**
+     * The fit-zoom full page frame [doFullResize] published for the current render generation,
+     * held through its own ownership so the tiled frame that replaces it cannot close the
+     * bitmap. It covers the whole page, so it can be republished at any offset without
+     * rendering anything; see the panel transition page frame design doc.
+     */
+    private val retainedPageFrame = MutableStateFlow<RetainedPageFrame?>(null)
+
+    /**
+     * Whether a fit-zoom page frame rendered for the current render generation is held. A frame
+     * from an older generation belongs to geometry or raster inputs that no longer apply, so it
+     * is not available even in the window before its release runs.
+     */
+    internal val hasRetainedPageFrame: Boolean
+        get() = retainedPageFrame.value?.generation == renderGeneration
+
+    /**
      * Mutated only from the processing lane, but read off it when a prefetch request is keyed,
      * so the read has to see the latest published value.
      */
@@ -170,6 +186,9 @@ abstract class TilingReaderImage(
             }
 
             imageEpoch += 1
+            // the page frame draws the image being replaced, so it is released here rather
+            // than waiting for the next render pass to notice the new generation
+            releaseRetainedPageFrame()
             image.value = null
             originalSize.value = originalImage?.let { IntSize(it.width, it.pageHeight) }
             currentSize.value = null
@@ -743,6 +762,10 @@ abstract class TilingReaderImage(
             // the tiled cache cannot serve a full resize frame, so it is retired here
             stats.evictedTiles += releaseRetainedTilesExcept(emptySet())
 
+            // taken before publication, so a page frame is only ever recorded for a frame that
+            // actually reached the frame pipeline
+            retainPageFrame(generation, frameHandles)
+
             frameData.value = FrameData(
                 frames = frames,
                 displaySize = displayArea,
@@ -1153,6 +1176,9 @@ abstract class TilingReaderImage(
             renderFingerprint = fingerprint
             renderGeneration += 1
             lastUsedScaleFactor = null
+            // the page frame was rendered for the fitted geometry and raster inputs that just
+            // changed, so it can no longer be drawn
+            releaseRetainedPageFrame()
             if (hadFingerprint) arbiter.invalidatePrefetchBefore(renderGeneration)
         }
         return renderGeneration
@@ -1164,6 +1190,27 @@ abstract class TilingReaderImage(
      */
     protected fun invalidateRenderGeneration() {
         rendererEpoch += 1
+    }
+
+    /**
+     * Takes the long-lived reference that keeps the fit-zoom page frame alive, independent of
+     * the frame ownership [doFullResize] hands to [FrameData]. Neither reference can close the
+     * bitmap while the other holds it.
+     */
+    private fun retainPageFrame(generation: Long, handles: List<TileHandle>) {
+        val ownership = handles.mapNotNull { it.retain() }
+        if (ownership.size != handles.size) {
+            ownership.forEach { it.close() }
+            throw IllegalStateException(
+                "page ${pageId.pageNumber} lost a full resize frame before it could be retained"
+            )
+        }
+        retainedPageFrame.getAndUpdate { RetainedPageFrame(generation, ownership) }?.release()
+    }
+
+    /** Releases the retained page frame if one is held. Idempotent under concurrent callers. */
+    private fun releaseRetainedPageFrame() {
+        retainedPageFrame.getAndUpdate { null }?.release()
     }
 
     private fun putRetainedTile(
@@ -1291,6 +1338,7 @@ abstract class TilingReaderImage(
         frameData.value = null
         originalImage?.close()
         data?.releaseAll()
+        releaseRetainedPageFrame()
         releaseRetainedTilesExcept(emptySet())
         image.value?.close()
         imageSource.close()
@@ -1392,6 +1440,17 @@ abstract class TilingReaderImage(
         val displayRegion: Rect,
         val generation: Long,
     )
+
+    /**
+     * The fit-zoom page frame of one render generation and the references keeping it alive. An
+     * animated page resizes to several frames, so every one of them is held.
+     */
+    private class RetainedPageFrame(
+        val generation: Long,
+        private val ownership: List<TileOwnership>,
+    ) {
+        fun release() = ownership.forEach { it.close() }
+    }
 
     internal class RetainedTile(
         val handle: TileHandle,

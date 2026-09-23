@@ -12,6 +12,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
@@ -26,6 +27,7 @@ import org.jetbrains.skia.ColorType
 import org.jetbrains.skia.Image
 import org.jetbrains.skia.ImageInfo
 import snd.komelia.image.processing.ImageProcessingPipeline
+import snd.komelia.image.processing.ProcessingStep
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
@@ -107,6 +109,12 @@ private val lastRowPanel = IntRect(400, 1_450, 1_200, 1_550)
 // expands to the whole fitted page
 private val wholeSmallPagePanel = IntRect(400, 400, 1_200, 1_200)
 
+// a second fitted geometry: 4096 fitted into 2000x2000 tiles at zoom 3 into an 8x8 grid of 512
+// pixel source tiles, each rendering to 750x750 and covering 250 display pixels. This panel
+// expands to display 1800..2000 on both axes, which is the last tile of that grid alone.
+private val largerScreen = IntSize(2_000, 2_000)
+private val largerScreenPanel = IntRect(1_850, 1_850, 1_950, 1_950)
+
 private fun movingViewport(index: Int): IntRect {
     val offset = index * 16
     return IntRect(1_900 + offset, 1_900, 2_700 + offset, 2_700)
@@ -131,14 +139,19 @@ internal interface PreparationFixture : ReaderImage {
     val closedImages: List<RenderImage>
     val publishedTiles: List<List<RenderedTile>>
     val retainedWorkingSet: StateFlow<Map<TilingReaderImage.TileCacheKey, TilingReaderImage.RetainedTile>>
+    val hasRetainedPageFrame: Boolean
 
     /** highest number of native bitmap pixels alive at the same time across the whole run */
     val peakLiveNativePixels: Long
+    fun replacePageImage()
+    suspend fun awaitPageReplacement()
+    fun releasePageReplacement()
     fun blockPainterPublication()
     suspend fun awaitPainterPublicationAttempts(count: Int)
     suspend fun awaitRegionGeneration()
     suspend fun awaitPainterPublications(count: Int)
     suspend fun awaitRenderEntries(count: Int)
+    suspend fun awaitClosedImages(count: Int)
     fun releasePainterPublication()
     fun releaseRendering()
     fun blockRendering()
@@ -1024,6 +1037,136 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
+    fun `full resize output is retained after tiled rendering replaces it`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            // 1600x1600 fitted at zoom 1 is 2.56M display pixels, under the tiling threshold,
+            // so this pass renders the whole page as a single full resize frame
+            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            val pageFrame = image.renderedTiles.single()
+            assertTrue(image.hasRetainedPageFrame, "a published full resize must retain a page frame")
+
+            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
+
+            assertEquals(2, image.renderedTiles.size, "the tiled pass must render its own tile")
+            assertTrue(
+                image.publishedTiles.last().none { it.renderImage === pageFrame.renderImage },
+                "the tiled frame must have replaced the page frame",
+            )
+            assertEquals(
+                0,
+                image.closedImages.count { it === pageFrame.renderImage },
+                "the retained page frame must stay live under the tiled frame",
+            )
+            assertTrue(image.hasRetainedPageFrame, "tiled rendering must not retire the page frame")
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `retained page frame is unavailable before the first successful full resize`() = runTest {
+        val image = preparationFixture()
+        try {
+            assertFalse(image.hasRetainedPageFrame, "a page that has not painted has no page frame")
+
+            image.releaseRendering()
+            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
+
+            assertEquals(1, image.renderedTiles.size)
+            assertFalse(
+                image.hasRetainedPageFrame,
+                "a tiled pass covers one viewport and must not be reported as a page frame",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `page replacement releases the retained page frame exactly once`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            val outgoing = image.renderedTiles.single()
+            // leaves the reader tiled at panel zoom, so nothing the replacement renders can
+            // produce another page frame and hide a leak of this one
+            image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
+            assertTrue(image.hasRetainedPageFrame)
+
+            image.replacePageImage()
+            image.awaitPageReplacement()
+
+            assertFalse(
+                image.hasRetainedPageFrame,
+                "the outgoing image's page frame must stop being available as it is replaced",
+            )
+            assertEquals(
+                1,
+                image.closedImages.count { it === outgoing.renderImage },
+                "the outgoing page frame must be released exactly once",
+            )
+
+            image.releasePageReplacement()
+            image.awaitRenderEntries(2)
+
+            assertTrue(
+                image.tileCloseCounts.all { it <= 1 },
+                "expected no tile to close twice, got ${image.tileCloseCounts}",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `generation or geometry change releases the retained page frame exactly once`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            val outgoing = image.renderedTiles.single()
+
+            // a different fitted geometry at panel zoom: the page frame of the previous
+            // generation can no longer be drawn, and a tiled pass renders no replacement for it
+            image.prepareUpdate(largerScreen, listOf(requirement(largerScreenPanel, 3f))).close()
+
+            assertEquals(2, image.renderedTiles.size, "the new geometry must render its own tile")
+            assertEquals(
+                1,
+                image.closedImages.count { it === outgoing.renderImage },
+                "the page frame of the previous geometry must be released exactly once",
+            )
+            assertFalse(
+                image.hasRetainedPageFrame,
+                "a generation with no full resize of its own has no page frame",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `reader close releases the retained page frame exactly once`() = runTest {
+        val image = preparationFixture()
+        image.releaseRendering()
+        image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+        assertTrue(image.hasRetainedPageFrame)
+
+        image.close()
+
+        assertFalse(image.hasRetainedPageFrame, "a closed reader holds no page frame")
+        // the preparation lease releases its own reference on the reader's real dispatcher as
+        // the cancellation unwinds, so the last reference to drop is not the closing thread's
+        withContext(Dispatchers.Default) {
+            withTimeout(2_000) { image.awaitClosedImages(1) }
+        }
+        assertEquals(listOf(1), image.tileCloseCounts)
+    }
+
+    @Test
     fun `reader close drains queues and releases every ownership once`() = runTest {
         val image = preparationFixture()
         image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
@@ -1076,6 +1219,7 @@ private class DelegatingPreparationFixture(
     override val peakLiveNativePixels: Long get() = delegate.peakLiveNativePixels
     override val retainedWorkingSet: StateFlow<Map<TilingReaderImage.TileCacheKey, TilingReaderImage.RetainedTile>>
         get() = delegate.retainedWorkingSet
+    override val hasRetainedPageFrame: Boolean get() = delegate.hasRetainedPageFrame
     override val barrierCompletionCounts: Map<Long, Int>
         get() = completions.mapValues { (_, count) ->
             count + if (delegate.reusedCompletedBarrier) 1 else 0
@@ -1117,12 +1261,16 @@ private class DelegatingPreparationFixture(
 
     override suspend fun getOriginalImageSize(): Result<IntSize> = delegate.getOriginalImageSize()
     override suspend fun getOriginalImage(): Result<KomeliaImage> = delegate.getOriginalImage()
+    override fun replacePageImage() = delegate.replacePageImage()
+    override suspend fun awaitPageReplacement() = delegate.awaitPageReplacement()
+    override fun releasePageReplacement() = delegate.releasePageReplacement()
     override fun blockPainterPublication() = delegate.blockPainterPublication()
     override suspend fun awaitPainterPublicationAttempts(count: Int) =
         delegate.awaitPainterPublicationAttempts(count)
     override suspend fun awaitRegionGeneration() = delegate.awaitRegionGeneration()
     override suspend fun awaitPainterPublications(count: Int) = delegate.awaitPainterPublications(count)
     override suspend fun awaitRenderEntries(count: Int) = delegate.awaitRenderEntries(count)
+    override suspend fun awaitClosedImages(count: Int) = delegate.awaitClosedImages(count)
     override fun releasePainterPublication() = delegate.releasePainterPublication()
     override fun releaseRendering() = delegate.releaseRendering()
     override fun blockRendering() = delegate.blockRendering()
@@ -1137,22 +1285,24 @@ private class DelegatingPreparationFixture(
 
 private class ControllableTilingReaderImage private constructor(
     private val linearLight: MutableStateFlow<Boolean>,
+    private val processingPipeline: ImageProcessingPipeline,
 ) : TilingReaderImage(
     imageSource = ImageSource.MemorySource(byteArrayOf(0)),
     imageDecoder = FixtureDecoder,
-    processingPipeline = ImageProcessingPipeline(),
+    processingPipeline = processingPipeline,
     stretchImages = MutableStateFlow(false),
     upsamplingMode = MutableStateFlow(UpsamplingMode.BILINEAR),
     downSamplingKernel = MutableStateFlow(ReduceKernel.DEFAULT),
     linearLightDownSampling = linearLight,
     pageId = ReaderImage.PageId("preparation", 1),
 ) {
-    constructor() : this(MutableStateFlow(false))
+    constructor() : this(MutableStateFlow(false), ImageProcessingPipeline())
 
     private val publicationCount = MutableStateFlow(0)
     private val publicationAttemptCount = MutableStateFlow(0)
     private val generatedRegions = MutableStateFlow(0)
     private val renderEntryCount = MutableStateFlow(0)
+    private val closedImageCount = MutableStateFlow(0)
     private val renderedRegions = CopyOnWriteArrayList<IntRect>()
     private val generatedTiles = CopyOnWriteArrayList<RenderedTile>()
     private val closedImages = CopyOnWriteArrayList<RenderImage>()
@@ -1164,6 +1314,7 @@ private class ControllableTilingReaderImage private constructor(
     private val renderFailure = AtomicReference<Throwable?>(null)
     private val remainingSuccesses = AtomicLong(0)
     private val completedBarrierReuse = AtomicBoolean(false)
+    private val pageReplacement = AtomicReference<PageReplacementStep?>(null)
     private val pixelsByImage = Collections.synchronizedMap(IdentityHashMap<RenderImage, Long>())
     private val liveNativePixels = AtomicLong(0)
     private val peakNativePixels = AtomicLong(0)
@@ -1199,6 +1350,10 @@ private class ControllableTilingReaderImage private constructor(
         renderEntryCount.first { it >= count }
     }
 
+    suspend fun awaitClosedImages(count: Int) {
+        closedImageCount.first { it >= count }
+    }
+
     fun releasePainterPublication() {
         publicationGate.get().countDown()
     }
@@ -1224,6 +1379,27 @@ private class ControllableTilingReaderImage private constructor(
         renderFailure.set(error)
     }
 
+    /**
+     * Replaces the page's decoded image the way a processing pipeline change does: the reader
+     * discards the current image, decodes it again and re-renders the last request against it.
+     *
+     * The reader parks inside the replacement so the state it leaves behind can be observed
+     * before the re-render hides it. [releasePageReplacement] or [close] resumes it.
+     */
+    fun replacePageImage() {
+        val step = PageReplacementStep()
+        pageReplacement.set(step)
+        processingPipeline.addStep(step)
+    }
+
+    suspend fun awaitPageReplacement() {
+        checkNotNull(pageReplacement.get()) { "no page replacement was started" }.entered.first { it }
+    }
+
+    fun releasePageReplacement() {
+        checkNotNull(pageReplacement.get()) { "no page replacement was started" }.resume()
+    }
+
     /** changes a producing input the way a settings change does, and lets the reader reload */
     fun triggerSettingsReload() {
         if (lastUpdateRequest?.readiness?.isCompleted == true) {
@@ -1244,6 +1420,7 @@ private class ControllableTilingReaderImage private constructor(
         closedImages += renderImage
         pixelsByImage.remove(renderImage)?.let { liveNativePixels.addAndGet(-it) }
         runCatching { renderImage.close() }
+        closedImageCount.update { it + 1 }
     }
 
     override fun createTilePainter(
@@ -1333,7 +1510,27 @@ private class ControllableTilingReaderImage private constructor(
         publicationGate.get().countDown()
         renderingGate.countDown()
         renderGate.get().countDown()
+        pageReplacement.get()?.resume()
     }
+}
+
+/**
+ * Fires the pipeline change flow and then parks the reader inside the replacement it triggers.
+ * The decoded image itself is left as it is.
+ */
+private class PageReplacementStep : ProcessingStep {
+    val entered = MutableStateFlow(false)
+    private val gate = CountDownLatch(1)
+
+    override suspend fun process(pageId: ReaderImage.PageId, image: KomeliaImage): KomeliaImage? {
+        entered.value = true
+        gate.await()
+        return null
+    }
+
+    override suspend fun addChangeListener(callback: () -> Unit) = Unit
+
+    fun resume() = gate.countDown()
 }
 
 private class FixturePainter : TilingReaderImage.TiledPainter() {
