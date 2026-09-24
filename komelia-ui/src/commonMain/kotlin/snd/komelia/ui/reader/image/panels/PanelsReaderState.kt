@@ -38,7 +38,6 @@ import snd.komelia.image.KomeliaPanelDetector
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.ReaderImage.PageId
 import snd.komelia.image.ReaderImageResult
-import snd.komelia.image.TransitionRenderStats
 import snd.komelia.onnxruntime.OnnxRuntimeException
 import snd.komelia.settings.ImageReaderSettingsRepository
 import snd.komelia.settings.model.PagedReadingDirection
@@ -84,8 +83,8 @@ enum class PanelTransitionOutcome {
 }
 
 /**
- * One transition, correlated across both layers: the generation, mode, duration and movement
- * timings this state owns, joined with what the renderer reported it did.
+ * One transition as this state observed it: the generation, mode, duration and movement timings
+ * it owns, plus whether the retained page frame was there to move on.
  *
  * Every time is milliseconds elapsed since the input was accepted. A phase a transition never
  * reached reports the elapsed time at which the transition ended instead.
@@ -102,28 +101,14 @@ data class PanelTransitionEvent(
      * means it took the waiting fallback and rendered its destination before moving.
      */
     val pageFrameAvailable: Boolean,
-    val stats: TransitionRenderStats?,
     val readinessMillis: Long,
     val movementStartMillis: Long,
     val movementEndMillis: Long,
 ) {
-    /**
-     * Native tile renders the demand path issued before movement, or null when the renderer
-     * does not account for pixels. Null is never reported as zero: zero is the success case.
-     */
-    val renderedTiles: Int? get() = stats?.renderedTiles
-
     fun toLogLine(): String = "panel transition $generation $outcome mode=$mode " +
         "duration=${durationMillis}ms pageFrame=$pageFrameAvailable " +
         "readiness=${readinessMillis}ms " +
-        "movement=${movementStartMillis}ms..${movementEndMillis}ms stats=${statsField()}"
-
-    private fun statsField(): String {
-        val stats = stats ?: return "unavailable"
-        return "[rendered=${stats.renderedTiles} reused=${stats.reusedTiles} " +
-            "upgraded=${stats.upgradedTiles} evicted=${stats.evictedTiles} " +
-            "retainedPixels=${stats.uniqueRetainedPixels} reservedPixels=${stats.reservedPixels}]"
-    }
+        "movement=${movementStartMillis}ms..${movementEndMillis}ms"
 }
 
 /** Where [PanelTransitionEvent]s go. The default sink logs them. */
@@ -637,8 +622,7 @@ class PanelsReaderState(
             requirements = target.requirements,
         )
 
-        // the renderer reports what it rendered; every other field of the event lives here, so
-        // the correlated record can only be assembled at this layer
+        // every field of the event is owned by this layer, so the record is assembled here
         val generation = transitionGeneration.updateAndGet { it + 1 }
         val transitionStart = TimeSource.Monotonic.markNow()
         var pageFrameAvailable = false
@@ -659,7 +643,6 @@ class PanelsReaderState(
                     durationMillis = transitionDurationMillis,
                     outcome = outcome,
                     pageFrameAvailable = pageFrameAvailable,
-                    stats = null,
                     readinessMillis = readinessMillis ?: elapsedMillis,
                     movementStartMillis = movementStartMillis ?: elapsedMillis,
                     movementEndMillis = movementEndMillis ?: elapsedMillis,

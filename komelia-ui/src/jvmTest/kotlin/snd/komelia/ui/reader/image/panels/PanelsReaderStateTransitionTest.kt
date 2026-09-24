@@ -442,6 +442,34 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
+    fun `a transition that publishes the page frame reports no readiness delay`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(
+            pageFrameAvailable = true,
+            diagnostics = PanelTransitionDiagnostics { events += it },
+        )
+        try {
+            fixture.awaitViewportObserver()
+            fixture.state.nextPanel()
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            withTimeout(2_000) { while (events.isEmpty()) delay(10) }
+
+            assertEquals(1, events.size, "one input must emit exactly one event")
+            val event = events.single()
+            assertTrue(event.pageFrameAvailable, "the fixture publishes a page frame")
+            assertEquals(0L, event.readinessMillis, "publishing an existing frame renders nothing")
+            assertEquals(PanelTransitionMode.SNAPPY, event.mode)
+            assertEquals(250, event.durationMillis)
+            assertTrue(
+                "stats" !in event.toLogLine(),
+                "the log line must not carry a field it can never populate: ${event.toLogLine()}",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
     fun `cancelled transition emits a cancellation event and no error event`() = runBlocking {
         val events = CopyOnWriteArrayList<PanelTransitionEvent>()
         val fixture = panelFixture(pageFrameAvailable = false, diagnostics = { events += it })

@@ -502,7 +502,6 @@ abstract class TilingReaderImage(
         var upgradedTiles = 0
         var renderedTiles = 0
         var evictedTiles = 0
-        var reservedPixels = 0L
 
         fun toTransitionStats(uniqueRetainedPixels: Long) = TransitionRenderStats(
             reusedTiles = reusedTiles,
@@ -510,7 +509,6 @@ abstract class TilingReaderImage(
             renderedTiles = renderedTiles,
             evictedTiles = evictedTiles,
             uniqueRetainedPixels = uniqueRetainedPixels,
-            reservedPixels = reservedPixels,
         )
     }
 
