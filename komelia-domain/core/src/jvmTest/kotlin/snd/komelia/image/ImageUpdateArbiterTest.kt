@@ -84,6 +84,39 @@ class ImageUpdateArbiterTest {
             lane.cancel()
         }
     }
+
+    @Test
+    fun `a priority demand runs before demands already waiting`() = runBlocking {
+        val lane = laneScope()
+        val order = CopyOnWriteArrayList<String>()
+        val arbiter = ImageUpdateArbiter(lane)
+        try {
+            val release = CompletableDeferred<Unit>()
+            val occupied = CompletableDeferred<Unit>()
+            val inFlight = lane.launch {
+                arbiter.submitDemand {
+                    order += "in-flight"
+                    occupied.complete(Unit)
+                    release.await()
+                }
+            }
+            withTimeout(5_000) { occupied.await() }
+
+            val ordinary = lane.launch { arbiter.submitDemand { order += "ordinary" } }
+            lane.awaitDispatchedSubmissions()
+
+            val priority = lane.launch { arbiter.submitDemand(priority = true) { order += "priority" } }
+            lane.awaitDispatchedSubmissions()
+
+            release.complete(Unit)
+            withTimeout(5_000) { joinAll(inFlight, ordinary, priority) }
+
+            assertEquals(listOf("in-flight", "priority", "ordinary"), order.toList())
+        } finally {
+            arbiter.close()
+            lane.cancel()
+        }
+    }
 }
 
 @Suppress("OPT_IN_USAGE")

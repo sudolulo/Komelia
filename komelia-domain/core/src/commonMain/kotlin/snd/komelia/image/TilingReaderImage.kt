@@ -431,7 +431,9 @@ abstract class TilingReaderImage(
         val lease = PreparedUpdateLeaseImpl()
         val published = CompletableDeferred<Boolean>()
         val job = processingScope.launch {
-            arbiter.submitDemand {
+            // publication renders nothing, so it may jump the queue of waiting render work;
+            // every other submitDemand call site stays ordinary FIFO
+            arbiter.submitDemand(priority = true) {
                 var frameOwnership: List<TileOwnership> = emptyList()
                 try {
                     val page = retainedPageFrame.value?.takeIf { it.generation == renderGeneration }
@@ -903,6 +905,7 @@ abstract class TilingReaderImage(
             // raster input it was rendered with. A surviving frame is re-stamped to the new
             // generation, so hasRetainedPageFrame and publishPageFrame stay truthful instead of
             // having to special-case an older generation.
+            // frame is read after the bump; its displaySize is the pre-drift size, the drift check's reference
             val frame = retainedPageFrame.value
             val keepPageFrame = onlyDisplaySizeChanged &&
                 frame != null &&

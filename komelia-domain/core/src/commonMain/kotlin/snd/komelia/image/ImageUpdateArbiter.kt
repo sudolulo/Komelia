@@ -39,12 +39,24 @@ internal class ImageUpdateArbiter(
      * Runs [work] on the processing lane and returns once it finished. The work runs in the
      * lane's coroutine, so cancelling the caller does not cancel the shared pass; failures are
      * rethrown here.
+     *
+     * A [priority] submission is placed ahead of ordinary work already waiting, but never ahead
+     * of another priority submission, so priority entries keep their own arrival order. Priority
+     * reorders only waiting entries: it cannot preempt work already in flight on the lane.
      */
-    suspend fun submitDemand(work: suspend () -> Unit) {
+    suspend fun submitDemand(priority: Boolean = false, work: suspend () -> Unit) {
         if (closed.value) throw CancellationException("image update arbiter is closed")
 
-        val entry = QueuedWork(work)
-        state.update { current -> current + entry }
+        val entry = QueuedWork(work, priority)
+        // a priority entry goes ahead of ordinary waiting work, but never ahead of another
+        // priority entry, so priority submissions keep their own arrival order
+        state.update { current ->
+            if (!priority) current + entry
+            else {
+                val insertAt = current.indexOfLast { it.priority } + 1
+                current.subList(0, insertAt) + entry + current.subList(insertAt, current.size)
+            }
+        }
         wakeUp.trySend(Unit)
         // close() may have drained the queues between the check above and the enqueue
         if (closed.value) cancelPending()
@@ -97,6 +109,7 @@ internal class ImageUpdateArbiter(
 
     private class QueuedWork(
         val work: suspend () -> Unit,
+        val priority: Boolean = false,
     ) {
         val completion = CompletableDeferred<Unit>()
     }
