@@ -58,6 +58,16 @@ class PanelsReaderStateTest {
             return PreparedUpdateLease {}
         }
 
+        override suspend fun prepareUpdate(
+            maxDisplaySize: IntSize,
+            requirements: List<ViewportRenderRequirement>,
+            isStillValid: () -> Boolean,
+        ): PreparedUpdateLease {
+            preparation.await()
+            if (!isStillValid()) throw kotlinx.coroutines.CancellationException("image update is obsolete")
+            return PreparedUpdateLease {}
+        }
+
         override suspend fun publishPageFrame(): PreparedUpdateLease? {
             preparation.await()
             return PreparedUpdateLease {}

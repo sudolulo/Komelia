@@ -2,6 +2,7 @@ package snd.komelia.ui.reader.image.panels
 
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.toIntSize
 import androidx.compose.ui.unit.toSize
@@ -9,6 +10,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
@@ -35,9 +37,11 @@ import snd.komelia.AppNotifications
 import snd.komelia.image.BookImageLoader
 import snd.komelia.image.ImageRect
 import snd.komelia.image.KomeliaPanelDetector
+import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.ReaderImage.PageId
 import snd.komelia.image.ReaderImageResult
+import snd.komelia.image.ViewportRenderRequirement
 import snd.komelia.onnxruntime.OnnxRuntimeException
 import snd.komelia.settings.ImageReaderSettingsRepository
 import snd.komelia.settings.model.PagedReadingDirection
@@ -160,6 +164,8 @@ class PanelsReaderState(
     // The final animation value can reach the conflated observer after the controller returns to Idle.
     // Suppress only that exact duplicate of the explicit post-lease destination update.
     private val suppressedViewportUpdate = MutableStateFlow<ViewportUpdateSnapshot?>(null)
+    private val resizeGeneration = MutableStateFlow(0L)
+    private var resizeJob: Job? = null
 
     val pageMetadata: MutableStateFlow<List<PageMetadata>> = MutableStateFlow(emptyList())
 
@@ -195,23 +201,16 @@ class PanelsReaderState(
         screenScaleState.areaSize
             .drop(1)
             .conflate()
-            .onEach {
-                when (panelTransitionController.phase.value) {
-                    PanelTransitionPhase.Animating -> cancelPanelTransition()
-                    PanelTransitionPhase.Preparing -> {
-                        cancelPanelTransition()
-                        currentPage.value?.let { page ->
-                            updateImageState(page, screenScaleState)
-                        }
-                    }
+            .onEach { areaSize ->
+                val generation = resizeGeneration.updateAndGet { it + 1 }
+                resizeJob?.cancel()
+                cancelPanelTransition()
 
-                    PanelTransitionPhase.Idle -> {
-                        currentPage.value?.let { page ->
-                            updateImageState(page, screenScaleState)
-                        }
-                    }
+                val page = currentPage.value ?: return@onEach
+                val pageIndex = currentPageIndex.value
+                resizeJob = stateScope.launch {
+                    prepareMaterialResize(page, pageIndex, areaSize, generation)
                 }
-                delay(100)
             }
             .launchIn(stateScope)
 
@@ -248,6 +247,7 @@ class PanelsReaderState(
     }
 
     fun stop() {
+        resizeGeneration.update { it + 1 }
         cancelPanelTransition()
         stateScope.coroutineContext.cancelChildren()
         pageLoadCoordinator.stop { currentPage.value = null }
@@ -284,6 +284,50 @@ class PanelsReaderState(
                 zoomFactor = zoomFactor,
                 maxDisplaySize = maxPageSize
             )
+        }
+    }
+
+    private suspend fun prepareMaterialResize(
+        page: PanelsPage,
+        pageIndex: PageIndex,
+        areaSize: IntSize,
+        generation: Long,
+    ) {
+        val image = (page.imageResult as? ReaderImageResult.Success)?.image ?: return
+        val panel = page.panelData?.panels?.getOrNull(pageIndex.panel) ?: return
+        val isStillValid = {
+            resizeGeneration.value == generation &&
+                currentPage.value === page &&
+                currentPageIndex.value == pageIndex &&
+                screenScaleState.areaSize.value == areaSize
+        }
+
+        val fitState = getScaleFor(page, areaSize)
+        if (!isStillValid()) return
+
+        suppressedViewportUpdate.value = ViewportUpdateSnapshot(
+            page = page,
+            areaSize = areaSize,
+            targetSize = fitState.targetSize.value.toIntSize(),
+            transformation = fitState.transformation.value,
+        )
+        screenScaleState.apply(fitState)
+
+        val targetSize = fitState.targetSize.value.toIntSize()
+        if (targetSize.width <= 0 || targetSize.height <= 0) return
+        val fitRequirement = ViewportRenderRequirement(
+            region = IntRect(0, 0, targetSize.width, targetSize.height),
+            zoomFactor = fitState.transformation.value.scale,
+        )
+        val lease = image.prepareUpdate(
+            maxDisplaySize = areaSize,
+            requirements = listOf(fitRequirement),
+            isStillValid = isStillValid,
+        )
+        if (isStillValid()) {
+            launchPanelTransition(pageIndex.panel, panel, preparedLease = lease)
+        } else {
+            lease.close()
         }
     }
 
@@ -590,144 +634,163 @@ class PanelsReaderState(
         return launchPanelTransition(0, panels.first())
     }
 
-    private fun launchPanelTransition(targetPanelIndex: Int, panel: ImageRect): Boolean {
-        if (pendingPageIndex.value != null || panelTransitionController.isActive) return false
-        // the mode is snapshotted here, so a change during movement only affects the next one
-        val transitionMode = panelTransitionMode.value
-        val transitionDurationMillis = transitionMode.durationMillis()
+    private fun launchPanelTransition(
+        targetPanelIndex: Int,
+        panel: ImageRect,
+        preparedLease: PreparedUpdateLease? = null,
+    ): Boolean {
+        var leaseHandedOff = false
+        try {
+            if (pendingPageIndex.value != null || panelTransitionController.isActive) return false
+            // the mode is snapshotted here, so a change during movement only affects the next one
+            val transitionMode = panelTransitionMode.value
+            val transitionDurationMillis = transitionMode.durationMillis()
 
-        val sourcePage = currentPage.value ?: return false
-        val panelData = sourcePage.panelData ?: return false
-        val image = (sourcePage.imageResult as? ReaderImageResult.Success)?.image ?: return false
-        val sourceIndex = currentPageIndex.value
-        val areaSize = screenScaleState.areaSize.value
-        val targetSize = screenScaleState.targetSize.value.toIntSize()
-        val sourceTransformation = screenScaleState.transformation.value
-        val target = panelTarget(
-            panelData = panelData,
-            areaSize = areaSize,
-            targetSize = targetSize,
-            sourceTransformation = sourceTransformation,
-            panel = panel,
-        ) ?: return false
+            val sourcePage = currentPage.value ?: return false
+            val panelData = sourcePage.panelData ?: return false
+            val image = (sourcePage.imageResult as? ReaderImageResult.Success)?.image ?: return false
+            val sourceIndex = currentPageIndex.value
+            val areaSize = screenScaleState.areaSize.value
+            val targetSize = screenScaleState.targetSize.value.toIntSize()
+            val sourceTransformation = screenScaleState.transformation.value
+            val target = panelTarget(
+                panelData = panelData,
+                areaSize = areaSize,
+                targetSize = targetSize,
+                sourceTransformation = sourceTransformation,
+                panel = panel,
+            ) ?: return false
 
-        val transition = PreparedPanelTransition(
-            sourcePage = sourcePage,
-            sourceIndex = sourceIndex,
-            areaSize = areaSize,
-            targetSize = targetSize,
-            targetPanelIndex = targetPanelIndex,
-            targetZoom = target.targetZoom,
-            targetOffset = target.targetOffset,
-            requirements = target.requirements,
-        )
-
-        // every field of the event is owned by this layer, so the record is assembled here
-        val generation = transitionGeneration.updateAndGet { it + 1 }
-        val transitionStart = TimeSource.Monotonic.markNow()
-        var pageFrameAvailable = false
-        var readinessMillis: Long? = null
-        var movementStartMillis: Long? = null
-        var movementEndMillis: Long? = null
-        var eventEmitted = false
-
-        fun emitTransitionEvent(outcome: PanelTransitionOutcome) {
-            // every terminal path calls this; the first one wins, so one input is one event
-            if (eventEmitted) return
-            eventEmitted = true
-            val elapsedMillis = transitionStart.elapsedNow().inWholeMilliseconds
-            transitionDiagnostics.onTransition(
-                PanelTransitionEvent(
-                    generation = generation,
-                    mode = transitionMode,
-                    durationMillis = transitionDurationMillis,
-                    outcome = outcome,
-                    pageFrameAvailable = pageFrameAvailable,
-                    readinessMillis = readinessMillis ?: elapsedMillis,
-                    movementStartMillis = movementStartMillis ?: elapsedMillis,
-                    movementEndMillis = movementEndMillis ?: elapsedMillis,
-                )
+            val transition = PreparedPanelTransition(
+                sourcePage = sourcePage,
+                sourceIndex = sourceIndex,
+                areaSize = areaSize,
+                targetSize = targetSize,
+                targetPanelIndex = targetPanelIndex,
+                targetZoom = target.targetZoom,
+                targetOffset = target.targetOffset,
+                requirements = target.requirements,
             )
-        }
 
-        return panelTransitionController.launch(
-            prepare = {
-                try {
-                    // the page frame covers the whole page, so publishing it is all the movement
-                    // needs; the lease that comes back is a publication lock and renders nothing
-                    val pageFrame = image.publishPageFrame()
-                    val lease = if (pageFrame != null) {
-                        pageFrameAvailable = true
-                        pageFrame
-                    } else {
-                        // no frame covers the page yet, so moving now would sweep across
-                        // unrendered space: this is the only case where movement waits
-                        logger.info {
-                            "panel transition $generation has no page frame, " +
-                                "rendering ${transition.requirements.destination.region} before moving"
-                        }
-                        image.prepareUpdate(
-                            maxDisplaySize = transition.areaSize,
-                            requirements = listOf(transition.requirements.destination),
-                        )
-                    }
-                    readinessMillis = transitionStart.elapsedNow().inWholeMilliseconds
-                    lease
-                } catch (e: CancellationException) {
-                    emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
-                    throw e
-                } catch (e: Throwable) {
-                    emitTransitionEvent(PanelTransitionOutcome.FAILED)
-                    throw e
-                }
-            },
-            isStillValid = {
-                val valid = currentPage.value === transition.sourcePage &&
-                    currentPageIndex.value == transition.sourceIndex &&
-                    screenScaleState.areaSize.value == transition.areaSize &&
-                    screenScaleState.targetSize.value.toIntSize() == transition.targetSize &&
-                    screenScaleState.transformation.value == sourceTransformation
-                // the controller runs nothing else once this reports false, so the terminal
-                // event for a superseded transition has to be emitted here
-                if (!valid) emitTransitionEvent(PanelTransitionOutcome.SUPERSEDED)
-                valid
-            },
-            commit = {
-                try {
-                    currentCoroutineContext().ensureActive()
-                    movementStartMillis = transitionStart.elapsedNow().inWholeMilliseconds
-                    currentPageIndex.value = transition.sourceIndex.copy(
-                        panel = transition.targetPanelIndex,
-                        isLastPanelZoomOutActive = false,
-                    )
-                    screenScaleState.setZoom(transition.targetZoom)
+            // every field of the event is owned by this layer, so the record is assembled here
+            val generation = transitionGeneration.updateAndGet { it + 1 }
+            val transitionStart = TimeSource.Monotonic.markNow()
+            var pageFrameAvailable = false
+            var readinessMillis: Long? = null
+            var movementStartMillis: Long? = null
+            var movementEndMillis: Long? = null
+            var eventEmitted = false
 
-                    val animation = screenScaleState.scrollTo(
-                        offset = transition.targetOffset,
+            fun emitTransitionEvent(outcome: PanelTransitionOutcome) {
+                // every terminal path calls this; the first one wins, so one input is one event
+                if (eventEmitted) return
+                eventEmitted = true
+                val elapsedMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                transitionDiagnostics.onTransition(
+                    PanelTransitionEvent(
+                        generation = generation,
+                        mode = transitionMode,
                         durationMillis = transitionDurationMillis,
+                        outcome = outcome,
+                        pageFrameAvailable = pageFrameAvailable,
+                        readinessMillis = readinessMillis ?: elapsedMillis,
+                        movementStartMillis = movementStartMillis ?: elapsedMillis,
+                        movementEndMillis = movementEndMillis ?: elapsedMillis,
                     )
+                )
+            }
+
+            val launched = panelTransitionController.launch(
+                prepare = {
                     try {
-                        animation.join()
-                    } finally {
-                        if (animation.isActive) animation.cancel()
+                        // the page frame covers the whole page, so publishing it is all the movement
+                        // needs; the lease that comes back is a publication lock and renders nothing
+                        val lease = if (preparedLease != null) {
+                            pageFrameAvailable = true
+                            readinessMillis = 0L
+                            preparedLease
+                        } else {
+                            val pageFrame = image.publishPageFrame()
+                            if (pageFrame != null) {
+                                pageFrameAvailable = true
+                                readinessMillis = 0L
+                                pageFrame
+                            } else {
+                                // no frame covers the page yet, so moving now would sweep across
+                                // unrendered space: this is the only case where movement waits
+                                logger.info {
+                                    "panel transition $generation has no page frame, " +
+                                        "rendering ${transition.requirements.destination.region} before moving"
+                                }
+                                val renderedLease = image.prepareUpdate(
+                                    maxDisplaySize = transition.areaSize,
+                                    requirements = listOf(transition.requirements.destination),
+                                )
+                                readinessMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                                renderedLease
+                            }
+                        }
+                        lease
+                    } catch (e: CancellationException) {
+                        emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
+                        throw e
+                    } catch (e: Throwable) {
+                        emitTransitionEvent(PanelTransitionOutcome.FAILED)
+                        throw e
                     }
-                    movementEndMillis = transitionStart.elapsedNow().inWholeMilliseconds
-                    emitTransitionEvent(PanelTransitionOutcome.ANIMATED)
-                } catch (e: CancellationException) {
-                    emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
-                    throw e
-                } catch (e: Throwable) {
-                    emitTransitionEvent(PanelTransitionOutcome.FAILED)
-                    throw e
-                }
-            },
-            afterRelease = {
-                currentPage.value?.let { page ->
-                    suppressedViewportUpdate.value = viewportUpdateSnapshot(page, screenScaleState)
-                    updateImageState(page, screenScaleState, force = true)
-                }
-            },
-        )
+                },
+                isStillValid = {
+                    val valid = currentPage.value === transition.sourcePage &&
+                        currentPageIndex.value == transition.sourceIndex &&
+                        screenScaleState.areaSize.value == transition.areaSize &&
+                        screenScaleState.targetSize.value.toIntSize() == transition.targetSize &&
+                        screenScaleState.transformation.value == sourceTransformation
+                    // the controller runs nothing else once this reports false, so the terminal
+                    // event for a superseded transition has to be emitted here
+                    if (!valid) emitTransitionEvent(PanelTransitionOutcome.SUPERSEDED)
+                    valid
+                },
+                commit = {
+                    try {
+                        currentCoroutineContext().ensureActive()
+                        movementStartMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                        currentPageIndex.value = transition.sourceIndex.copy(
+                            panel = transition.targetPanelIndex,
+                            isLastPanelZoomOutActive = false,
+                        )
+                        screenScaleState.setZoom(transition.targetZoom)
+
+                        val animation = screenScaleState.scrollTo(
+                            offset = transition.targetOffset,
+                            durationMillis = transitionDurationMillis,
+                        )
+                        try {
+                            animation.join()
+                        } finally {
+                            if (animation.isActive) animation.cancel()
+                        }
+                        movementEndMillis = transitionStart.elapsedNow().inWholeMilliseconds
+                        emitTransitionEvent(PanelTransitionOutcome.ANIMATED)
+                    } catch (e: CancellationException) {
+                        emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
+                        throw e
+                    } catch (e: Throwable) {
+                        emitTransitionEvent(PanelTransitionOutcome.FAILED)
+                        throw e
+                    }
+                },
+                afterRelease = {
+                    currentPage.value?.let { page ->
+                        suppressedViewportUpdate.value = viewportUpdateSnapshot(page, screenScaleState)
+                        updateImageState(page, screenScaleState, force = true)
+                    }
+                },
+            )
+            leaseHandedOff = launched
+            return launched
+        } finally {
+            if (!leaseHandedOff) preparedLease?.close()
+        }
     }
 
     /**

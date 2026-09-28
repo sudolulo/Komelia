@@ -645,6 +645,42 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
+    fun `a full resize invalidated after retention rolls the page frame back`() = runTest {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+
+            // valid right up until the page frame is retained; retaining it is what flips the
+            // predicate false, which lands in the window between retention and frame publication
+            assertFailsWith<CancellationException> {
+                image.prepareUpdate(
+                    smallScreen,
+                    listOf(requirement(wholeSmallPagePanel, 1f)),
+                    isStillValid = { !image.hasRetainedPageFrame },
+                )
+            }
+
+            assertFalse(
+                image.hasRetainedPageFrame,
+                "a page frame retained by a resize invalidated before publication must be rolled back",
+            )
+            val outgoing = image.renderedTiles.single()
+            assertEquals(
+                1,
+                image.closedImages.count { it === outgoing.renderImage },
+                "the rolled-back page frame must be released exactly once, got ${image.tileCloseCounts}",
+            )
+            assertEquals(
+                0,
+                image.painterPublications,
+                "an invalidated resize must not publish a frame",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
     fun `a few pixels of display drift keep the retained page frame`() = runTest {
         val image = preparationFixture(imageSize = devicePage)
         try {
@@ -923,6 +959,22 @@ private class DelegatingPreparationFixture(
         val barrierId = nextBarrierId.incrementAndGet()
         val lease = try {
             delegate.prepareUpdate(maxDisplaySize, requirements)
+        } catch (e: Throwable) {
+            delegate.error.value?.let { throw it }
+            throw e
+        }
+        completions.compute(barrierId) { _, count -> (count ?: 0) + 1 }
+        return lease
+    }
+
+    override suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+        isStillValid: () -> Boolean,
+    ): PreparedUpdateLease {
+        val barrierId = nextBarrierId.incrementAndGet()
+        val lease = try {
+            delegate.prepareUpdate(maxDisplaySize, requirements, isStillValid)
         } catch (e: Throwable) {
             delegate.error.value?.let { throw it }
             throw e

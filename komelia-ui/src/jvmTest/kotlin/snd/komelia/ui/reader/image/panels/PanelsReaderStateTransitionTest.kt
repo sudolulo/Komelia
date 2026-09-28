@@ -17,6 +17,7 @@ import cafe.adriel.voyager.navigator.NavigatorDisposeBehavior
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -28,6 +29,7 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import snd.komelia.AppNotifications
 import snd.komelia.color.repository.BookColorCorrectionRepository
@@ -450,7 +452,11 @@ class PanelsReaderStateTransitionTest {
         )
         try {
             fixture.awaitViewportObserver()
+            fixture.image.blockPageFramePublication()
             fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.pageFramePublicationStarted.await() }
+            delay(25)
+            fixture.image.releasePageFramePublication()
             repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
             withTimeout(2_000) { while (events.isEmpty()) delay(10) }
 
@@ -541,6 +547,142 @@ class PanelsReaderStateTransitionTest {
                 "the viewport must have moved off fit zoom into panel 0",
             )
             assertEquals(0, fixture.state.currentPageIndex.value.panel)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `material area change prepares at fit zoom then re-enters the current panel`() = runBlocking {
+        val fixture = panelFixture(startPanel = 1)
+        try {
+            fixture.awaitViewportObserver()
+            fixture.image.pageFrameAvailable = false
+            val rendersBeforeResize = fixture.image.nativeRenders
+
+            fixture.screenScaleState.setAreaSize(IntSize(200, 200))
+            delay(300)
+
+            assertEquals(
+                1,
+                fixture.image.prepareRequests.size,
+                "a material resize must synchronously prepare a replacement page frame",
+            )
+            val fitRequest = fixture.image.prepareRequests.single()
+            assertEquals(IntSize(200, 200), fitRequest.maxDisplaySize)
+            assertRequirements(
+                expectedRegions = listOf(IntRect(0, 0, 200, 200)),
+                expectedZoom = 1f,
+                actual = fitRequest.requirements,
+            )
+
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.screenScaleState.transformation.value.scale == 1f) delay(10)
+            }
+
+            assertEquals(1, fixture.state.currentPageIndex.value.panel)
+            assertEquals(
+                0,
+                fixture.image.pageFramePublications,
+                "re-entry must consume the prepared fit lease directly",
+            )
+            assertEquals(
+                rendersBeforeResize + 1,
+                fixture.image.nativeRenders,
+                "re-entry must publish the prepared page frame; " +
+                    "updates=${fixture.image.viewportUpdates}, prepares=${fixture.image.prepareRequests}",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `resize re-entry holds the fit lease so queued viewport publication cannot enter the gap`() = runBlocking {
+        val fixture = panelFixture(startPanel = 1)
+        try {
+            fixture.awaitViewportObserver()
+            fixture.image.pageFrameAvailable = false
+
+            fixture.screenScaleState.setAreaSize(IntSize(200, 200))
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.queueViewportPublicationOnPreparedLeaseRelease(
+                IntRect(100, 100, 200, 200),
+            )
+            fixture.image.releasePreparation.complete(Unit)
+
+            withTimeout(2_000) {
+                while (fixture.screenScaleState.transformation.value.scale == 1f) delay(10)
+            }
+
+            assertEquals(
+                0,
+                fixture.image.preparedLeaseReleases,
+                "the fit lease must transfer into movement without being released",
+            )
+            assertTrue(
+                Publication.QUEUED_VIEWPORT !in fixture.image.publications,
+                "queued viewport publication entered before movement: ${fixture.image.publications}",
+            )
+
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            withTimeout(2_000) {
+                while (fixture.image.preparedLeaseReleases == 0) delay(10)
+            }
+
+            assertEquals(1, fixture.image.preparedLeaseReleases, "the handed-off lease must close exactly once")
+            assertEquals(
+                1,
+                fixture.image.publications.count { it == Publication.QUEUED_VIEWPORT },
+                "the queued publication must run once after movement releases the fit lease",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `newer area change cancels obsolete preparation and re-enters at latest geometry`() = runBlocking {
+        val fixture = panelFixture(startPanel = 1)
+        try {
+            fixture.awaitViewportObserver()
+            fixture.image.pageFrameAvailable = false
+            val rendersBeforeResize = fixture.image.nativeRenders
+
+            fixture.screenScaleState.setAreaSize(IntSize(200, 200))
+            withTimeout(2_000) {
+                while (fixture.image.prepareRequests.isEmpty()) delay(10)
+            }
+
+            fixture.screenScaleState.setAreaSize(IntSize(250, 250))
+            withTimeout(2_000) {
+                while (fixture.image.prepareRequests.size < 2) delay(10)
+            }
+
+            assertEquals(
+                listOf(IntSize(200, 200), IntSize(250, 250)),
+                fixture.image.prepareRequests.map { it.maxDisplaySize },
+            )
+
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.screenScaleState.transformation.value.scale == 1f) delay(10)
+            }
+
+            assertEquals(IntSize(250, 250).toSize(), fixture.screenScaleState.targetSize.value)
+            assertEquals(1, fixture.state.currentPageIndex.value.panel)
+            assertEquals(
+                0,
+                fixture.image.pageFramePublications,
+                "latest resize re-entry must consume its prepared fit lease directly",
+            )
+            assertEquals(
+                rendersBeforeResize + 1,
+                fixture.image.nativeRenders,
+                "the cancelled resize must not render; " +
+                    "updates=${fixture.image.viewportUpdates}, prepares=${fixture.image.prepareRequests}",
+            )
         } finally {
             fixture.close()
         }
@@ -675,7 +817,7 @@ private data class PrepareRequest(
 )
 
 /** which kind of frame a publication installed, in the order the renderer installed them */
-private enum class Publication { PAGE_FRAME, TILED }
+private enum class Publication { PAGE_FRAME, TILED, QUEUED_VIEWPORT }
 
 private class FixturePainter(private val name: String) : Painter() {
     override val intrinsicSize = Size.Zero
@@ -708,7 +850,9 @@ private class ControlledReaderImage(
     private val renders = AtomicInteger()
     private val pageFramePublishCount = AtomicInteger()
     private val pageFrameReleases = AtomicInteger()
+    private val preparedReleases = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
+    private val queuedViewportPublication = AtomicReference<IntRect?>(null)
     private val pageFrameGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
     private val pageFramePainter = FixturePainter("page-frame")
 
@@ -718,6 +862,7 @@ private class ControlledReaderImage(
     val nativeRenders: Int get() = renders.get()
     val pageFramePublications: Int get() = pageFramePublishCount.get()
     val pageFrameLeaseReleases: Int get() = pageFrameReleases.get()
+    val preparedLeaseReleases: Int get() = preparedReleases.get()
 
     /** the fitted display region the currently installed frame can draw */
     val installedCoverage: IntRect? get() = coverage.get()
@@ -728,6 +873,10 @@ private class ControlledReaderImage(
 
     fun releasePageFramePublication() {
         pageFrameGate.get().complete(Unit)
+    }
+
+    fun queueViewportPublicationOnPreparedLeaseRelease(region: IntRect) {
+        check(queuedViewportPublication.compareAndSet(null, region))
     }
 
     override val pageId = ReaderImage.PageId("book", 1)
@@ -760,11 +909,40 @@ private class ControlledReaderImage(
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         requirements: List<ViewportRenderRequirement>,
+    ): PreparedUpdateLease = performPreparation(
+        maxDisplaySize = maxDisplaySize,
+        requirements = requirements,
+        waitForRelease = { releasePreparation.await() },
+        isStillValid = { true },
+    )
+
+    override suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+        isStillValid: () -> Boolean,
+    ): PreparedUpdateLease = performPreparation(
+        maxDisplaySize = maxDisplaySize,
+        requirements = requirements,
+        waitForRelease = {
+            // The real renderer owns preparation on its processing lane, so cancelling the
+            // awaiting state job does not cancel that shared work. Keep the double faithful,
+            // then let the latest-wins check reject obsolete geometry before native rendering.
+            withContext(NonCancellable) { releasePreparation.await() }
+        },
+        isStillValid = isStillValid,
+    )
+
+    private suspend fun performPreparation(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+        waitForRelease: suspend () -> Unit,
+        isStillValid: () -> Boolean,
     ): PreparedUpdateLease {
         val request = PrepareRequest(maxDisplaySize, requirements)
         prepareRequests += request
         preparationStarted.complete(request)
-        releasePreparation.await()
+        waitForRelease()
+        if (!isStillValid()) throw kotlinx.coroutines.CancellationException("image update is obsolete")
 
         render(requirements)
         val installed = requirements.map { it.region }.reduce { left, right ->
@@ -776,7 +954,19 @@ private class ControlledReaderImage(
             )
         }
         install(Publication.TILED, installed, FixturePainter("tiled $installed"))
-        return PreparedUpdateLease {}
+        if (requirements.singleOrNull() == ViewportRenderRequirement(installed, 1f)) {
+            pageFrameAvailable = true
+        }
+        return PreparedUpdateLease {
+            preparedReleases.incrementAndGet()
+            queuedViewportPublication.getAndSet(null)?.let { region ->
+                install(
+                    Publication.QUEUED_VIEWPORT,
+                    region,
+                    FixturePainter("queued viewport $region"),
+                )
+            }
+        }
     }
 
     private fun install(publication: Publication, region: IntRect, frame: Painter) {

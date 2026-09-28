@@ -5,6 +5,7 @@ import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import io.github.oshai.kotlinlogging.KotlinLogging
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -251,7 +252,7 @@ abstract class TilingReaderImage(
 
     private suspend fun processUpdate(request: UpdateRequest, stats: RenderPassStats) {
         try {
-            processUpdateLocked(request, stats)
+            processUpdateLocked(request, stats) { true }
             error.value = null
         } catch (e: Throwable) {
             currentCoroutineContext().ensureActive()
@@ -261,8 +262,12 @@ abstract class TilingReaderImage(
         }
     }
 
-    private suspend fun processUpdateLocked(request: UpdateRequest, stats: RenderPassStats) {
-        val publishedFrame = doUpdate(request, stats)
+    private suspend fun processUpdateLocked(
+        request: UpdateRequest,
+        stats: RenderPassStats,
+        isStillValid: () -> Boolean,
+    ) {
+        val publishedFrame = doUpdate(request, stats, isStillValid)
         if (!publishedFrame) {
             request.readiness?.complete(Unit)
         } else {
@@ -359,7 +364,13 @@ abstract class TilingReaderImage(
     final override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         requirements: List<ViewportRenderRequirement>,
-    ): PreparedUpdateLease = prepareUpdateWithStats(maxDisplaySize, requirements).lease
+    ): PreparedUpdateLease = prepareUpdateWithStats(maxDisplaySize, requirements) { true }.lease
+
+    final override suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+        isStillValid: () -> Boolean,
+    ): PreparedUpdateLease = prepareUpdateWithStats(maxDisplaySize, requirements, isStillValid).lease
 
     /**
      * [prepareUpdate] plus the accounting of what the pass actually did, for callers that
@@ -368,6 +379,7 @@ abstract class TilingReaderImage(
     private suspend fun prepareUpdateWithStats(
         maxDisplaySize: IntSize,
         requirements: List<ViewportRenderRequirement>,
+        isStillValid: () -> Boolean,
     ): PreparedUpdateResult {
         require(requirements.isNotEmpty()) { "prepareUpdate needs at least one viewport requirement" }
         val readiness = CompletableDeferred<Unit>()
@@ -385,7 +397,9 @@ abstract class TilingReaderImage(
                         maxDisplaySize = maxDisplaySize,
                         readiness = readiness,
                     )
-                    processUpdateLocked(request, stats)
+                    ensureUpdateIsCurrent(isStillValid)
+                    processUpdateLocked(request, stats, isStillValid)
+                    ensureUpdateIsCurrent(isStillValid)
                     error.value = null
                     // the lease owns the exact handle set that satisfied readiness
                     leaseOwnership = frameData.value?.retainHandles() ?: emptyList()
@@ -393,6 +407,10 @@ abstract class TilingReaderImage(
                         PreparedUpdateResult(lease, stats.toTransitionStats(retainedPixels()))
                     )
                     lease.awaitRelease()
+                } catch (e: CancellationException) {
+                    readiness.completeExceptionally(e)
+                    prepared.completeExceptionally(e)
+                    throw e
                 } catch (e: Throwable) {
                     currentCoroutineContext().ensureActive()
                     logger.catching(e)
@@ -526,8 +544,12 @@ abstract class TilingReaderImage(
         }
     }
 
-    private suspend fun doUpdate(request: UpdateRequest, stats: RenderPassStats): Boolean {
-        lastUpdateRequest = request.copy(readiness = null)
+    private suspend fun doUpdate(
+        request: UpdateRequest,
+        stats: RenderPassStats,
+        isStillValid: () -> Boolean,
+    ): Boolean {
+        ensureUpdateIsCurrent(isStillValid)
 
         if (request.maxDisplaySize.width <= 0 || request.maxDisplaySize.height <= 0) {
             logger.debug { "page ${pageId.pageNumber} skipped update for empty area ${request.maxDisplaySize}" }
@@ -556,6 +578,8 @@ abstract class TilingReaderImage(
         val dstWidth = displaySize.width * zoomFactor
         val dstHeight = displaySize.height * zoomFactor
 
+        ensureUpdateIsCurrent(isStillValid)
+        lastUpdateRequest = request.copy(readiness = null)
         this.displaySize.value = displaySize
         this.currentSize.value = IntSize(dstWidth.roundToInt(), dstHeight.roundToInt())
 
@@ -572,6 +596,7 @@ abstract class TilingReaderImage(
                     generation = generation,
                     readiness = request.readiness,
                     stats = stats,
+                    isStillValid = isStillValid,
                 )
             } else {
                 doTile(
@@ -584,6 +609,7 @@ abstract class TilingReaderImage(
                     generation = generation,
                     readiness = request.readiness,
                     stats = stats,
+                    isStillValid = isStillValid,
                 )
             }
 
@@ -610,6 +636,7 @@ abstract class TilingReaderImage(
         generation: Long,
         readiness: CompletableDeferred<Unit>?,
         stats: RenderPassStats,
+        isStillValid: () -> Boolean,
     ): UpdateResult {
         if (lastUsedScaleFactor == scaleFactor) {
             error.value?.let { throw (it) }
@@ -626,9 +653,14 @@ abstract class TilingReaderImage(
             round(image.pageHeight * displayScaleFactor).toFloat()
         )
 
+        ensureUpdateIsCurrent(isStillValid)
         val resizedImage = resizeImage(image, dstWidth, dstHeight)
         stats.renderedTiles += 1
 
+        if (!isStillValid()) {
+            resizedImage.frames.forEach { closeRenderImage(it) }
+            throw CancellationException("image update is obsolete")
+        }
         if (generationFor(displayArea) != generation) {
             resizedImage.frames.forEach { closeRenderImage(it) }
             return UpdateResult.STALE
@@ -637,6 +669,7 @@ abstract class TilingReaderImage(
         val frameOwnership = mutableListOf<TileOwnership>()
         val frameHandles = mutableListOf<TileHandle>()
         val frames = mutableListOf<ImageFrame>()
+        var newlyRetainedPageFrame: RetainedPageFrame? = null
         var succeeded = false
         try {
             resizedImage.frames.forEachIndexed { index, renderImage ->
@@ -656,12 +689,15 @@ abstract class TilingReaderImage(
                 )
             }
 
+            ensureUpdateIsCurrent(isStillValid)
+
             // the tiled cache cannot serve a full resize frame, so it is retired here
             stats.evictedTiles += releaseRetainedTilesExcept(emptySet())
 
-            // taken before publication, so a page frame is only ever recorded for a frame that
-            // actually reached the frame pipeline
-            retainPageFrame(
+            // Retain before publication so the long-lived page-frame and visible frame take
+            // independent ownership. If validity changes between them, the exact retained value
+            // is rolled back below instead of being left publishable.
+            newlyRetainedPageFrame = retainPageFrame(
                 generation = generation,
                 handles = frameHandles,
                 frames = frames.toList(),
@@ -669,6 +705,7 @@ abstract class TilingReaderImage(
                 scaleFactor = scaleFactor,
             )
 
+            ensureUpdateIsCurrent(isStillValid)
             frameData.value = FrameData(
                 frames = frames,
                 displaySize = displayArea,
@@ -678,12 +715,14 @@ abstract class TilingReaderImage(
                 frameOwnership = frameOwnership.toList(),
                 retiredOwnership = frameData.value?.takePendingOwnership() ?: emptyList(),
             )
+            newlyRetainedPageFrame = null
             lastUsedScaleFactor = scaleFactor
             succeeded = true
             logger.info { "page ${pageId.pageNumber} completed full resize to $dstWidth x $dstHeight" }
             return UpdateResult.PUBLISHED
         } finally {
             if (!succeeded) {
+                newlyRetainedPageFrame?.let { rollbackRetainedPageFrame(it) }
                 frameOwnership.forEach { it.close() }
             }
         }
@@ -701,6 +740,7 @@ abstract class TilingReaderImage(
         generation: Long,
         readiness: CompletableDeferred<Unit>?,
         stats: RenderPassStats,
+        isStillValid: () -> Boolean,
     ): UpdateResult {
         val timeSource = TimeSource.Monotonic
         val start = timeSource.markNow()
@@ -743,10 +783,15 @@ abstract class TilingReaderImage(
                 val upgradesRetainedTile = retained != null &&
                     !retained.handle.isSufficientFor(requiredSize)
 
+                ensureUpdateIsCurrent(isStillValid)
                 val rendered = getImageRegion(image, tileRegion, requiredSize.width, requiredSize.height)
                 stats.renderedTiles += 1
                 if (upgradesRetainedTile) stats.upgradedTiles += 1
 
+                if (!isStillValid()) {
+                    rendered.frames.forEach { closeRenderImage(it) }
+                    throw CancellationException("image update is obsolete")
+                }
                 if (generationFor(displayArea) != generation) {
                     rendered.frames.forEach { closeRenderImage(it) }
                     return UpdateResult.STALE
@@ -790,6 +835,7 @@ abstract class TilingReaderImage(
             val scaleChanged = previousFrame?.scaleFactor != scaleFactor
             val shouldPublish = newTiles.isNotEmpty() && (addedNewTiles || coverageChanged || scaleChanged)
 
+            ensureUpdateIsCurrent(isStillValid)
             if (shouldPublish) {
                 frameData.value = FrameData(
                     frames = listOf(ImageFrame(newTiles, 0)),
@@ -832,6 +878,10 @@ abstract class TilingReaderImage(
         in tileThreshold1..tileThreshold2 -> 1024
         in tileThreshold2..tileThreshold3 -> 512
         else -> 256
+    }
+
+    private fun ensureUpdateIsCurrent(isStillValid: () -> Boolean) {
+        if (!isStillValid()) throw CancellationException("image update is obsolete")
     }
 
     /** Source tile grid and its fitted display rectangles. */
@@ -951,7 +1001,7 @@ abstract class TilingReaderImage(
         frames: List<ImageFrame>,
         displayArea: IntSize,
         scaleFactor: Double,
-    ) {
+    ): RetainedPageFrame {
         val ownership = handles.mapNotNull { it.retain() }
         if (ownership.size != handles.size) {
             ownership.forEach { it.close() }
@@ -968,6 +1018,11 @@ abstract class TilingReaderImage(
             ownership = ownership,
         )
         retainedPageFrame.getAndUpdate { retained }?.release()
+        return retained
+    }
+
+    private fun rollbackRetainedPageFrame(retained: RetainedPageFrame) {
+        if (retainedPageFrame.compareAndSet(retained, null)) retained.release()
     }
 
     /** Releases the retained page frame if one is held. Idempotent under concurrent callers. */

@@ -49,6 +49,23 @@ interface ReaderImage : AutoCloseable {
     ): PreparedUpdateLease
 
     /**
+     * Prepare [requirements] only while [isStillValid] remains true.
+     *
+     * Unlike cancelling the awaiting caller, which deliberately does not cancel shared image
+     * processing, this predicate lets a latest-wins owner invalidate queued work before it
+     * renders or publishes obsolete geometry.
+     *
+     * This is intentionally abstract rather than a once-checked default: the contract promises
+     * the predicate is honoured continuously, up to the moment before publication, so an
+     * implementation that only checks it once at entry would silently break that promise.
+     */
+    suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+        isStillValid: () -> Boolean,
+    ): PreparedUpdateLease
+
+    /**
      * Publish the retained fit-zoom page frame and lock publication until the lease closes.
      *
      * The frame covers the whole page, so once it is installed no viewport position over that

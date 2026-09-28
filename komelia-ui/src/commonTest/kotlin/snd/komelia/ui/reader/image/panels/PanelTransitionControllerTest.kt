@@ -359,6 +359,16 @@ private class TestReaderImage : ReaderImage {
         return publicationLock()
     }
 
+    override suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+        isStillValid: () -> Boolean,
+    ): PreparedUpdateLease {
+        preparation.await()
+        if (!isStillValid()) throw CancellationException("image update is obsolete")
+        return publicationLock()
+    }
+
     override suspend fun publishPageFrame(): PreparedUpdateLease {
         preparation.await()
         painter.value = pageFrame
