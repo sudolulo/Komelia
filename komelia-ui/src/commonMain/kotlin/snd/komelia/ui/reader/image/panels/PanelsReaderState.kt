@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -224,6 +225,11 @@ class PanelsReaderState(
                 val generation = resizeGeneration.updateAndGet { it + 1 }
                 resizeJob?.cancel()
                 cancelPanelTransition()
+                val staleRollingWindow = rollingWindowJob
+                rollingWindowJob = null
+                rollingWindowKey = null
+                // Do not start rebuilding geometry while an old-size window can still publish.
+                staleRollingWindow?.cancelAndJoin()
 
                 val page = currentPage.value ?: return@onEach
                 val pageIndex = currentPageIndex.value

@@ -1203,6 +1203,49 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
+    fun `a second resize cancels a gated old size rolling window before it can publish`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(
+            startPanel = 1,
+            pageFrameAvailable = false,
+            diagnostics = { events += it },
+        )
+        try {
+            fixture.awaitViewportObserver()
+
+            val oldArea = IntSize(200, 200)
+            fixture.screenScaleState.setAreaSize(oldArea)
+            withTimeout(2_000) {
+                while (fixture.image.prepareRequests.none { it.maxDisplaySize == oldArea }) delay(10)
+            }
+            // Let the resize collector leave its throttle window while the old rolling window
+            // remains gated inside prepareUpdate.
+            delay(150)
+            val rendersBeforeRelease = fixture.image.nativeRenders
+
+            // The replacement page cannot prepare another window. The resize itself must still
+            // invalidate the old one rather than relying on a later prepareRollingWindow call.
+            val page = fixture.state.currentPage.value!!
+            fixture.state.currentPage.value = page.copy(panelData = null)
+            fixture.screenScaleState.setAreaSize(IntSize(250, 250))
+            withTimeout(2_000) {
+                while (events.none { it.outcome == PanelTransitionOutcome.CANCELLED }) delay(10)
+            }
+
+            fixture.image.releasePreparation.complete(Unit)
+            delay(150)
+
+            assertEquals(
+                rendersBeforeRelease,
+                fixture.image.nativeRenders,
+                "the superseded $oldArea rolling window rendered after the new area became active",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
     fun `a page with no panels does not try to enter a panel`() = runBlocking {
         val fixture = panelFixture(panels = emptyList())
         try {
