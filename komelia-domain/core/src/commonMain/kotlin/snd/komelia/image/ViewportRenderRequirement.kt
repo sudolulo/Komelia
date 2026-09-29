@@ -15,6 +15,7 @@ import kotlin.math.roundToInt
 data class ViewportRenderRequirement(
     val region: IntRect,
     val zoomFactor: Float,
+    val overscan: Boolean = true,
 ) {
     init {
         require(zoomFactor.isFinite()) { "zoom factor must be finite, got $zoomFactor" }
@@ -27,7 +28,8 @@ data class ViewportRenderRequirement(
      * off-screen margin that keeps small movements from exposing empty tiles.
      */
     internal fun visibilityWindow(displayArea: IntSize): Rect =
-        visibilityWindowFor(region.toRect(), displayArea)
+        if (overscan) visibilityWindowFor(region.toRect(), displayArea)
+        else region.toRect()
 }
 
 /**

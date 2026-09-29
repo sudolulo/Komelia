@@ -1,8 +1,14 @@
+@file:Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
+
 package snd.komelia.ui.reader.image.panels
 
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.toRect
+import snd.komelia.image.ImageRect
+import snd.komelia.image.ViewportRenderRequirement
+import snd.komelia.image.visibilityWindowFor
 import snd.komelia.ui.reader.image.ScreenScaleState.Transformation
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -12,8 +18,110 @@ import kotlin.test.assertTrue
 private val displaySize = IntSize(2588, 4000)
 private val areaSize = IntSize(900, 1000)
 private val targetTransformation = Transformation(offset = Offset(-656f, 1200f), scale = 2f)
+private val fixtureImageSize = IntSize(300, 300)
+private val defaultPanels = listOf(
+    ImageRect(left = 0, top = 0, right = 100, bottom = 100),
+    ImageRect(left = 100, top = 100, right = 200, bottom = 200),
+    ImageRect(left = 200, top = 200, right = 300, bottom = 300),
+)
+
+private fun identityTransformationForZoom(zoom: Float): Transformation =
+    Transformation(offset = Offset.Zero, scale = zoom)
 
 class PanelTransitionGeometryTest {
+    @Test
+    fun `a requirement without overscan covers exactly its region`() {
+        val region = IntRect(left = 100, top = 100, right = 300, bottom = 400)
+        val exact = ViewportRenderRequirement(region = region, zoomFactor = 3f, overscan = false)
+        val displayArea = IntSize(1192, 1843)
+
+        assertEquals(region.toRect(), exact.visibilityWindow(displayArea))
+    }
+
+    @Test
+    fun `a requirement with overscan expands by half a viewport per side`() {
+        val region = IntRect(left = 400, top = 600, right = 800, bottom = 1000)
+        val overscanned = ViewportRenderRequirement(region = region, zoomFactor = 3f)
+        val displayArea = IntSize(1192, 1843)
+
+        assertEquals(visibilityWindowFor(region.toRect(), displayArea), overscanned.visibilityWindow(displayArea))
+    }
+
+    @Test
+    fun `the rolling window holds previous current and next at panel zoom without overscan`() {
+        val window = rollingPanelRequirements(
+            panels = defaultPanels,
+            currentPanelIndex = 1,
+            areaSize = IntSize(1192, 1843),
+            targetSize = IntSize(1192, 1843),
+            transformationForZoom = ::identityTransformationForZoom,
+            imageSize = fixtureImageSize,
+        )
+
+        assertEquals(3, window.size)
+        assertTrue(window.all { !it.overscan })
+        assertTrue(window.all { it.zoomFactor > 1f })
+    }
+
+    @Test
+    fun `the rolling window clips to two entries at the first panel`() {
+        val window = rollingPanelRequirements(
+            panels = defaultPanels,
+            currentPanelIndex = 0,
+            areaSize = IntSize(1192, 1843),
+            targetSize = IntSize(1192, 1843),
+            transformationForZoom = ::identityTransformationForZoom,
+            imageSize = fixtureImageSize,
+        )
+
+        assertEquals(2, window.size)
+    }
+
+    @Test
+    fun `the rolling window clips to two entries at the last panel`() {
+        val window = rollingPanelRequirements(
+            panels = defaultPanels,
+            currentPanelIndex = 2,
+            areaSize = IntSize(1192, 1843),
+            targetSize = IntSize(1192, 1843),
+            transformationForZoom = ::identityTransformationForZoom,
+            imageSize = fixtureImageSize,
+        )
+
+        assertEquals(2, window.size)
+    }
+
+    @Test
+    fun `the rolling window is empty for a degenerate area size`() {
+        val window = rollingPanelRequirements(
+            panels = defaultPanels,
+            currentPanelIndex = 1,
+            areaSize = IntSize(0, 0),
+            targetSize = IntSize(1192, 1843),
+            transformationForZoom = ::identityTransformationForZoom,
+            imageSize = fixtureImageSize,
+        )
+
+        assertEquals(emptyList(), window)
+    }
+
+    @Test
+    fun `fit page requirement covers the full target at fit scale`() {
+        assertEquals(
+            ViewportRenderRequirement(
+                region = IntRect(0, 0, 1192, 1843),
+                zoomFactor = 0.75f,
+            ),
+            fitPageRequirement(targetSize = IntSize(1192, 1843), fitScale = 0.75f),
+        )
+    }
+
+    @Test
+    fun `fit page requirement rejects unusable geometry`() {
+        assertEquals(null, fitPageRequirement(targetSize = IntSize.Zero, fitScale = 1f))
+        assertEquals(null, fitPageRequirement(targetSize = IntSize(1192, 1843), fitScale = Float.NaN))
+    }
+
     @Test
     fun `visible region at target zoom is bounded around the panel`() {
         val region = visibleDisplayRegion(
