@@ -457,6 +457,45 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
+    fun `over budget post arrival window prepares the next sharp pair before input`() = runBlocking {
+        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
+        try {
+            fixture.settle()
+
+            fixture.image.failRollingWindowsAsOverBudget()
+            val requestsBeforeTransition = fixture.image.prepareRequests.size
+            fixture.state.nextPanel()
+            fixture.runMovementToCompletion()
+            withTimeout(2_000) {
+                while (fixture.image.prepareRequests.size < requestsBeforeTransition + 4) delay(10)
+            }
+
+            val rollingWindow = fixture.image.prepareRequests[requestsBeforeTransition + 2]
+            val fallbackPair = fixture.image.prepareRequests[requestsBeforeTransition + 3]
+            assertEquals(3, rollingWindow.requirements.count { !it.overscan })
+            assertEquals(2, fallbackPair.requirements.count { !it.overscan })
+
+            fixture.image.releasePreparation.complete(Unit)
+            fixture.settle()
+            val rendersBeforeNextInput = fixture.image.nativeRenders
+            fixture.image.blockPreparation()
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 4) delay(10)
+            }
+
+            assertEquals(
+                rendersBeforeNextInput,
+                fixture.image.nativeRenders,
+                "the next tap must reuse the post-arrival sharp pair without rendering",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
     fun `an ordinary requestUpdate mid animation does not publish over the rolling window`() = runBlocking {
         val fixture = panelFixture()
         try {
@@ -1454,6 +1493,7 @@ private class ControlledReaderImage(
     private val preparedReleases = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
     private val failRollingWindowAsOverBudget = AtomicBoolean(false)
+    private val failRollingWindowsAsOverBudget = AtomicBoolean(false)
 
     /** serialises frame installation against anything observing what is installed */
     private val installLock = ReentrantLock()
@@ -1506,6 +1546,10 @@ private class ControlledReaderImage(
         failRollingWindowAsOverBudget.set(true)
     }
 
+    fun failRollingWindowsAsOverBudget() {
+        failRollingWindowsAsOverBudget.set(true)
+    }
+
     override val pageId = ReaderImage.PageId("book", 1)
     override val originalSize = MutableStateFlow<IntSize?>(imageSize)
     override val displaySize = MutableStateFlow<IntSize?>(imageSize)
@@ -1543,7 +1587,11 @@ private class ControlledReaderImage(
         val request = PrepareRequest(maxDisplaySize, requirements)
         prepareRequests += request
         preparationStarted.complete(request)
-        if (failRollingWindowAsOverBudget.compareAndSet(true, false)) {
+        val sharpRequirementCount = requirements.count { !it.overscan }
+        if (
+            failRollingWindowAsOverBudget.compareAndSet(true, false) ||
+            failRollingWindowsAsOverBudget.get() && sharpRequirementCount >= 3
+        ) {
             throw TilePixelBudgetExceededException("controlled rolling window exceeds pixel budget")
         }
         if (requirements.any { it !in renderedCoverage }) {
