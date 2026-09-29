@@ -59,6 +59,14 @@ class PanelTransitionGeometryTest {
         )
 
         assertEquals(3, window.size)
+        assertEquals(
+            listOf(
+                IntRect(left = 0, top = 0, right = 397, bottom = 614),
+                IntRect(left = 397, top = 614, right = 794, bottom = 1228),
+                IntRect(left = 795, top = 1229, right = 1192, bottom = 1843),
+            ),
+            window.map { it.region },
+        )
         assertTrue(window.all { !it.overscan })
         assertTrue(window.all { it.zoomFactor > 1f })
     }

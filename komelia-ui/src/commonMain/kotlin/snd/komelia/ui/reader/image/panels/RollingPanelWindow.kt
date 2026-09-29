@@ -64,7 +64,7 @@ internal fun fitPageRequirement(
     )
 }
 
-private fun getPanelOffsetAndZoom(
+internal fun getPanelOffsetAndZoom(
     imageSize: IntSize,
     areaSize: IntSize,
     targetSize: IntSize,

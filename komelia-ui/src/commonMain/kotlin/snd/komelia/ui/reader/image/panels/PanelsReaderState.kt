@@ -59,8 +59,6 @@ import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookEnd
 import snd.komelia.ui.reader.image.paged.PagedReaderState.TransitionPage.BookStart
 import snd.komga.client.common.KomgaReadingDirection
-import kotlin.math.max
-import kotlin.math.min
 import kotlin.time.TimeSource
 import kotlin.time.measureTimedValue
 
@@ -882,47 +880,6 @@ class PanelsReaderState(
         )
         screenScaleState.setZoom(zoom)
         screenScaleState.scrollTo(offset)
-    }
-
-    private fun getPanelOffsetAndZoom(
-        imageSize: IntSize,
-        areaSize: IntSize,
-        targetSize: IntSize,
-        panel: ImageRect,
-    ): Pair<Offset, Float> {
-        val xScale: Float = targetSize.width.toFloat() / imageSize.width
-        val yScale: Float = targetSize.height.toFloat() / imageSize.height
-
-        val bboxLeft: Float = panel.left.coerceAtLeast(0) * xScale
-        val bboxRight: Float = panel.right.coerceAtMost(imageSize.width) * xScale
-        val bboxBottom: Float = panel.bottom.coerceAtMost(imageSize.height) * yScale
-        val bboxTop: Float = panel.top.coerceAtLeast(0) * yScale
-        val bboxWidth: Float = bboxRight - bboxLeft
-        val bboxHeight: Float = bboxBottom - bboxTop
-
-        val scale: Float = min(
-            areaSize.width / bboxWidth,
-            areaSize.height / bboxHeight
-        )
-        val fitToScreenScale = max(
-            areaSize.width.toFloat() / targetSize.width,
-            areaSize.height.toFloat() / targetSize.height
-        )
-        val zoom: Float = scale / fitToScreenScale
-
-        val bboxHalfWidth: Float = bboxWidth / 2.0f
-        val bboxHalfHeight: Float = bboxHeight / 2.0f
-        val imageHalfWidth: Float = targetSize.width / 2.0f
-        val imageHalfHeight: Float = targetSize.height / 2.0f
-
-        val centerX: Float = (bboxLeft - imageHalfWidth) * -1.0f
-        val centerY: Float = (bboxTop - imageHalfHeight) * -1.0f
-        val offset = Offset(
-            (centerX - bboxHalfWidth) * scale,
-            (centerY - bboxHalfHeight) * scale
-        )
-
-        return offset to zoom
     }
 
     data class PanelsPage(
