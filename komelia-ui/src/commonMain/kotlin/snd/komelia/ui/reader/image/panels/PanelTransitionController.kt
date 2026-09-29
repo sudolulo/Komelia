@@ -24,6 +24,9 @@ internal class PanelTransitionController(
     private var transitionJob: Job? = null
     private var transitionIdentity: Any? = null
 
+    /** the running transition's own validity check, consulted before a viewport change cancels it */
+    private var transitionIsStillValid: (() -> Boolean)? = null
+
     val isActive: Boolean
         get() = transitionJob?.isActive == true
 
@@ -39,6 +42,7 @@ internal class PanelTransitionController(
 
         val identity = Any()
         transitionIdentity = identity
+        transitionIsStillValid = isStillValid
         mutablePhase.value = PanelTransitionPhase.Preparing
 
         val job = scope.launch(start = CoroutineStart.LAZY) {
@@ -68,6 +72,7 @@ internal class PanelTransitionController(
                 }
                 if (transitionIdentity === identity) {
                     transitionIdentity = null
+                    transitionIsStillValid = null
                     transitionJob = null
                     mutablePhase.value = PanelTransitionPhase.Idle
                 }
@@ -99,8 +104,15 @@ internal class PanelTransitionController(
             PanelTransitionPhase.Preparing -> {
                 when {
                     isCurrentTransition && currentPhase == PanelTransitionPhase.Preparing -> {
-                        cancel()
-                        updateViewport()
+                        // The capture is asynchronous, so a change the transition itself was
+                        // started from can arrive here after it entered Preparing. Cancelling on
+                        // that would discard a preparation that is still exactly right, so the
+                        // transition's own validity decides: only a change that moved the viewport
+                        // away from what it prepared for cancels it.
+                        if (transitionIsStillValid?.invoke() != true) {
+                            cancel()
+                            updateViewport()
+                        }
                     }
 
                     transitionIdentity == null && currentPhase == PanelTransitionPhase.Idle -> updateViewport()
@@ -133,12 +145,10 @@ internal data class PreparedPanelTransition(
     val targetPanelIndex: Int,
     val targetZoom: Float,
     val targetOffset: Offset,
-    val requirements: PanelTransitionRequirements,
 )
 
-/** Where a transition to a single panel ends up, and everything it has to render to get there. */
+/** Where a transition to a single panel ends up. */
 internal data class PanelTarget(
-    val requirements: PanelTransitionRequirements,
     val targetZoom: Float,
     val targetOffset: Offset,
 )

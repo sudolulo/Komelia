@@ -17,7 +17,7 @@ import cafe.adriel.voyager.navigator.NavigatorDisposeBehavior
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -29,8 +29,8 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import snd.komelia.AppNotifications
 import snd.komelia.color.repository.BookColorCorrectionRepository
 import snd.komelia.image.BookImageLoader
@@ -61,8 +61,12 @@ import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+import kotlin.math.roundToInt
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
@@ -78,6 +82,16 @@ private val defaultPanels = listOf(
     ImageRect(200, 200, 300, 300),
 )
 
+// five non-overlapping panels stacked through the full image height. Each is narrower than the
+// page, so it fills the fixture display at panel zoom rather than fit zoom.
+private val fivePanels = listOf(
+    ImageRect(100, 0, 200, 60),
+    ImageRect(100, 60, 200, 120),
+    ImageRect(100, 120, 200, 180),
+    ImageRect(100, 180, 200, 240),
+    ImageRect(100, 240, 200, 300),
+)
+
 /** the fitted page in display coordinates; the retained page frame covers exactly this */
 private val pageRegion = IntRect(0, 0, 100, 100)
 
@@ -89,19 +103,34 @@ private fun IntRect.containsRect(other: IntRect): Boolean =
     left <= other.left && top <= other.top && right >= other.right && bottom >= other.bottom
 
 /**
- * The panel zoom is derived through float scale arithmetic, so it lands within rounding distance
- * of 3 rather than exactly on it. The fitted regions are integers and are compared exactly.
+ * The invariant every panel transition owes, whichever frame it moved on: every viewport it
+ * presented was drawable from the frame installed at that moment. Both frames span the whole
+ * fitted page - the retained page frame, and the fit-zoom page the fallback renders - so every
+ * intermediate viewport of the movement is inside the installed coverage.
  */
-private fun assertRequirements(
-    expectedRegions: List<IntRect>,
-    expectedZoom: Float,
-    actual: List<ViewportRenderRequirement>,
+private fun assertEveryPresentedViewportCovered(
+    presented: List<TransitionSample>,
+    context: String,
+    detail: String = "",
 ) {
-    assertEquals(expectedRegions, actual.map { it.region })
-    for (requirement in actual) {
-        assertEquals(expectedZoom, requirement.zoomFactor, 0.0001f)
+    assertTrue(presented.isNotEmpty(), "$context presented no viewport at all$detail")
+    assertTrue(
+        presented.all { it.painterInstalled },
+        "painter was null during $context at some viewport$detail",
+    )
+    val uncovered = presented.filterNot { sample ->
+        sample.installedCoverage?.containsRect(sample.visibleRegion) == true
     }
+    assertTrue(
+        uncovered.isEmpty(),
+        "$context presented viewports the installed frame does not cover: $uncovered$detail",
+    )
 }
+
+/** output pixels the renderer is asked to produce for one requirement */
+private fun renderedPixelsOf(requirement: ViewportRenderRequirement): Int =
+    (requirement.region.width * requirement.zoomFactor).roundToInt() *
+        (requirement.region.height * requirement.zoomFactor).roundToInt()
 
 class PanelsReaderStateTransitionTest {
     @Test
@@ -115,50 +144,90 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
+    fun `a settled mid-page panel pre-renders the fit page plus previous current and next`() = runBlocking {
+        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
+        try {
+            fixture.settle()
+
+            val lastPrepare = fixture.image.prepareRequests.last()
+            assertEquals(4, lastPrepare.requirements.size)
+            val panelRequirements = lastPrepare.requirements.filter { !it.overscan }
+            assertEquals(3, panelRequirements.size)
+            assertTrue(panelRequirements.all { it.zoomFactor > 1f })
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a warm forward transition renders nothing`() = runBlocking {
+        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
+        try {
+            fixture.settle()
+            val rendersBefore = fixture.image.nativeRenders
+
+            fixture.state.nextPanel()
+            fixture.runMovementToCompletion()
+
+            assertEquals(rendersBefore, fixture.image.nativeRenders)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a warm backward transition renders nothing`() = runBlocking {
+        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
+        try {
+            fixture.settle()
+            val rendersBefore = fixture.image.nativeRenders
+
+            fixture.state.previousPanel()
+            fixture.runMovementToCompletion()
+
+            assertEquals(rendersBefore, fixture.image.nativeRenders)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `after arrival only the newly entering edge panel is rendered`() = runBlocking {
+        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
+        try {
+            fixture.settle()
+
+            fixture.state.nextPanel()
+            fixture.runMovementToCompletion()
+            val rendersBefore = fixture.image.nativeRenders
+            fixture.settle()
+
+            assertEquals(rendersBefore + 1, fixture.image.nativeRenders)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
     fun `painter is never null during a panel transition`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.awaitViewportObserver()
+            fixture.settle()
 
-            val samples = CopyOnWriteArrayList<TransitionSample>()
-            val watcher = launch(Dispatchers.Default) {
-                fixture.screenScaleState.transformation.collect { transformation ->
-                    samples += TransitionSample(
-                        visibleRegion = visibleDisplayRegion(
-                            displaySize = fixture.screenScaleState.targetSize.value.toIntSize(),
-                            areaSize = fixture.screenScaleState.areaSize.value,
-                            transformation = transformation,
-                        ),
-                        painterInstalled = fixture.image.painter.value != null,
-                        installedCoverage = fixture.image.installedCoverage,
-                    )
-                }
-            }
+            val recording = recordPresentations(fixture)
 
             fixture.state.nextPanel()
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
-            }
-            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
-            withTimeout(2_000) {
-                while (fixture.image.viewportUpdates.isEmpty()) delay(10)
-            }
-            watcher.cancelAndJoin()
+            fixture.runMovementToCompletion()
+            recording.stop()
 
             assertTrue(
-                samples.any { it.visibleRegion != sourceRegion },
-                "the transition must have moved the viewport, sampled ${samples.map { it.visibleRegion }}",
+                recording.samples.any { it.visibleRegion != sourceRegion },
+                "the transition must have moved the viewport, sampled " +
+                    "${recording.samples.map { it.visibleRegion }}",
             )
-            assertTrue(
-                samples.all { it.painterInstalled },
-                "painter was null during the transition at some viewport",
-            )
-            val uncovered = samples.filterNot { sample ->
-                sample.installedCoverage?.containsRect(sample.visibleRegion) == true
-            }
-            assertTrue(
-                uncovered.isEmpty(),
-                "the installed frame left a swept viewport uncovered: $uncovered",
+            assertEveryPresentedViewportCovered(
+                recording.samples,
+                "a transition on the rolling window",
             )
         } finally {
             fixture.close()
@@ -166,25 +235,26 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `transition publishes the page frame before changing zoom or offset`() = runBlocking {
-        val fixture = panelFixture()
+    fun `transition prepares the rolling window before changing zoom or offset`() = runBlocking {
+        val fixture = panelFixture(pageFrameAvailable = false)
         try {
             fixture.awaitViewportObserver()
-            fixture.image.blockPageFramePublication()
             val startTransformation = fixture.screenScaleState.transformation.value
 
             fixture.state.nextPanel()
-            withTimeout(2_000) { fixture.image.pageFramePublicationStarted.await() }
+            val preparation = withTimeout(2_000) { fixture.image.preparationStarted.await() }
 
             assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
             assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
+            assertEquals(4, preparation.requirements.size)
+            assertEquals(3, preparation.requirements.count { !it.overscan })
 
-            fixture.image.releasePageFramePublication()
+            fixture.image.releasePreparation.complete(Unit)
             withTimeout(2_000) {
                 while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
             }
 
-            assertEquals(listOf(Publication.PAGE_FRAME), fixture.image.publications.toList())
+            assertEquals(listOf(Publication.TILED), fixture.image.publications.toList())
             assertEquals(pageRegion, fixture.image.installedCoverage)
         } finally {
             fixture.close()
@@ -195,7 +265,7 @@ class PanelsReaderStateTransitionTest {
     fun `transition performs zero native renders before movement starts`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.awaitViewportObserver()
+            fixture.settle()
             val rendersBeforeTransition = fixture.image.nativeRenders
 
             fixture.state.nextPanel()
@@ -214,36 +284,25 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `destination viewport is rendered after movement and published as a second frame`() = runBlocking {
-        val fixture = panelFixture()
+    fun `arrival replaces the movement window only after the new edge is ready`() = runBlocking {
+        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
         try {
-            fixture.awaitViewportObserver()
+            fixture.settle()
 
             fixture.state.nextPanel()
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
-            }
+            fixture.runMovementToCompletion()
 
-            // the movement is still running, so nothing but the page frame may be installed
-            repeat(10) { fixture.frameClock.sendFrame(it * 16_000_000L) }
-            delay(50)
+            // The shifted window is blocked on its missing edge, so only the reacquired movement
+            // window has published and no ordinary viewport update has replaced it.
             assertEquals(emptyList(), fixture.image.viewportUpdates.toList())
-            assertEquals(listOf(Publication.PAGE_FRAME), fixture.image.publications.toList())
+            assertEquals(listOf(Publication.TILED), fixture.image.publications.toList())
 
-            repeat(60) { fixture.frameClock.sendFrame((it + 10) * 16_000_000L) }
-            withTimeout(2_000) {
-                while (fixture.image.viewportUpdates.isEmpty()) delay(10)
-            }
-            delay(250)
+            fixture.settle()
 
-            val destination = fixture.image.viewportUpdates.single()
-            assertEquals(fixtureAreaSize, destination.maxDisplaySize)
-            assertEquals(nextDestinationRegion, destination.visibleDisplaySize)
-            assertEquals(3f, destination.zoomFactor, 0.0001f)
             assertEquals(
-                listOf(Publication.PAGE_FRAME, Publication.TILED),
+                listOf(Publication.TILED, Publication.TILED),
                 fixture.image.publications.toList(),
-                "the destination must arrive as a second frame after the page frame",
+                "the shifted rolling window must publish only after its new edge is ready",
             )
         } finally {
             fixture.close()
@@ -251,10 +310,10 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `an ordinary requestUpdate mid animation does not publish over the page frame`() = runBlocking {
+    fun `an ordinary requestUpdate mid animation does not publish over the rolling window`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.awaitViewportObserver()
+            fixture.settle()
 
             fixture.state.nextPanel()
             withTimeout(2_000) {
@@ -269,35 +328,22 @@ class PanelsReaderStateTransitionTest {
             assertEquals(
                 emptyList(),
                 fixture.image.viewportUpdates.toList(),
-                "no ordinary viewport update may be issued while the page frame lease is held",
+                "no ordinary viewport update may be issued while the rolling-window lease is held",
             )
             assertEquals(pageRegion, fixture.image.installedCoverage)
-            assertEquals(0, fixture.image.pageFrameLeaseReleases)
         } finally {
             fixture.close()
         }
     }
 
     @Test
-    fun `cancelling mid animation leaves the page frame published and releases ownership once`() = runBlocking {
+    fun `cancelling mid animation leaves the rolling window published and releases ownership once`() = runBlocking {
         val fixture = panelFixture()
         try {
-            fixture.awaitViewportObserver()
+            fixture.settle()
+            val releasesBefore = fixture.image.preparedLeaseReleases
 
-            val samples = CopyOnWriteArrayList<TransitionSample>()
-            val watcher = launch(Dispatchers.Default) {
-                fixture.screenScaleState.transformation.collect { transformation ->
-                    samples += TransitionSample(
-                        visibleRegion = visibleDisplayRegion(
-                            displaySize = fixture.screenScaleState.targetSize.value.toIntSize(),
-                            areaSize = fixture.screenScaleState.areaSize.value,
-                            transformation = transformation,
-                        ),
-                        painterInstalled = fixture.image.painter.value != null,
-                        installedCoverage = fixture.image.installedCoverage,
-                    )
-                }
-            }
+            val recording = recordPresentations(fixture)
 
             fixture.state.nextPanel()
             withTimeout(2_000) {
@@ -315,22 +361,16 @@ class PanelsReaderStateTransitionTest {
 
             fixture.state.stop()
             delay(250)
-            watcher.cancelAndJoin()
+            recording.stop()
 
-            // the page frame stayed installed for every swept viewport, cancellation included
-            assertTrue(
-                samples.all { it.painterInstalled },
-                "painter was null while the cancelled transition unwound",
-            )
-            val uncovered = samples.filterNot { sample ->
-                sample.installedCoverage?.containsRect(sample.visibleRegion) == true
-            }
-            assertTrue(uncovered.isEmpty(), "a cancelled transition left a viewport uncovered: $uncovered")
+            // the rolling window stayed installed for every swept viewport, cancellation included
+            assertEveryPresentedViewportCovered(recording.samples, "a cancelled transition")
 
             assertEquals(
-                1,
-                fixture.image.pageFrameLeaseReleases,
-                "the page frame lease must be released exactly once",
+                fixture.image.prepareRequests.size,
+                fixture.image.preparedLeaseReleases,
+                "every completed rolling-window preparation must release its lease exactly once; " +
+                    "started with $releasesBefore releases",
             )
         } finally {
             fixture.close()
@@ -338,8 +378,9 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `a transition before the initial paint takes the waiting fallback`() = runBlocking {
-        val fixture = panelFixture(pageFrameAvailable = false)
+    fun `a transition before the rolling window is ready waits for sharp coverage`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(pageFrameAvailable = false, diagnostics = { events += it })
         try {
             fixture.awaitViewportObserver()
             val startTransformation = fixture.screenScaleState.transformation.value
@@ -347,10 +388,10 @@ class PanelsReaderStateTransitionTest {
             fixture.state.nextPanel()
             val fallback = withTimeout(2_000) { fixture.image.preparationStarted.await() }
 
-            // the destination is rendered before anything moves, which is the one case where
-            // movement is allowed to wait
             assertEquals(fixtureAreaSize, fallback.maxDisplaySize)
-            assertRequirements(listOf(nextDestinationRegion), 3f, fallback.requirements)
+            assertEquals(4, fallback.requirements.size)
+            assertEquals(1, fallback.requirements.count { it.overscan })
+            assertEquals(3, fallback.requirements.count { !it.overscan })
             assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
             assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
 
@@ -358,11 +399,161 @@ class PanelsReaderStateTransitionTest {
             withTimeout(2_000) {
                 while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
             }
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            withTimeout(2_000) {
+                while (events.none { it.outcome == PanelTransitionOutcome.ANIMATED }) delay(10)
+            }
+            withTimeout(2_000) {
+                while (fixture.image.publications.size < 2) delay(10)
+            }
 
-            assertEquals(listOf(Publication.TILED), fixture.image.publications.toList())
+            assertEquals(
+                listOf(Publication.TILED, Publication.TILED),
+                fixture.image.publications.toList(),
+                "the transition publishes its sharp window, then the post-arrival window",
+            )
             assertEquals(0, fixture.image.pageFramePublications)
         } finally {
             fixture.close()
+        }
+    }
+
+    @Test
+    fun `the rolling window includes whole-page fit coverage with exact sharp panels`() = runBlocking {
+        val fixture = panelFixture(pageFrameAvailable = false)
+        try {
+            fixture.awaitViewportObserver()
+
+            fixture.state.nextPanel()
+            val fallback = withTimeout(2_000) { fixture.image.preparationStarted.await() }
+
+            val requirement = fallback.requirements.single { it.overscan }
+            assertEquals(pageRegion, requirement.region, "the fallback must cover the whole fitted page")
+            assertEquals(1f, requirement.zoomFactor, 0.0001f, "the fallback must render at fit zoom")
+            assertEquals(3, fallback.requirements.count { !it.overscan })
+
+            // the corridor this replaced was the bounding box of the post-zoom start and the
+            // destination, rendered at the panel zoom the movement ends on. It covers less of the
+            // page and still costs several times the output pixels, because zoom is squared.
+            val corridor = ViewportRenderRequirement(IntRect(33, 33, 100, 100), 3f)
+            assertEquals(10_000, renderedPixelsOf(requirement))
+            assertEquals(40_401, renderedPixelsOf(corridor))
+            assertTrue(
+                renderedPixelsOf(requirement) < renderedPixelsOf(corridor),
+                "the fit-zoom page must cost fewer output pixels than the corridor it replaced",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a cold transition animates across a rendered rolling window`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(pageFrameAvailable = false, diagnostics = { events += it })
+        try {
+            fixture.awaitViewportObserver()
+            fixture.image.releasePreparation.complete(Unit)
+            assertEquals(sourceRegion, fixture.image.installedCoverage)
+
+            val recording = recordPresentations(fixture)
+            // the recorder samples the current transformation first; the transition waits for
+            // that sample, so every later sample comes from a change the transition itself made
+            withTimeout(2_000) {
+                while (recording.samples.isEmpty()) delay(10)
+            }
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 2) delay(10)
+            }
+            // enough frames to carry a 250 ms animation to completion, had one been started
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            fixture.awaitStableTransformation()
+            delay(150)
+            recording.stop()
+
+            assertEveryPresentedViewportCovered(
+                presented = recording.samples,
+                context = "a transition with no page frame",
+                detail = "; transitions=$events prepares=${fixture.image.prepareRequests}",
+            )
+            val rollingWindowCoverage = pageRegion
+            val rollingWindowSamples = recording.samples.filter { it.installedCoverage == rollingWindowCoverage }
+            assertTrue(
+                rollingWindowSamples.map { it.visibleRegion }.distinct().size > 1,
+                "the driven frame clock must expose animated rolling-window movement, sampled " +
+                    "${rollingWindowSamples.map { it.visibleRegion }}",
+            )
+            val firstPrepare = fixture.image.prepareRequests.first()
+            assertEquals(1, firstPrepare.requirements.count { it.overscan })
+            assertEquals(3, firstPrepare.requirements.count { !it.overscan })
+            assertEquals(2, fixture.state.currentPageIndex.value.panel)
+            assertEquals(3f, fixture.screenScaleState.transformation.value.scale, 0.0001f)
+
+            val event = events.single()
+            assertEquals(PanelTransitionOutcome.ANIMATED, event.outcome)
+            assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
+            assertFalse(event.pageFrameAvailable)
+            assertEquals(
+                250,
+                event.durationMillis,
+                "the fallback must report the selected mode's full duration: ${event.toLogLine()}",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    /**
+     * What the coverage assertion is allowed to conclude rests entirely on this: a viewport belongs
+     * to the frame that was installed while it was on screen. Reading the frame later attributes
+     * the viewport to whatever has been installed since - and a transition ends by installing a
+     * destination-only frame on the ordinary viewport path, so a viewport from just before arrival
+     * read afterwards looks like a transition that swept space its frame did not cover, when the
+     * frame that was actually installed under it was the whole page.
+     */
+    @Test
+    fun `a viewport is recorded against the frame installed while it was on screen`() = runBlocking {
+        val screenScaleState = ScreenScaleState().apply {
+            setAreaSize(fixtureAreaSize)
+            setTargetSize(fixtureAreaSize.toSize())
+            setZoom(3f)
+        }
+        val image = ControlledReaderImage(fixtureImageSize, true)
+        // the whole fitted page: the coverage a transition animates on
+        image.requestUpdate(fixtureAreaSize, 1f, pageRegion)
+        val recording = recordPresentations(screenScaleState, image)
+        try {
+            withTimeout(2_000) {
+                while (recording.samples.isEmpty()) delay(10)
+            }
+
+            screenScaleState.setOffset(Offset(-1f, -1f))
+            // read before the publication's caller can do anything else, installing a frame
+            // included: a pair the recorder only assembles later is a pair it can assemble after
+            // the next installation, and that is exactly how a viewport gets misattributed
+            val recordedAtPublication = recording.samples.toList()
+            val published = visibleDisplayRegion(
+                displaySize = screenScaleState.targetSize.value.toIntSize(),
+                areaSize = screenScaleState.areaSize.value,
+                transformation = screenScaleState.transformation.value,
+            )
+
+            assertFalse(
+                nextDestinationRegion.containsRect(published),
+                "the viewport must be one a destination-only frame does not cover, got $published",
+            )
+            assertEquals(
+                listOf(pageRegion),
+                recordedAtPublication
+                    .filter { it.visibleRegion == published }
+                    .map { it.installedCoverage },
+                "$published must be recorded against the frame installed under it by the time its " +
+                    "publication returns, recorded $recordedAtPublication",
+            )
+        } finally {
+            recording.stop()
         }
     }
 
@@ -434,7 +625,8 @@ class PanelsReaderStateTransitionTest {
             assertEquals(PanelTransitionMode.SNAPPY, event.mode)
             assertEquals(250, event.durationMillis)
             assertEquals(PanelTransitionOutcome.ANIMATED, event.outcome)
-            assertTrue(event.pageFrameAvailable)
+            assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
+            assertFalse(event.pageFrameAvailable)
             assertTrue(event.generation > 0)
             assertTrue(event.readinessMillis >= 0)
             assertTrue(event.movementEndMillis >= event.movementStartMillis)
@@ -444,26 +636,23 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `a transition that publishes the page frame reports no readiness delay`() = runBlocking {
+    fun `a warm rolling transition reports its measured readiness`() = runBlocking {
         val events = CopyOnWriteArrayList<PanelTransitionEvent>()
         val fixture = panelFixture(
             pageFrameAvailable = true,
             diagnostics = PanelTransitionDiagnostics { events += it },
         )
         try {
-            fixture.awaitViewportObserver()
-            fixture.image.blockPageFramePublication()
+            fixture.settle()
             fixture.state.nextPanel()
-            withTimeout(2_000) { fixture.image.pageFramePublicationStarted.await() }
-            delay(25)
-            fixture.image.releasePageFramePublication()
             repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
             withTimeout(2_000) { while (events.isEmpty()) delay(10) }
 
             assertEquals(1, events.size, "one input must emit exactly one event")
             val event = events.single()
-            assertTrue(event.pageFrameAvailable, "the fixture publishes a page frame")
-            assertEquals(0L, event.readinessMillis, "publishing an existing frame renders nothing")
+            assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
+            assertFalse(event.pageFrameAvailable)
+            assertTrue(event.readinessMillis >= 0L)
             assertEquals(PanelTransitionMode.SNAPPY, event.mode)
             assertEquals(250, event.durationMillis)
             assertTrue(
@@ -493,6 +682,7 @@ class PanelsReaderStateTransitionTest {
 
             val event = events.single()
             assertEquals(PanelTransitionOutcome.CANCELLED, event.outcome)
+            assertEquals(250, event.durationMillis)
             assertTrue(
                 events.none { it.outcome == PanelTransitionOutcome.FAILED },
                 "a cancellation must never be reported as a renderer failure, got $events",
@@ -553,89 +743,56 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `material area change prepares at fit zoom then re-enters the current panel`() = runBlocking {
-        val fixture = panelFixture(startPanel = 1)
+    fun `a material area change re-enters the current panel at the new geometry`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(startPanel = 1, diagnostics = { events += it })
         try {
             fixture.awaitViewportObserver()
-            fixture.image.pageFrameAvailable = false
-            val rendersBeforeResize = fixture.image.nativeRenders
-
-            fixture.screenScaleState.setAreaSize(IntSize(200, 200))
-            delay(300)
-
-            assertEquals(
-                1,
-                fixture.image.prepareRequests.size,
-                "a material resize must synchronously prepare a replacement page frame",
-            )
-            val fitRequest = fixture.image.prepareRequests.single()
-            assertEquals(IntSize(200, 200), fitRequest.maxDisplaySize)
-            assertRequirements(
-                expectedRegions = listOf(IntRect(0, 0, 200, 200)),
-                expectedZoom = 1f,
-                actual = fitRequest.requirements,
-            )
-
-            fixture.image.releasePreparation.complete(Unit)
-            withTimeout(2_000) {
-                while (fixture.screenScaleState.transformation.value.scale == 1f) delay(10)
-            }
-
-            assertEquals(1, fixture.state.currentPageIndex.value.panel)
-            assertEquals(
-                0,
-                fixture.image.pageFramePublications,
-                "re-entry must consume the prepared fit lease directly",
-            )
-            assertEquals(
-                rendersBeforeResize + 1,
-                fixture.image.nativeRenders,
-                "re-entry must publish the prepared page frame; " +
-                    "updates=${fixture.image.viewportUpdates}, prepares=${fixture.image.prepareRequests}",
-            )
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `resize re-entry holds the fit lease so queued viewport publication cannot enter the gap`() = runBlocking {
-        val fixture = panelFixture(startPanel = 1)
-        try {
-            fixture.awaitViewportObserver()
-            fixture.image.pageFrameAvailable = false
 
             fixture.screenScaleState.setAreaSize(IntSize(200, 200))
             withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            fixture.image.queueViewportPublicationOnPreparedLeaseRelease(
-                IntRect(100, 100, 200, 200),
-            )
             fixture.image.releasePreparation.complete(Unit)
-
-            withTimeout(2_000) {
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            val moved = withTimeoutOrNull(2_000) {
                 while (fixture.screenScaleState.transformation.value.scale == 1f) delay(10)
+                true
             }
+            assertTrue(
+                moved == true,
+                "the re-entry never moved into the panel; transitions=$events " +
+                    "prepares=${fixture.image.prepareRequests}",
+            )
+
+            assertEquals(
+                1,
+                fixture.state.currentPageIndex.value.panel,
+                "a resize must leave the reader on the panel it was reading",
+            )
+            assertEquals(IntSize(200, 200), fixture.screenScaleState.areaSize.value)
+            assertEquals(IntSize(200, 200).toSize(), fixture.screenScaleState.targetSize.value)
 
             assertEquals(
                 0,
-                fixture.image.preparedLeaseReleases,
-                "the fit lease must transfer into movement without being released",
+                fixture.image.pageFramePublications,
+                "a page frame retained for the previous page size must never be published at the new one",
             )
+            val rollingWindow = fixture.image.prepareRequests.last()
+            assertEquals(IntSize(200, 200), rollingWindow.maxDisplaySize)
+            assertEquals(IntRect(0, 0, 200, 200), rollingWindow.requirements.single { it.overscan }.region)
+            assertEquals(3, rollingWindow.requirements.count { !it.overscan })
             assertTrue(
-                Publication.QUEUED_VIEWPORT !in fixture.image.publications,
-                "queued viewport publication entered before movement: ${fixture.image.publications}",
+                fixture.image.viewportUpdates.any { it.maxDisplaySize == IntSize(200, 200) },
+                "the new fit geometry must go out on the ordinary viewport path, " +
+                    "got ${fixture.image.viewportUpdates}",
             )
 
-            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
             withTimeout(2_000) {
                 while (fixture.image.preparedLeaseReleases == 0) delay(10)
             }
-
-            assertEquals(1, fixture.image.preparedLeaseReleases, "the handed-off lease must close exactly once")
             assertEquals(
-                1,
-                fixture.image.publications.count { it == Publication.QUEUED_VIEWPORT },
-                "the queued publication must run once after movement releases the fit lease",
+                fixture.image.prepareRequests.size,
+                fixture.image.preparedLeaseReleases,
+                "every lease the re-entry took must be released exactly once",
             )
         } finally {
             fixture.close()
@@ -643,12 +800,112 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `newer area change cancels obsolete preparation and re-enters at latest geometry`() = runBlocking {
+    fun `a post resize re-entry keeps every swept viewport covered`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(startPanel = 0, diagnostics = { events += it })
+        try {
+            fixture.awaitViewportObserver()
+            // the reader is genuinely reading panel 0 before the resize: panel 0 of a 300x300
+            // page fitted into 100x100 sits at offset (100, 100) at panel zoom, and the frame
+            // installed for it covers that panel's viewport rather than the whole page
+            fixture.screenScaleState.setOffset(Offset(100f, 100f))
+            withTimeout(2_000) {
+                while (fixture.image.viewportUpdates.isEmpty()) delay(10)
+            }
+            delay(150)
+            assertEquals(previousDestinationRegion, fixture.image.installedCoverage)
+
+            val recording = recordPresentations(fixture)
+            // the recorder samples the current transformation first; the resize waits for that
+            // sample so no sample can pair a pre-resize transformation with the new area size
+            withTimeout(2_000) {
+                while (recording.samples.isEmpty()) delay(10)
+            }
+
+            fixture.screenScaleState.setAreaSize(IntSize(200, 200))
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            fixture.image.releasePreparation.complete(Unit)
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
+            val moved = withTimeoutOrNull(2_000) {
+                while (fixture.screenScaleState.transformation.value.offset == Offset.Zero) delay(10)
+                true
+            }
+            assertTrue(
+                moved == true,
+                "the re-entry never moved into the panel; transitions=$events " +
+                    "prepares=${fixture.image.prepareRequests}",
+            )
+            fixture.awaitStableTransformation()
+            delay(150)
+            recording.stop()
+
+            // The movement runs entirely at the panel zoom, which setZoom installs before the
+            // scroll animation starts. Everything up to and including the single fit-scale
+            // sample is the resize applying its new page geometry, before the transition exists.
+            val samples = recording.samples
+            val resizeApplied = samples.indexOfFirst { it.scale == 1f }
+            assertTrue(
+                resizeApplied >= 0,
+                "the resize must have applied its fit geometry, sampled $samples",
+            )
+            val movement = samples.drop(resizeApplied + 1)
+            assertEveryPresentedViewportCovered(
+                presented = movement,
+                context = "the post-resize re-entry",
+                detail = "; transitions=$events prepares=${fixture.image.prepareRequests}",
+            )
+            assertTrue(
+                movement.map { it.visibleRegion }.distinct().size > 1,
+                "the post-resize fallback must animate through multiple viewports; " +
+                    "samples=${movement.map { it.visibleRegion }} transitions=$events",
+            )
+            val rollingWindow = fixture.image.prepareRequests.last()
+            assertEquals(IntRect(0, 0, 200, 200), rollingWindow.requirements.single { it.overscan }.region)
+            assertEquals(2, rollingWindow.requirements.count { !it.overscan })
+            assertEquals(PanelTransitionOutcome.ANIMATED, events.single().outcome)
+            assertEquals(250, events.single().durationMillis)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a burst of area changes prepares a bounded number of times and honours the final size`() = runBlocking {
         val fixture = panelFixture(startPanel = 1)
         try {
             fixture.awaitViewportObserver()
-            fixture.image.pageFrameAvailable = false
-            val rendersBeforeResize = fixture.image.nativeRenders
+
+            // a window resize drag: twenty intermediate sizes, spaced far enough apart that an
+            // unthrottled collector prepares every single one of them
+            repeat(20) { step ->
+                fixture.screenScaleState.setAreaSize(IntSize(200 + step * 5, 200 + step * 5))
+                delay(10)
+            }
+            delay(300)
+
+            assertTrue(
+                fixture.image.prepareRequests.map { it.maxDisplaySize }.distinct().size <= 3,
+                "a resize drag must not prepare one frame per intermediate size, prepared " +
+                    "${fixture.image.prepareRequests.map { it.maxDisplaySize }}",
+            )
+            assertEquals(
+                IntSize(295, 295),
+                fixture.image.prepareRequests.last().maxDisplaySize,
+                "the size the drag ended on must always be prepared",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a newer area change wins and the superseded one never moves the viewport`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(startPanel = 1, diagnostics = { events += it })
+        try {
+            fixture.awaitViewportObserver()
+
+            val recording = recordPresentations(fixture)
 
             fixture.screenScaleState.setAreaSize(IntSize(200, 200))
             withTimeout(2_000) {
@@ -657,31 +914,48 @@ class PanelsReaderStateTransitionTest {
 
             fixture.screenScaleState.setAreaSize(IntSize(250, 250))
             withTimeout(2_000) {
-                while (fixture.image.prepareRequests.size < 2) delay(10)
+                while (fixture.image.prepareRequests.none { it.maxDisplaySize == IntSize(250, 250) }) delay(10)
             }
 
             assertEquals(
                 listOf(IntSize(200, 200), IntSize(250, 250)),
-                fixture.image.prepareRequests.map { it.maxDisplaySize },
+                fixture.image.prepareRequests.map { it.maxDisplaySize }.distinct(),
+                "the newer area must prepare for itself instead of inheriting the superseded one",
             )
 
             fixture.image.releasePreparation.complete(Unit)
+            repeat(70) { fixture.frameClock.sendFrame(it * 16_000_000L) }
             withTimeout(2_000) {
                 while (fixture.screenScaleState.transformation.value.scale == 1f) delay(10)
             }
+            withTimeout(2_000) {
+                while (events.none { it.outcome == PanelTransitionOutcome.ANIMATED }) delay(10)
+            }
+            delay(150)
+            recording.stop()
 
             assertEquals(IntSize(250, 250).toSize(), fixture.screenScaleState.targetSize.value)
             assertEquals(1, fixture.state.currentPageIndex.value.panel)
             assertEquals(
-                0,
-                fixture.image.pageFramePublications,
-                "latest resize re-entry must consume its prepared fit lease directly",
+                1,
+                events.count { it.outcome == PanelTransitionOutcome.ANIMATED },
+                "only the latest resize may move the viewport, got $events",
             )
-            assertEquals(
-                rendersBeforeResize + 1,
-                fixture.image.nativeRenders,
-                "the cancelled resize must not render; " +
-                    "updates=${fixture.image.viewportUpdates}, prepares=${fixture.image.prepareRequests}",
+            assertTrue(
+                events.any { it.outcome != PanelTransitionOutcome.ANIMATED },
+                "the superseded resize must reach a terminal outcome without moving, got $events",
+            )
+            assertTrue(
+                events.all { it.durationMillis == 250 },
+                "every terminal outcome must report the selected mode's duration, got $events",
+            )
+            val installedFallback = recording.samples.filter {
+                it.installedCoverage == IntRect(0, 0, 250, 250)
+            }
+            assertEveryPresentedViewportCovered(
+                presented = installedFallback,
+                context = "the winning resize transition",
+                detail = "; transitions=$events prepares=${fixture.image.prepareRequests}",
             )
         } finally {
             fixture.close()
@@ -696,6 +970,48 @@ class PanelsReaderStateTransitionTest {
             assertTrue(!fixture.state.enterFirstPanel(), "a page with no panels must not start a transition")
         } finally {
             fixture.close()
+        }
+    }
+
+    /**
+     * A page fitted down to a 2x2 display is degenerate: at the panel zoom the destination
+     * viewport rounds away to an empty region, so there is no renderable view to arrive on and
+     * the reader must stay where it is rather than animate onto nothing.
+     */
+    @Test
+    fun `a destination viewport that is not renderable does not start a transition`() = runBlocking {
+        val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val screenScaleState = ScreenScaleState().apply {
+            composeScope = animationScope
+            setAreaSize(fixtureAreaSize)
+            setTargetSize(Size(2f, 2f))
+        }
+        val state = panelsReaderState(screenScaleState)
+        try {
+            state.currentPage.value = PanelsReaderState.PanelsPage(
+                metadata = PageMetadata(KomgaBookId("book"), 1, fixtureImageSize),
+                imageResult = ReaderImageResult.Success(ControlledReaderImage(fixtureImageSize, true)),
+                panelData = PanelsReaderState.PanelData(
+                    panels = listOf(ImageRect(0, 0, 60, 60)),
+                    originalImageSize = fixtureImageSize,
+                    panelCoversMajorityOfImage = false,
+                ),
+            )
+            state.currentPageIndex.value = PanelsReaderState.PageIndex(0, 0, false)
+            val startTransformation = screenScaleState.transformation.value
+
+            assertFalse(
+                state.enterFirstPanel(),
+                "a destination viewport that is not renderable must not start a transition",
+            )
+            assertEquals(
+                startTransformation,
+                screenScaleState.transformation.value,
+                "a refused transition must leave the viewport where it was",
+            )
+        } finally {
+            state.stop()
+            animationScope.cancel()
         }
     }
 }
@@ -713,9 +1029,72 @@ private class ControlledFrameClock : MonotonicFrameClock {
 /** one sampled point of a transition: where the viewport was and what was drawable there */
 private data class TransitionSample(
     val visibleRegion: IntRect,
+    val scale: Float,
     val painterInstalled: Boolean,
     val installedCoverage: IntRect?,
 )
+
+/**
+ * Records what the reader presented: one [TransitionSample] per viewport the scale state publishes
+ * and one per frame the renderer installs, in the order they happened.
+ *
+ * Both sides are appended by the thread that changed them, while the other side is held, so every
+ * entry is a (viewport, installed frame) pair that really held at one instant. That is the whole
+ * point: sampling the two sides independently pairs a viewport with a frame that was installed
+ * after it, and a transition ends by installing a destination-only frame on the ordinary viewport
+ * path, so a viewport from just before arrival read afterwards looks like a transition that swept
+ * space its frame did not cover when the frame installed under it was the whole page.
+ */
+private class PresentationRecording(
+    private val screenScaleState: ScreenScaleState,
+    private val image: ControlledReaderImage,
+) {
+    val samples = CopyOnWriteArrayList<TransitionSample>()
+
+    private var collector: Job? = null
+
+    fun start(scope: CoroutineScope) {
+        image.frameInstalled = { record() }
+        // Unconfined on purpose, and not an optimisation: a dispatched collector resumes some time
+        // after the viewport was published and reads whatever frame is installed by then, which is
+        // the misattribution above. Unconfined collection runs the append inside the publication
+        // itself, on the thread that published it, so nothing can install in between.
+        collector = scope.launch(Dispatchers.Unconfined) {
+            try {
+                screenScaleState.transformation.collect { record() }
+            } finally {
+                image.frameInstalled = null
+            }
+        }
+    }
+
+    suspend fun stop() {
+        collector?.cancelAndJoin()
+    }
+
+    private fun record() = image.withInstalledFrameHeld { coverage, painter ->
+        val transformation = screenScaleState.transformation.value
+        samples += TransitionSample(
+            visibleRegion = visibleDisplayRegion(
+                displaySize = screenScaleState.targetSize.value.toIntSize(),
+                areaSize = screenScaleState.areaSize.value,
+                transformation = transformation,
+            ),
+            scale = transformation.scale,
+            painterInstalled = painter != null,
+            installedCoverage = coverage,
+        )
+    }
+}
+
+private fun CoroutineScope.recordPresentations(
+    screenScaleState: ScreenScaleState,
+    image: ControlledReaderImage,
+): PresentationRecording =
+    PresentationRecording(screenScaleState, image).also { it.start(this) }
+
+private fun CoroutineScope.recordPresentations(fixture: PanelFixture): PresentationRecording =
+    recordPresentations(fixture.screenScaleState, fixture.image)
 
 private class PanelFixture(
     val state: PanelsReaderState,
@@ -724,6 +1103,8 @@ private class PanelFixture(
     val frameClock: ControlledFrameClock,
     private val animationScope: CoroutineScope,
 ) {
+    private var viewportObserverSettled = false
+
     /** drives the viewport until the reader's conflated observers are demonstrably running */
     suspend fun awaitViewportObserver() {
         withTimeout(2_000) {
@@ -760,11 +1141,30 @@ private class PanelFixture(
 
     /** Leaves the reader on a stable panel with its viewport observers settled. */
     suspend fun settle() {
-        awaitViewportObserver()
-        screenScaleState.setOffset(Offset(1f, 1f))
-        delay(150)
-        image.viewportUpdates.clear()
-        image.publications.clear()
+        if (image.prepareRequests.isEmpty()) state.prepareRollingWindow()
+        if (!viewportObserverSettled) {
+            awaitViewportObserver()
+            viewportObserverSettled = true
+        }
+        image.releasePreparation.complete(Unit)
+        var previousPrepareCount = -1
+        var stableChecks = 0
+        withTimeout(2_000) {
+            while (stableChecks < 3) {
+                repeat(70) { frameClock.sendFrame(it * 16_000_000L) }
+                delay(25)
+                val currentPrepareCount = image.prepareRequests.size
+                if (currentPrepareCount == previousPrepareCount) stableChecks++ else stableChecks = 0
+                previousPrepareCount = currentPrepareCount
+            }
+        }
+    }
+
+    /** Drives the controlled frame clock past the longest panel movement and waits for stability. */
+    suspend fun runMovementToCompletion() {
+        image.blockPreparation()
+        repeat(70) { frameClock.sendFrame(it * 16_000_000L) }
+        awaitStableTransformation()
     }
 
     fun close() {
@@ -817,7 +1217,7 @@ private data class PrepareRequest(
 )
 
 /** which kind of frame a publication installed, in the order the renderer installed them */
-private enum class Publication { PAGE_FRAME, TILED, QUEUED_VIEWPORT }
+private enum class Publication { PAGE_FRAME, TILED }
 
 private class FixturePainter(private val name: String) : Painter() {
     override val intrinsicSize = Size.Zero
@@ -839,8 +1239,16 @@ private class ControlledReaderImage(
     pageFrameAvailable: Boolean,
 ) : ReaderImage {
     val preparationStarted = CompletableDeferred<PrepareRequest>()
-    val releasePreparation = CompletableDeferred<Unit>()
     val pageFramePublicationStarted = CompletableDeferred<Unit>()
+
+    private val preparationGate = AtomicReference(
+        CompletableDeferred<Unit>().apply {
+            if (pageFrameAvailable) complete(Unit)
+        }
+    )
+
+    val releasePreparation: CompletableDeferred<Unit>
+        get() = preparationGate.get()
 
     val viewportUpdates = Collections.synchronizedList(mutableListOf<ImageUpdate>())
     val prepareRequests = CopyOnWriteArrayList<PrepareRequest>()
@@ -852,12 +1260,22 @@ private class ControlledReaderImage(
     private val pageFrameReleases = AtomicInteger()
     private val preparedReleases = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
-    private val queuedViewportPublication = AtomicReference<IntRect?>(null)
+
+    /** serialises frame installation against anything observing what is installed */
+    private val installLock = ReentrantLock()
+
     private val pageFrameGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
     private val pageFramePainter = FixturePainter("page-frame")
 
     @Volatile
     var pageFrameAvailable: Boolean = pageFrameAvailable
+
+    /**
+     * The fitted page size the retained page frame was rendered for. The double never re-renders
+     * a page frame for a new size: an ordinary viewport update is asynchronous in the renderer,
+     * so a transition that follows a resize finds the frame of the size before it, and is refused.
+     */
+    private val pageFrameDisplaySize: IntSize = fixtureAreaSize
 
     val nativeRenders: Int get() = renders.get()
     val pageFramePublications: Int get() = pageFramePublishCount.get()
@@ -867,6 +1285,17 @@ private class ControlledReaderImage(
     /** the fitted display region the currently installed frame can draw */
     val installedCoverage: IntRect? get() = coverage.get()
 
+    /** notified at the end of each installation, while installation is still held */
+    @Volatile
+    var frameInstalled: (() -> Unit)? = null
+
+    /**
+     * Reads the installed frame with installation excluded for the duration, so a reader can never
+     * see the coverage of one frame beside the painter of another, nor straddle an installation.
+     */
+    fun <T> withInstalledFrameHeld(read: (coverage: IntRect?, painter: Painter?) -> T): T =
+        installLock.withLock { read(coverage.get(), painter.value) }
+
     fun blockPageFramePublication() {
         pageFrameGate.set(CompletableDeferred())
     }
@@ -875,8 +1304,8 @@ private class ControlledReaderImage(
         pageFrameGate.get().complete(Unit)
     }
 
-    fun queueViewportPublicationOnPreparedLeaseRelease(region: IntRect) {
-        check(queuedViewportPublication.compareAndSet(null, region))
+    fun blockPreparation() {
+        preparationGate.set(CompletableDeferred())
     }
 
     override val pageId = ReaderImage.PageId("book", 1)
@@ -896,10 +1325,13 @@ private class ControlledReaderImage(
         install(Publication.TILED, visibleDisplaySize, FixturePainter("tiled $visibleDisplaySize"))
     }
 
-    override suspend fun publishPageFrame(): PreparedUpdateLease? {
+    override suspend fun publishPageFrame(displayArea: IntSize): PreparedUpdateLease? {
         pageFramePublicationStarted.complete(Unit)
         pageFrameGate.get().await()
         if (!pageFrameAvailable) return null
+        // the retained frame's tiles carry absolute display coordinates, so the renderer refuses
+        // to publish one whose geometry no longer matches the caller's page; so does this double
+        if (displayArea != pageFrameDisplaySize) return null
 
         pageFramePublishCount.incrementAndGet()
         install(Publication.PAGE_FRAME, pageRegion, pageFramePainter)
@@ -909,40 +1341,13 @@ private class ControlledReaderImage(
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         requirements: List<ViewportRenderRequirement>,
-    ): PreparedUpdateLease = performPreparation(
-        maxDisplaySize = maxDisplaySize,
-        requirements = requirements,
-        waitForRelease = { releasePreparation.await() },
-        isStillValid = { true },
-    )
-
-    override suspend fun prepareUpdate(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-        isStillValid: () -> Boolean,
-    ): PreparedUpdateLease = performPreparation(
-        maxDisplaySize = maxDisplaySize,
-        requirements = requirements,
-        waitForRelease = {
-            // The real renderer owns preparation on its processing lane, so cancelling the
-            // awaiting state job does not cancel that shared work. Keep the double faithful,
-            // then let the latest-wins check reject obsolete geometry before native rendering.
-            withContext(NonCancellable) { releasePreparation.await() }
-        },
-        isStillValid = isStillValid,
-    )
-
-    private suspend fun performPreparation(
-        maxDisplaySize: IntSize,
-        requirements: List<ViewportRenderRequirement>,
-        waitForRelease: suspend () -> Unit,
-        isStillValid: () -> Boolean,
     ): PreparedUpdateLease {
         val request = PrepareRequest(maxDisplaySize, requirements)
         prepareRequests += request
         preparationStarted.complete(request)
-        waitForRelease()
-        if (!isStillValid()) throw kotlinx.coroutines.CancellationException("image update is obsolete")
+        if (requirements.any { it !in renderedCoverage }) {
+            preparationGate.get().await()
+        }
 
         render(requirements)
         val installed = requirements.map { it.region }.reduce { left, right ->
@@ -954,25 +1359,16 @@ private class ControlledReaderImage(
             )
         }
         install(Publication.TILED, installed, FixturePainter("tiled $installed"))
-        if (requirements.singleOrNull() == ViewportRenderRequirement(installed, 1f)) {
-            pageFrameAvailable = true
-        }
-        return PreparedUpdateLease {
-            preparedReleases.incrementAndGet()
-            queuedViewportPublication.getAndSet(null)?.let { region ->
-                install(
-                    Publication.QUEUED_VIEWPORT,
-                    region,
-                    FixturePainter("queued viewport $region"),
-                )
-            }
-        }
+        return PreparedUpdateLease { preparedReleases.incrementAndGet() }
     }
 
     private fun install(publication: Publication, region: IntRect, frame: Painter) {
-        coverage.set(region)
-        painter.value = frame
-        publications += publication
+        installLock.withLock {
+            coverage.set(region)
+            painter.value = frame
+            publications += publication
+            frameInstalled?.invoke()
+        }
     }
 
     /** one requirement stands in for one tile here, so the counts are directly assertable */
