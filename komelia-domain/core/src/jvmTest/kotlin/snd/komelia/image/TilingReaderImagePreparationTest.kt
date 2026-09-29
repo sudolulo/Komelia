@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -109,6 +110,7 @@ internal interface PreparationFixture : ReaderImage {
     val barrierCompletionCounts: Map<Long, Int>
     val tileCloseCounts: List<Int>
     val renderedTiles: List<RenderedTile>
+    val renderEntryCount: StateFlow<Int>
     val closedImages: List<RenderImage>
     val publishedTiles: List<List<RenderedTile>>
     val hasRetainedPageFrame: Boolean
@@ -353,6 +355,65 @@ class TilingReaderImagePreparationTest {
                 image.renderedTiles.size,
                 "a sufficiently resolved tile must not trigger another native render",
             )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `overlapping requirements render each shared source tile once at the max density`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            val region = targetCorridor
+
+            image.prepareUpdate(
+                screenSize,
+                listOf(requirement(region, 2f), requirement(region, 2.5f)),
+            ).close()
+
+            val rendered = image.renderedTiles.toList()
+            assertEquals(rendered.map { it.sourceBounds }.toSet().size, rendered.size)
+            assertTrue(rendered.all { it.renderSize == highDensityTile })
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `an over budget requirement set throws and leaves the installed frame untouched`() = runBlocking {
+        val image = preparationFixture(hardPeakDisplayAreas = 1)
+        try {
+            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
+            val coverageBefore = image.currentTileCoverage
+            val publishedBefore = image.publishedTiles.size
+
+            assertFailsWith<TilePixelBudgetExceededException> {
+                image.prepareUpdate(
+                    screenSize,
+                    listOf(requirement(widePanel, 2.5f), requirement(targetCorridor, 2.5f)),
+                )
+            }
+
+            assertEquals(coverageBefore, image.currentTileCoverage)
+            assertEquals(publishedBefore, image.publishedTiles.size)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `a set within the peak publishes and renders its tiles`() = runBlocking {
+        val image = preparationFixture(hardPeakDisplayAreas = 8)
+        try {
+            val rendersBefore = image.renderEntryCount.value
+
+            image.prepareUpdate(
+                screenSize,
+                listOf(requirement(narrowPanel, 2f), requirement(targetCorridor, 2f)),
+            ).close()
+
+            assertTrue(image.renderEntryCount.value > rendersBefore)
+            assertEquals(1, image.publishedTiles.size)
         } finally {
             image.close()
         }
@@ -919,8 +980,11 @@ private suspend fun renderDestinationViewport(displaySize: IntSize, zoom: Float)
 private fun IntRect.containsRect(other: IntRect): Boolean =
     left <= other.left && top <= other.top && right >= other.right && bottom >= other.bottom
 
-private fun preparationFixture(imageSize: IntSize = IntSize(4_096, 4_096)): PreparationFixture {
-    return DelegatingPreparationFixture(ControllableTilingReaderImage(imageSize))
+private fun preparationFixture(
+    imageSize: IntSize = IntSize(4_096, 4_096),
+    hardPeakDisplayAreas: Int = 8,
+): PreparationFixture {
+    return DelegatingPreparationFixture(ControllableTilingReaderImage(imageSize, hardPeakDisplayAreas))
 }
 
 private class DelegatingPreparationFixture(
@@ -940,6 +1004,7 @@ private class DelegatingPreparationFixture(
     override val publishedRegions: List<IntRect> get() = delegate.publishedRegions
     override val tileCloseCounts: List<Int> get() = delegate.tileCloseCounts
     override val renderedTiles: List<RenderedTile> get() = delegate.renderedTiles
+    override val renderEntryCount: StateFlow<Int> get() = delegate.renderEntryCount
     override val closedImages: List<RenderImage> get() = delegate.closedRenderImages
     override val publishedTiles: List<List<RenderedTile>> get() = delegate.publishedTiles
     override val hasRetainedPageFrame: Boolean get() = delegate.hasRetainedPageFrame
@@ -1013,6 +1078,7 @@ private class ControllableTilingReaderImage private constructor(
     private val linearLight: MutableStateFlow<Boolean>,
     private val processingPipeline: ImageProcessingPipeline,
     fixtureImage: KomeliaImage,
+    hardPeakDisplayAreas: Int,
 ) : TilingReaderImage(
     imageSource = ImageSource.MemorySource(byteArrayOf(0)),
     imageDecoder = FixtureDecoder(fixtureImage),
@@ -1022,17 +1088,19 @@ private class ControllableTilingReaderImage private constructor(
     downSamplingKernel = MutableStateFlow(ReduceKernel.DEFAULT),
     linearLightDownSampling = linearLight,
     pageId = ReaderImage.PageId("preparation", 1),
+    hardPeakDisplayAreas = hardPeakDisplayAreas,
 ) {
-    constructor(imageSize: IntSize) : this(
+    constructor(imageSize: IntSize, hardPeakDisplayAreas: Int = 8) : this(
         MutableStateFlow(false),
         ImageProcessingPipeline(),
         FixtureImage(imageSize.width, imageSize.height),
+        hardPeakDisplayAreas,
     )
 
     private val publicationCount = MutableStateFlow(0)
     private val publicationAttemptCount = MutableStateFlow(0)
     private val generatedRegions = MutableStateFlow(0)
-    private val renderEntryCount = MutableStateFlow(0)
+    val renderEntryCount = MutableStateFlow(0)
     private val closedImageCount = MutableStateFlow(0)
     private val renderedRegions = CopyOnWriteArrayList<IntRect>()
     private val generatedTiles = CopyOnWriteArrayList<RenderedTile>()

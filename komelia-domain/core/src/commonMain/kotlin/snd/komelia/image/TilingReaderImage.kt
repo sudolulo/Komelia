@@ -39,10 +39,8 @@ import kotlin.math.round
 import kotlin.math.roundToInt
 import kotlin.time.TimeSource
 
-// Rendering is bounded by visibilityWindowFor's 2.25x viewport expansion. At the measured
-// 1192x1843 fitted display and panel zoom 3x, destination-only rendering is about 6M pixels,
-// or 24 MB. Admission control was deliberately removed on that basis; any change that renders
-// multiple viewports must restore a bound.
+// Rendering is admitted against a fixed number of fitted display areas before a tiled frame is
+// published. This keeps multi-viewport updates bounded without reducing requested resolution.
 private const val tileThreshold1 = 2048 * 2048
 private const val tileThreshold2 = 4096 * 4096
 private const val tileThreshold3 = 6144 * 6144
@@ -88,7 +86,8 @@ abstract class TilingReaderImage(
     protected val upsamplingMode: StateFlow<UpsamplingMode>,
     protected val downSamplingKernel: StateFlow<ReduceKernel>,
     protected val linearLightDownSampling: StateFlow<Boolean>,
-    final override val pageId: ReaderImage.PageId
+    final override val pageId: ReaderImage.PageId,
+    protected val hardPeakDisplayAreas: Int = 8,
 ) : ReaderImage {
     final override val painter = MutableStateFlow<TiledPainter?>(null)
     final override val error = MutableStateFlow<Throwable?>(null)
@@ -584,6 +583,9 @@ abstract class TilingReaderImage(
         this.currentSize.value = IntSize(dstWidth.roundToInt(), dstHeight.roundToInt())
 
         val tileSize = tileSizeFor((dstWidth * dstHeight).roundToInt())
+        val budget = TilePixelBudget(
+            hardPeakPixels = hardPeakDisplayAreas.toLong() * displaySize.width * displaySize.height,
+        )
 
         repeat(maxGenerationRetries) {
             val generation = generationFor(displaySize)
@@ -607,6 +609,7 @@ abstract class TilingReaderImage(
                     displayArea = displaySize,
                     tileSize = tileSize,
                     generation = generation,
+                    budget = budget,
                     readiness = request.readiness,
                     stats = stats,
                     isStillValid = isStillValid,
@@ -738,6 +741,7 @@ abstract class TilingReaderImage(
         displayArea: IntSize,
         tileSize: Int,
         generation: Long,
+        budget: TilePixelBudget,
         readiness: CompletableDeferred<Unit>?,
         stats: RenderPassStats,
         isStillValid: () -> Boolean,
@@ -764,7 +768,7 @@ abstract class TilingReaderImage(
                 val key = TileCacheKey(tileRegion, tileDisplayRegion, generation)
                 val retained = retainedTiles.value[key]
                 if (retained != null && retained.handle.isSufficientFor(requiredSize)) {
-                    val frameOwnership = retained.handle.retain()
+                    val frameOwnership = budget.retain(retained.handle)
                     if (frameOwnership != null) {
                         stats.reusedTiles += 1
                         passTiles += PassTile(
@@ -776,6 +780,12 @@ abstract class TilingReaderImage(
                         )
                         continue
                     }
+                    if (!retained.handle.isClosed) {
+                        throw TilePixelBudgetExceededException(
+                            "page ${pageId.pageNumber} rolling window exceeds " +
+                                "$hardPeakDisplayAreas display areas"
+                        )
+                    }
                     // the native image died under us; drop the record and render again
                     dropRetainedTile(key)
                 }
@@ -784,15 +794,27 @@ abstract class TilingReaderImage(
                     !retained.handle.isSufficientFor(requiredSize)
 
                 ensureUpdateIsCurrent(isStillValid)
-                val rendered = getImageRegion(image, tileRegion, requiredSize.width, requiredSize.height)
+                val reservation = budget.reserve(requiredSize.width, requiredSize.height)
+                    ?: throw TilePixelBudgetExceededException(
+                        "page ${pageId.pageNumber} rolling window exceeds " +
+                            "$hardPeakDisplayAreas display areas"
+                    )
+                val rendered = try {
+                    getImageRegion(image, tileRegion, requiredSize.width, requiredSize.height)
+                } catch (e: Throwable) {
+                    reservation.close()
+                    throw e
+                }
                 stats.renderedTiles += 1
                 if (upgradesRetainedTile) stats.upgradedTiles += 1
 
                 if (!isStillValid()) {
+                    reservation.close()
                     rendered.frames.forEach { closeRenderImage(it) }
                     throw CancellationException("image update is obsolete")
                 }
                 if (generationFor(displayArea) != generation) {
+                    reservation.close()
                     rendered.frames.forEach { closeRenderImage(it) }
                     return UpdateResult.STALE
                 }
@@ -807,21 +829,22 @@ abstract class TilingReaderImage(
                     renderGeneration = generation,
                     closeImage = { closeRenderImage(it) },
                 )
-                val frameOwnership = owned.handle.retain()
+                val admitted = reservation.attach(owned) ?: return UpdateResult.STALE
+                val frameOwnership = admitted.handle.retain()
                 if (frameOwnership == null) {
-                    owned.ownership.close()
+                    admitted.ownership.close()
                     throw IllegalStateException(
                         "page ${pageId.pageNumber} could not take ownership of a rendered tile"
                     )
                 }
 
-                putRetainedTile(key, owned.handle, owned.ownership)
+                putRetainedTile(key, admitted.handle, admitted.ownership)
                 passTiles += PassTile(
                     key = key,
-                    handle = owned.handle,
+                    handle = admitted.handle,
                     frameOwnership = frameOwnership,
-                    insertedOwnership = owned.ownership,
-                    tile = readerTileOf(owned.handle),
+                    insertedOwnership = admitted.ownership,
+                    tile = readerTileOf(admitted.handle),
                 )
                 addedNewTiles = true
             }
