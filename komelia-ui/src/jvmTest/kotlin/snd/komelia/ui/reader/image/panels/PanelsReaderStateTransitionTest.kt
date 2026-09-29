@@ -160,6 +160,61 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
+    fun `a tap during background preparation waits for that sharp window`() = runBlocking {
+        val fixture = panelFixture(
+            panels = fivePanels,
+            startPanel = 2,
+            pageFrameAvailable = false,
+        )
+        try {
+            fixture.awaitViewportObserver()
+            assertTrue(fixture.state.prepareRollingWindow())
+            val backgroundPreparation = withTimeout(2_000) {
+                fixture.image.preparationStarted.await()
+            }
+            assertEquals(4, backgroundPreparation.requirements.size)
+            val rendersBeforePreparation = fixture.image.nativeRenders
+
+            fixture.state.nextPanel()
+            delay(100)
+
+            assertEquals(
+                1,
+                fixture.image.prepareRequests.size,
+                "the transition must join the in-flight background preparation",
+            )
+            assertEquals(
+                PanelsReaderState.PageIndex(0, 2, false),
+                fixture.state.currentPageIndex.value,
+                "movement must wait for sharp coverage",
+            )
+            assertEquals(
+                rendersBeforePreparation,
+                fixture.image.nativeRenders,
+                "the blocked preparation must not expose a soft render",
+            )
+
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (fixture.state.currentPageIndex.value.panel != 3) delay(10)
+            }
+
+            assertEquals(
+                2,
+                fixture.image.prepareRequests.size,
+                "movement must reacquire the completed rolling window exactly once",
+            )
+            assertEquals(
+                rendersBeforePreparation + 4,
+                fixture.image.nativeRenders,
+                "reacquiring the completed window must perform no additional native renders",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
     fun `a warm forward transition renders nothing`() = runBlocking {
         val fixture = panelFixture(panels = fivePanels, startPanel = 2)
         try {
@@ -494,7 +549,6 @@ class PanelsReaderStateTransitionTest {
             val event = events.single()
             assertEquals(PanelTransitionOutcome.ANIMATED, event.outcome)
             assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
-            assertFalse(event.pageFrameAvailable)
             assertEquals(
                 250,
                 event.durationMillis,
@@ -626,7 +680,6 @@ class PanelsReaderStateTransitionTest {
             assertEquals(250, event.durationMillis)
             assertEquals(PanelTransitionOutcome.ANIMATED, event.outcome)
             assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
-            assertFalse(event.pageFrameAvailable)
             assertTrue(event.generation > 0)
             assertTrue(event.readinessMillis >= 0)
             assertTrue(event.movementEndMillis >= event.movementStartMillis)
@@ -651,7 +704,6 @@ class PanelsReaderStateTransitionTest {
             assertEquals(1, events.size, "one input must emit exactly one event")
             val event = events.single()
             assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
-            assertFalse(event.pageFrameAvailable)
             assertTrue(event.readinessMillis >= 0L)
             assertEquals(PanelTransitionMode.SNAPPY, event.mode)
             assertEquals(250, event.durationMillis)

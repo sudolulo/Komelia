@@ -92,12 +92,6 @@ enum class PanelTransitionOutcome {
 enum class PanelTransitionFrameSource {
     /** the sharp rolling panel window was prepared or reacquired for movement */
     ROLLING_WINDOW,
-
-    /** the retained fit-zoom page frame was republished; nothing was rendered to move */
-    RETAINED_PAGE_FRAME,
-
-    /** no page frame was available, so the whole page was rendered at fit zoom before movement */
-    RENDERED_FIT_ZOOM_PAGE,
 }
 
 /**
@@ -124,14 +118,6 @@ data class PanelTransitionEvent(
     val movementStartMillis: Long,
     val movementEndMillis: Long,
 ) {
-    /**
-     * Whether the retained page frame was republished, so the transition moved immediately. It is
-     * derived from [frameSource] and cannot contradict it: a transition that had to render its
-     * swept path first reports false here, and reports the wait in [readinessMillis].
-     */
-    val pageFrameAvailable: Boolean
-        get() = frameSource == PanelTransitionFrameSource.RETAINED_PAGE_FRAME
-
     fun toLogLine(): String = "panel transition $generation $outcome mode=$mode " +
         "duration=${durationMillis}ms frame=$frameSource " +
         "readiness=${readinessMillis}ms " +
