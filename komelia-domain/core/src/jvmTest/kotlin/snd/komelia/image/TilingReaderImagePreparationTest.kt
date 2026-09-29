@@ -361,6 +361,37 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
+    fun `warm reuse counts retained tiles once within a tight budget`() = runBlocking {
+        val image = preparationFixture(hardPeakDisplayAreas = 1)
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(screenSize, listOf(requirement(widePanel, 1f))).close()
+            val rendersBeforeReuse = image.renderEntryCount.value
+            val retainedPixels = image.renderedTiles.sumOf {
+                it.renderSize.width.toLong() * it.renderSize.height
+            }
+            val hardPeakPixels = screenSize.width.toLong() * screenSize.height
+            assertTrue(
+                retainedPixels in (hardPeakPixels / 2 + 1)..hardPeakPixels,
+                "the retained fixture must fit once but not twice: $retainedPixels of $hardPeakPixels pixels",
+            )
+
+            image.prepareUpdate(
+                screenSize,
+                listOf(requirement(widePanel, 1f), requirement(targetCorridor, 1f)),
+            ).close()
+
+            assertEquals(
+                rendersBeforeReuse,
+                image.renderEntryCount.value,
+                "a fully retained warm pass must not render new tiles",
+            )
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
     fun `overlapping requirements render each shared source tile once at the max density`() = runBlocking {
         val image = preparationFixture()
         try {
