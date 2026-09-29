@@ -39,6 +39,7 @@ import snd.komelia.image.KomeliaPanelDetector
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.ReaderImage.PageId
 import snd.komelia.image.ReaderImageResult
+import snd.komelia.image.TilePixelBudgetExceededException
 import snd.komelia.onnxruntime.OnnxRuntimeException
 import snd.komelia.settings.ImageReaderSettingsRepository
 import snd.komelia.settings.model.PagedReadingDirection
@@ -92,6 +93,9 @@ enum class PanelTransitionOutcome {
 enum class PanelTransitionFrameSource {
     /** the sharp rolling panel window was prepared or reacquired for movement */
     ROLLING_WINDOW,
+
+    /** the rolling window exceeded its budget, so movement uses only its sharp endpoint pair */
+    SHARP_PAIR_FALLBACK,
 }
 
 /**
@@ -723,6 +727,16 @@ class PanelsReaderState(
         )
         if (rollingRequirements.isEmpty()) return false
         val transitionRequirements = listOf(fitZoomPage) + rollingRequirements
+        val sharpPairRequirements = rollingPanelRequirements(
+            panels = listOf(panelData.panels[sourceIndex.panel], panel),
+            currentPanelIndex = 0,
+            areaSize = areaSize,
+            targetSize = targetSize,
+            transformationForZoom = screenScaleState::transformationForZoom,
+            imageSize = panelData.originalImageSize,
+        ).distinct()
+        if (sharpPairRequirements.isEmpty()) return false
+        val fallbackRequirements = listOf(fitZoomPage) + sharpPairRequirements
         val transitionWindowKey = RollingWindowKey(image, sourceIndex.panel, areaSize, targetSize)
 
         val transition = PreparedPanelTransition(
@@ -769,11 +783,21 @@ class PanelsReaderState(
                     if (rollingWindowKey == transitionWindowKey) {
                         rollingWindowJob?.join()
                     }
-                    val lease = image.prepareUpdate(
-                        maxDisplaySize = transition.areaSize,
-                        requirements = transitionRequirements,
-                    )
-                    frameSource = PanelTransitionFrameSource.ROLLING_WINDOW
+                    val lease = try {
+                        image.prepareUpdate(
+                            maxDisplaySize = transition.areaSize,
+                            requirements = transitionRequirements,
+                        ).also {
+                            frameSource = PanelTransitionFrameSource.ROLLING_WINDOW
+                        }
+                    } catch (_: TilePixelBudgetExceededException) {
+                        image.prepareUpdate(
+                            maxDisplaySize = transition.areaSize,
+                            requirements = fallbackRequirements,
+                        ).also {
+                            frameSource = PanelTransitionFrameSource.SHARP_PAIR_FALLBACK
+                        }
+                    }
                     readinessMillis = transitionStart.elapsedNow().inWholeMilliseconds
                     lease
                 } catch (e: CancellationException) {

@@ -42,6 +42,7 @@ import snd.komelia.image.ReaderImage
 import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImageFactory
 import snd.komelia.image.ReaderImageResult
+import snd.komelia.image.TilePixelBudgetExceededException
 import snd.komelia.image.ViewportRenderRequirement
 import snd.komelia.komga.api.KomgaBookApi
 import snd.komelia.komga.api.KomgaReadListApi
@@ -59,6 +60,7 @@ import snd.komga.client.book.KomgaBookId
 import java.lang.reflect.Proxy
 import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
@@ -213,6 +215,96 @@ class PanelsReaderStateTransitionTest {
             fixture.close()
         }
     }
+
+    @Test
+    fun `rapid input before the edge is ready waits for sharp coverage`() = runBlocking {
+        val fixture = panelFixture(startPanel = 0, pageFrameAvailable = false)
+        try {
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+
+            assertFalse(fixture.movementStarted())
+
+            fixture.image.releasePreparation.complete(Unit)
+            fixture.runMovementToCompletion()
+
+            assertEquals(
+                PanelTransitionFrameSource.ROLLING_WINDOW,
+                fixture.lastEvent().frameSource,
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `readiness reports the wait when the window was not pre-rendered`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(startPanel = 0, pageFrameAvailable = false)
+        try {
+            fixture.withDiagnostics { events += it }
+
+            fixture.state.nextPanel()
+            fixture.delayPreparation(millis = 40)
+            fixture.runMovementToCompletion()
+
+            assertTrue(events.last().readinessMillis >= 40)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `an over budget window falls back to a sharp current and destination pair`() = runBlocking {
+        val fixture = panelFixture(startPanel = 1)
+        try {
+            fixture.image.failNextRollingWindowAsOverBudget()
+
+            fixture.state.nextPanel()
+            withTimeout(2_000) {
+                while (fixture.image.prepareRequests.size < 2) delay(10)
+            }
+            fixture.image.releasePreparation.complete(Unit)
+            withTimeout(2_000) {
+                while (!fixture.movementStarted()) delay(10)
+            }
+            fixture.runMovementToCompletion()
+
+            val event = fixture.lastEvent()
+            assertEquals(PanelTransitionFrameSource.SHARP_PAIR_FALLBACK, event.frameSource)
+            val fallback = fixture.image.prepareRequests[1]
+            assertEquals(3, fallback.requirements.size)
+            assertEquals(2, fallback.requirements.count { !it.overscan && it.zoomFactor > 1f })
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `a material resize rebuilds the window around the same panel and never reuses old coordinates`() =
+        runBlocking {
+            val fixture = panelFixture(startPanel = 1)
+            try {
+                fixture.settle()
+                val oldPanelRegions = fixture.image.prepareRequests.last().requirements
+                    .filterNot { it.overscan }
+                    .map { it.region }
+
+                fixture.resizeArea(IntSize(2208, 1840))
+                fixture.settle()
+
+                val lastPrepare = fixture.image.prepareRequests.last()
+                assertEquals(IntSize(2208, 1840), lastPrepare.maxDisplaySize)
+                assertEquals(1, fixture.state.currentPageIndex.value.panel)
+                assertNotEquals(
+                    oldPanelRegions,
+                    lastPrepare.requirements.filterNot { it.overscan }.map { it.region },
+                    "the resized window must use coordinates calculated for the new display geometry",
+                )
+            } finally {
+                fixture.close()
+            }
+        }
 
     @Test
     fun `a warm forward transition renders nothing`() = runBlocking {
@@ -1154,6 +1246,9 @@ private class PanelFixture(
     val screenScaleState: ScreenScaleState,
     val frameClock: ControlledFrameClock,
     private val animationScope: CoroutineScope,
+    private val initialPanel: Int,
+    private val events: CopyOnWriteArrayList<PanelTransitionEvent>,
+    private val diagnosticListeners: CopyOnWriteArrayList<(PanelTransitionEvent) -> Unit>,
 ) {
     private var viewportObserverSettled = false
 
@@ -1212,6 +1307,33 @@ private class PanelFixture(
         }
     }
 
+    fun movementStarted(): Boolean = state.currentPageIndex.value.panel != initialPanel
+
+    suspend fun delayPreparation(millis: Long) {
+        withTimeout(2_000) { image.preparationStarted.await() }
+        delay(millis)
+        image.releasePreparation.complete(Unit)
+    }
+
+    suspend fun resizeArea(areaSize: IntSize) {
+        val existingRequests = image.prepareRequests.size
+        screenScaleState.setAreaSize(areaSize)
+        withTimeout(2_000) {
+            while (image.prepareRequests.drop(existingRequests).none { it.maxDisplaySize == areaSize }) {
+                delay(10)
+            }
+        }
+    }
+
+    fun withDiagnostics(listener: (PanelTransitionEvent) -> Unit) {
+        diagnosticListeners += listener
+    }
+
+    suspend fun lastEvent(): PanelTransitionEvent = withTimeout(2_000) {
+        while (events.isEmpty()) delay(10)
+        events.last()
+    }
+
     /** Drives the controlled frame clock past the longest panel movement and waits for stability. */
     suspend fun runMovementToCompletion() {
         image.blockPreparation()
@@ -1236,13 +1358,23 @@ private suspend fun CoroutineScope.panelFixture(
     val image = ControlledReaderImage(fixtureImageSize, pageFrameAvailable)
     val frameClock = ControlledFrameClock()
     val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + frameClock)
+    val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+    val diagnosticListeners = CopyOnWriteArrayList<(PanelTransitionEvent) -> Unit>()
     val screenScaleState = ScreenScaleState().apply {
         composeScope = animationScope
         setAreaSize(fixtureAreaSize)
         setTargetSize(fixtureAreaSize.toSize())
         setZoom(3f)
     }
-    val state = panelsReaderState(screenScaleState, transitionMode, diagnostics)
+    val state = panelsReaderState(
+        screenScaleState,
+        transitionMode,
+        PanelTransitionDiagnostics { event ->
+            events += event
+            diagnostics.onTransition(event)
+            diagnosticListeners.forEach { it(event) }
+        },
+    )
     state.currentPage.value = PanelsReaderState.PanelsPage(
         metadata = PageMetadata(KomgaBookId("book"), 1, fixtureImageSize),
         imageResult = ReaderImageResult.Success(image),
@@ -1254,7 +1386,16 @@ private suspend fun CoroutineScope.panelFixture(
     )
     state.currentPageIndex.value = PanelsReaderState.PageIndex(0, startPanel, false)
     state.initialize()
-    return PanelFixture(state, image, screenScaleState, frameClock, animationScope)
+    return PanelFixture(
+        state = state,
+        image = image,
+        screenScaleState = screenScaleState,
+        frameClock = frameClock,
+        animationScope = animationScope,
+        initialPanel = startPanel,
+        events = events,
+        diagnosticListeners = diagnosticListeners,
+    )
 }
 
 private data class ImageUpdate(
@@ -1312,6 +1453,7 @@ private class ControlledReaderImage(
     private val pageFrameReleases = AtomicInteger()
     private val preparedReleases = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
+    private val failRollingWindowAsOverBudget = AtomicBoolean(false)
 
     /** serialises frame installation against anything observing what is installed */
     private val installLock = ReentrantLock()
@@ -1360,6 +1502,10 @@ private class ControlledReaderImage(
         preparationGate.set(CompletableDeferred())
     }
 
+    fun failNextRollingWindowAsOverBudget() {
+        failRollingWindowAsOverBudget.set(true)
+    }
+
     override val pageId = ReaderImage.PageId("book", 1)
     override val originalSize = MutableStateFlow<IntSize?>(imageSize)
     override val displaySize = MutableStateFlow<IntSize?>(imageSize)
@@ -1397,6 +1543,9 @@ private class ControlledReaderImage(
         val request = PrepareRequest(maxDisplaySize, requirements)
         prepareRequests += request
         preparationStarted.complete(request)
+        if (failRollingWindowAsOverBudget.compareAndSet(true, false)) {
+            throw TilePixelBudgetExceededException("controlled rolling window exceeds pixel budget")
+        }
         if (requirements.any { it !in renderedCoverage }) {
             preparationGate.get().await()
         }
