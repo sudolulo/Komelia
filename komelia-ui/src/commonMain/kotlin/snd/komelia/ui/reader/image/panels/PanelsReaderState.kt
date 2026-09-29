@@ -690,36 +690,15 @@ class PanelsReaderState(
             imageSize = panelData.originalImageSize,
         )
         if (panelRequirements.isEmpty()) return false
-        val fallbackPanels = listOfNotNull(
-            panelData.panels.getOrNull(panelIndex),
-            panelData.panels.getOrNull(panelIndex + 1)
-                ?: panelData.panels.getOrNull(panelIndex - 1),
-        )
-        val sharpPairRequirements = rollingPanelRequirements(
-            panels = fallbackPanels,
-            currentPanelIndex = 0,
-            areaSize = areaSize,
-            targetSize = targetSize,
-            transformationForZoom = screenScaleState::transformationForZoom,
-            imageSize = panelData.originalImageSize,
-        ).distinct()
-        if (sharpPairRequirements.isEmpty()) return false
 
         val key = RollingWindowKey(image, panelIndex, areaSize, targetSize)
         rollingWindowKey = key
         rollingWindowJob = stateScope.launch {
             try {
-                try {
-                    image.prepareUpdate(
-                        maxDisplaySize = areaSize,
-                        requirements = listOf(fitPage) + panelRequirements,
-                    )
-                } catch (_: TilePixelBudgetExceededException) {
-                    image.prepareUpdate(
-                        maxDisplaySize = areaSize,
-                        requirements = listOf(fitPage) + sharpPairRequirements,
-                    )
-                }.close()
+                image.prepareUpdate(
+                    maxDisplaySize = areaSize,
+                    requirements = listOf(fitPage) + panelRequirements,
+                ).close()
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {

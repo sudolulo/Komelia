@@ -514,7 +514,7 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `over budget post arrival window prepares the next sharp pair before input`() = runBlocking {
+    fun `over budget post arrival window waits for the selected destination`() = runBlocking {
         val fixture = panelFixture(panels = fivePanels, startPanel = 2)
         try {
             fixture.settle()
@@ -523,29 +523,28 @@ class PanelsReaderStateTransitionTest {
             val requestsBeforeTransition = fixture.image.prepareRequests.size
             fixture.state.nextPanel()
             fixture.runMovementToCompletion()
-            withTimeout(2_000) {
-                while (fixture.image.prepareRequests.size < requestsBeforeTransition + 4) delay(10)
-            }
-
-            val rollingWindow = fixture.image.prepareRequests[requestsBeforeTransition + 2]
-            val fallbackPair = fixture.image.prepareRequests[requestsBeforeTransition + 3]
-            assertEquals(3, rollingWindow.requirements.count { !it.overscan })
-            assertEquals(2, fallbackPair.requirements.count { !it.overscan })
-
-            fixture.image.releasePreparation.complete(Unit)
             fixture.settle()
-            val rendersBeforeNextInput = fixture.image.nativeRenders
-            fixture.image.blockPreparation()
-
-            fixture.state.nextPanel()
-            withTimeout(2_000) {
-                while (fixture.state.currentPageIndex.value.panel != 4) delay(10)
-            }
 
             assertEquals(
-                rendersBeforeNextInput,
-                fixture.image.nativeRenders,
-                "the next tap must reuse the post-arrival sharp pair without rendering",
+                requestsBeforeTransition + 3,
+                fixture.image.prepareRequests.size,
+                "an over-budget background window must not guess a fallback destination before input",
+            )
+
+            val requestsBeforeInput = fixture.image.prepareRequests.size
+            fixture.state.previousPanel()
+            fixture.runMovementToCompletion()
+
+            val fallbackPair = fixture.image.prepareRequests[requestsBeforeInput + 1]
+            val sharpRegions = fallbackPair.requirements.filterNot { it.overscan }.map { it.region }
+
+            assertEquals(
+                listOf(
+                    IntRect(left = 33, top = 53, right = 66, bottom = 86),
+                    IntRect(left = 33, top = 33, right = 66, bottom = 66),
+                ),
+                sharpRegions,
+                "the fallback must contain the current panel and the destination selected by input",
             )
         } finally {
             fixture.close()
