@@ -47,7 +47,7 @@ internal fun rollingPanelRequirements(
         )
         if (region.width <= 0 || region.height <= 0) return@mapNotNull null
 
-        ViewportRenderRequirement(region = region, zoomFactor = zoom, overscan = false)
+        ViewportRenderRequirement(region = region, zoomFactor = scale, overscan = false)
     }
 }
 

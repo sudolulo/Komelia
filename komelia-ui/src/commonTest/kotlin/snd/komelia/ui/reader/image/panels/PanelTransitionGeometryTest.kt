@@ -72,6 +72,22 @@ class PanelTransitionGeometryTest {
     }
 
     @Test
+    fun `the rolling window renders at the resolved transformation scale`() {
+        val window = rollingPanelRequirements(
+            panels = defaultPanels,
+            currentPanelIndex = 1,
+            areaSize = IntSize(300, 300),
+            targetSize = IntSize(600, 600),
+            transformationForZoom = { zoom ->
+                Transformation(offset = Offset.Zero, scale = zoom * 0.5f)
+            },
+            imageSize = fixtureImageSize,
+        )
+
+        assertEquals(listOf(1.5f, 1.5f, 1.5f), window.map { it.zoomFactor })
+    }
+
+    @Test
     fun `the rolling window clips to two entries at the first panel`() {
         val window = rollingPanelRequirements(
             panels = defaultPanels,
