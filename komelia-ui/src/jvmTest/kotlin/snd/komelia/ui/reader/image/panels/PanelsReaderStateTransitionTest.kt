@@ -307,6 +307,63 @@ class PanelsReaderStateTransitionTest {
         }
 
     @Test
+    fun `input immediately after an area change does not prepare with stale geometry`() = runBlocking {
+        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
+        val fixture = panelFixture(
+            startPanel = 1,
+            pageFrameAvailable = false,
+            diagnostics = { events += it },
+        )
+        try {
+            fixture.awaitViewportObserver()
+
+            // Put the resize collector inside its throttle window without changing the fitted
+            // geometry. Waiting for the blocked transition's cancellation proves the collector
+            // handled this first area change before the real resize and input below.
+            fixture.state.nextPanel()
+            withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            val page = fixture.state.currentPage.value!!
+            fixture.state.currentPage.value = page.copy(panelData = null)
+            fixture.screenScaleState.setAreaSize(IntSize(150, 150))
+            withTimeout(2_000) {
+                while (events.none { it.outcome == PanelTransitionOutcome.CANCELLED }) delay(10)
+            }
+
+            fixture.state.currentPage.value = page
+            val resizedArea = IntSize(200, 200)
+            fixture.screenScaleState.setAreaSize(resizedArea)
+            fixture.state.nextPanel()
+
+            withTimeout(2_000) {
+                while (
+                    fixture.image.prepareRequests.none { request ->
+                        request.maxDisplaySize == resizedArea &&
+                            request.requirements.single { it.overscan }.region == IntRect(0, 0, 200, 200)
+                    }
+                ) {
+                    delay(10)
+                }
+            }
+
+            val resizedRequests = fixture.image.prepareRequests.filter { it.maxDisplaySize == resizedArea }
+            assertTrue(
+                resizedRequests.all { request ->
+                    request.requirements.single { it.overscan }.region == IntRect(0, 0, 200, 200)
+                },
+                "input during resize must not prepare new-area frames from the old target geometry: " +
+                    resizedRequests,
+            )
+            assertEquals(
+                1,
+                fixture.state.currentPageIndex.value.panel,
+                "input must wait while resize rebuilds the current panel geometry",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
     fun `a warm forward transition renders nothing`() = runBlocking {
         val fixture = panelFixture(panels = fivePanels, startPanel = 2)
         try {

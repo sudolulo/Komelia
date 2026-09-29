@@ -179,6 +179,9 @@ class PanelsReaderState(
     // overscanned viewport update.
     private val suppressedViewportUpdate = MutableStateFlow<ViewportUpdateSnapshot?>(null)
     private val resizeGeneration = MutableStateFlow(0L)
+    // areaSize changes before targetSize and transformation are rebuilt. Navigation may only use
+    // the area whose panel geometry has reached that rebuild point.
+    private val panelGeometryAreaSize = MutableStateFlow(screenScaleState.areaSize.value)
     private var resizeJob: Job? = null
     private var rollingWindowJob: Job? = null
     private var rollingWindowKey: RollingWindowKey? = null
@@ -340,8 +343,9 @@ class PanelsReaderState(
         updateImageState(page, screenScaleState)
 
         if (isStillValid()) {
-            prepareRollingWindow()
-            launchPanelTransition(pageIndex.panel, panel)
+            prepareRollingWindow(resizeGeneration = generation)
+            launchPanelTransition(pageIndex.panel, panel, resizeGeneration = generation)
+            panelGeometryAreaSize.value = areaSize
         }
     }
 
@@ -492,6 +496,7 @@ class PanelsReaderState(
                 currentPage.value = readyPage.page
                 screenScaleState.enableOverscrollArea(true)
                 screenScaleState.apply(readyPage.scale)
+                panelGeometryAreaSize.value = screenScaleState.areaSize.value
                 pendingPageIndex.compareAndSet(pageIndex, null)
                 true
             },
@@ -654,7 +659,10 @@ class PanelsReaderState(
      * The lease is only a publication lock; retained tiles keep the published frame alive after it
      * closes. A newer window cancels an obsolete preparation before taking its place.
      */
-    internal fun prepareRollingWindow(): Boolean {
+    internal fun prepareRollingWindow(): Boolean = prepareRollingWindow(resizeGeneration = null)
+
+    private fun prepareRollingWindow(resizeGeneration: Long?): Boolean {
+        if (!panelGeometryIsReady(resizeGeneration)) return false
         rollingWindowJob?.cancel()
         rollingWindowJob = null
         rollingWindowKey = null
@@ -715,7 +723,12 @@ class PanelsReaderState(
         return true
     }
 
-    private fun launchPanelTransition(targetPanelIndex: Int, panel: ImageRect): Boolean {
+    private fun launchPanelTransition(
+        targetPanelIndex: Int,
+        panel: ImageRect,
+        resizeGeneration: Long? = null,
+    ): Boolean {
+        if (!panelGeometryIsReady(resizeGeneration)) return false
         if (pendingPageIndex.value != null || panelTransitionController.isActive) return false
         // the mode is snapshotted here, so a change during movement only affects the next one
         val transitionMode = panelTransitionMode.value
@@ -877,6 +890,13 @@ class PanelsReaderState(
             },
         )
     }
+
+    private fun panelGeometryIsReady(resizeGeneration: Long?): Boolean =
+        if (resizeGeneration == null) {
+            panelGeometryAreaSize.value == screenScaleState.areaSize.value
+        } else {
+            this.resizeGeneration.value == resizeGeneration
+        }
 
     /**
      * Resolves where a transition to [panel] ends up, or null when the geometry is not usable yet.
