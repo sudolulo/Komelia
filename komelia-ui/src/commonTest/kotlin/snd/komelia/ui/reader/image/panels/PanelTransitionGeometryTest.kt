@@ -20,9 +20,9 @@ private val areaSize = IntSize(900, 1000)
 private val targetTransformation = Transformation(offset = Offset(-656f, 1200f), scale = 2f)
 private val fixtureImageSize = IntSize(300, 300)
 private val defaultPanels = listOf(
-    ImageRect(left = 0, top = 0, right = 100, bottom = 100),
-    ImageRect(left = 100, top = 100, right = 200, bottom = 200),
-    ImageRect(left = 200, top = 200, right = 300, bottom = 300),
+    ImageRect(left = 0, top = 0, right = 300, bottom = 100),
+    ImageRect(left = 0, top = 100, right = 300, bottom = 200),
+    ImageRect(left = 0, top = 200, right = 300, bottom = 300),
 )
 
 private fun identityTransformationForZoom(zoom: Float): Transformation =
@@ -61,14 +61,14 @@ class PanelTransitionGeometryTest {
         assertEquals(3, window.size)
         assertEquals(
             listOf(
-                IntRect(left = 0, top = 0, right = 397, bottom = 614),
-                IntRect(left = 397, top = 614, right = 794, bottom = 1228),
-                IntRect(left = 795, top = 1229, right = 1192, bottom = 1843),
+                IntRect(left = 0, top = 0, right = 1192, bottom = 1843),
+                IntRect(left = 0, top = 0, right = 1192, bottom = 1843),
+                IntRect(left = 0, top = 614, right = 1192, bottom = 1843),
             ),
             window.map { it.region },
         )
         assertTrue(window.all { !it.overscan })
-        assertTrue(window.all { it.zoomFactor > 1f })
+        assertEquals(listOf(1f, 1f, 1f), window.map { it.zoomFactor })
     }
 
     @Test
