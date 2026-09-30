@@ -504,7 +504,13 @@ private class MeasuringReaderImage(
             height = scaleHeight,
             kind = RenderKind.FULL_RESIZE,
         )
-        return ReaderImageData(scaleWidth, scaleHeight, listOf(rendered), null)
+        return ReaderImageData(
+            scaleWidth,
+            scaleHeight,
+            IntSize(scaleWidth, scaleHeight),
+            listOf(rendered),
+            null,
+        )
     }
 
     override suspend fun getImageRegion(
@@ -524,7 +530,13 @@ private class MeasuringReaderImage(
             height = scaleHeight,
             kind = RenderKind.TILE,
         )
-        return ReaderImageData(scaleWidth, scaleHeight, listOf(rendered), null)
+        return ReaderImageData(
+            scaleWidth,
+            scaleHeight,
+            IntSize(scaleWidth, scaleHeight),
+            listOf(rendered),
+            null,
+        )
     }
 
     /**

@@ -659,6 +659,7 @@ abstract class TilingReaderImage(
         ensureUpdateIsCurrent(isStillValid)
         val resizedImage = resizeImage(image, dstWidth, dstHeight)
         stats.renderedTiles += 1
+        requireSatisfiedSize(resizedImage, IntSize(dstWidth, dstHeight))
 
         if (!isStillValid()) {
             resizedImage.frames.forEach { closeRenderImage(it) }
@@ -681,6 +682,7 @@ abstract class TilingReaderImage(
                     sourceBounds = sourceBounds,
                     displayRegion = tileDisplayRegion,
                     renderSize = IntSize(resizedImage.width, resizedImage.height),
+                    satisfiedSize = resizedImage.satisfiedSize,
                     renderGeneration = generation,
                     closeImage = { closeRenderImage(it) },
                 )
@@ -807,6 +809,7 @@ abstract class TilingReaderImage(
                 }
                 stats.renderedTiles += 1
                 if (upgradesRetainedTile) stats.upgradedTiles += 1
+                requireSatisfiedSize(rendered, requiredSize)
 
                 if (!isStillValid()) {
                     reservation.close()
@@ -826,6 +829,7 @@ abstract class TilingReaderImage(
                     sourceBounds = tileRegion,
                     displayRegion = tileDisplayRegion,
                     renderSize = IntSize(rendered.width, rendered.height),
+                    satisfiedSize = rendered.satisfiedSize,
                     renderGeneration = generation,
                     closeImage = { closeRenderImage(it) },
                 )
@@ -905,6 +909,22 @@ abstract class TilingReaderImage(
 
     private fun ensureUpdateIsCurrent(isStillValid: () -> Boolean) {
         if (!isStillValid()) throw CancellationException("image update is obsolete")
+    }
+
+    private fun requireSatisfiedSize(rendered: ReaderImageData, requiredSize: IntSize) {
+        if (
+            rendered.satisfiedSize.width >= requiredSize.width &&
+            rendered.satisfiedSize.height >= requiredSize.height
+        ) {
+            return
+        }
+
+        rendered.frames.forEach { closeRenderImage(it) }
+        throw IllegalStateException(
+            "page ${pageId.pageNumber} backend returned ${rendered.width} x ${rendered.height} " +
+                "satisfying ${rendered.satisfiedSize.width} x ${rendered.satisfiedSize.height} " +
+                "for requested ${requiredSize.width} x ${requiredSize.height}"
+        )
     }
 
     /** Source tile grid and its fitted display rectangles. */
@@ -1143,6 +1163,7 @@ abstract class TilingReaderImage(
     data class ReaderImageData(
         val width: Int,
         val height: Int,
+        val satisfiedSize: IntSize,
         val frames: List<RenderImage>,
         val delays: List<Long>?,
     )

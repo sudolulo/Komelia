@@ -56,12 +56,13 @@ class AndroidReaderImage(
     }
 
     override suspend fun resizeImage(image: KomeliaImage, scaleWidth: Int, scaleHeight: Int): ReaderImageData {
+        val requestedSize = IntSize(scaleWidth, scaleHeight)
         return image.resize(
             scaleWidth = scaleWidth,
             scaleHeight = scaleHeight,
             linear = linearLightDownSampling.value,
             kernel = downSamplingKernel.value
-        ).toReaderImageData()
+        ).toReaderImageData(requestedSize).requireActualSize(requestedSize)
     }
 
     override suspend fun getImageRegion(
@@ -75,8 +76,8 @@ class AndroidReaderImage(
         try {
             region = image.extractArea(imageRegion.toImageRect())
             if (scaleWidth > imageRegion.width || scaleHeight > imageRegion.height) {
-                val regionData = region.toReaderImageData()
-                return regionData
+                return region.toReaderImageData(IntSize(scaleWidth, scaleHeight))
+                    .requireActualSize(IntSize(imageRegion.width, imageRegion.height))
             }
             resized = region.resize(
                 scaleWidth = scaleWidth,
@@ -84,16 +85,17 @@ class AndroidReaderImage(
                 linear = linearLightDownSampling.value,
                 kernel = downSamplingKernel.value
             )
-            return resized.toReaderImageData()
+            val requestedSize = IntSize(scaleWidth, scaleHeight)
+            return resized.toReaderImageData(requestedSize).requireActualSize(requestedSize)
         } finally {
             region?.close()
             resized?.close()
         }
     }
 
-    private suspend fun KomeliaImage.toReaderImageData(): ReaderImageData {
+    private suspend fun KomeliaImage.toReaderImageData(satisfiedSize: IntSize): ReaderImageData {
         if (this.pagesLoaded == 1) {
-            return ReaderImageData(width, height, listOf(this.toBitmap()), null)
+            return ReaderImageData(width, height, satisfiedSize, listOf(this.toBitmap()), null)
         }
 
         val frames = mutableListOf<RenderImage>()
@@ -111,7 +113,15 @@ class AndroidReaderImage(
             frames.add(bitmap)
             delays?.add(this.pageDelays?.getOrNull(i)?.toLong() ?: defaultFrameDelay)
         }
-        return ReaderImageData(width, pageHeight, frames, delays)
+        return ReaderImageData(width, pageHeight, satisfiedSize, frames, delays)
+    }
+
+    private fun ReaderImageData.requireActualSize(expectedSize: IntSize): ReaderImageData {
+        if (width == expectedSize.width && height == expectedSize.height) return this
+        frames.forEach { closeRenderImage(it) }
+        throw IllegalStateException(
+            "backend returned $width x $height for complete ${expectedSize.width} x ${expectedSize.height} region"
+        )
     }
 
     private fun IntRect.toImageRect() =

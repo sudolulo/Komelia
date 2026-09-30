@@ -89,7 +89,9 @@ class DesktopReaderImage(
             linear = linearLightDownSampling.value,
             kernel = downSamplingKernel.value
         )
-        val imageData = downscaled.toReaderImageData()
+        val requestedSize = IntSize(scaleWidth, scaleHeight)
+        requireCompleteSize(downscaled, requestedSize)
+        val imageData = downscaled.toReaderImageData(requestedSize)
         downscaled.close()
         return imageData
     }
@@ -113,7 +115,9 @@ class DesktopReaderImage(
                 linear = linearLightDownSampling.value,
                 kernel = downSamplingKernel.value
             )
-            return resized.toReaderImageData()
+            val requestedSize = IntSize(scaleWidth, scaleHeight)
+            requireCompleteSize(resized, requestedSize)
+            return resized.toReaderImageData(requestedSize)
         } finally {
             region?.close()
             resized?.close()
@@ -128,6 +132,7 @@ class DesktopReaderImage(
         val upscaled = upscaler?.upscale(image, pageId.toString())
 
         if (upscaled != null) {
+            requireCompleteUpscale(image, upscaled)
             if (upscaled.width > scaleWidth && upscaled.pageHeight > scaleHeight) {
                 val resized = upscaled.resize(
                     scaleWidth = scaleWidth,
@@ -135,15 +140,23 @@ class DesktopReaderImage(
                     linear = linearLightDownSampling.value,
                     kernel = downSamplingKernel.value
                 )
-                val imageData = resized.toReaderImageData()
+                val requestedSize = IntSize(scaleWidth, scaleHeight)
+                requireCompleteSize(resized, requestedSize)
+                val imageData = resized.toReaderImageData(requestedSize)
                 resized.close()
                 return imageData
             } else {
-                val imageData = upscaled.toReaderImageData()
+                val actualSize = IntSize(upscaled.width, upscaled.pageHeight)
+                val imageData = upscaled.toReaderImageData(
+                    completeResultSatisfiedSize(actualSize, IntSize(scaleWidth, scaleHeight))
+                )
                 return imageData
             }
         } else {
-            val imageData = image.toReaderImageData()
+            val actualSize = IntSize(image.width, image.pageHeight)
+            val imageData = image.toReaderImageData(
+                completeResultSatisfiedSize(actualSize, IntSize(scaleWidth, scaleHeight))
+            )
             return imageData
         }
     }
@@ -163,7 +176,7 @@ class DesktopReaderImage(
         try {
             if (upscaled != null) {
                 // assume upscaling is done by integer fraction (2x, 4x etc.)
-                val scaleRatio = upscaled.width / image.width
+                val scaleRatio = requireCompleteUpscale(image, upscaled)
                 val targetRegion = ImageRect(
                     left = imageRegion.left * scaleRatio,
                     right = imageRegion.right * scaleRatio,
@@ -171,6 +184,8 @@ class DesktopReaderImage(
                     bottom = imageRegion.bottom * scaleRatio
                 )
                 region = upscaled.extractArea(targetRegion)
+                val completeRegionSize = IntSize(targetRegion.width, targetRegion.height)
+                requireCompleteSize(region, completeRegionSize)
 
                 // downscale if region is bigger than requested scale
                 if (region.width > scaleWidth || region.pageHeight > scaleHeight) {
@@ -180,16 +195,24 @@ class DesktopReaderImage(
                         linear = linearLightDownSampling.value,
                         kernel = downSamplingKernel.value
                     )
-                    return resized.toReaderImageData()
+                    val requestedSize = IntSize(scaleWidth, scaleHeight)
+                    requireCompleteSize(resized, requestedSize)
+                    return resized.toReaderImageData(requestedSize)
                     // otherwise do not upsample and return original region size
                 } else {
-                    return region.toReaderImageData()
+                    return region.toReaderImageData(
+                        completeResultSatisfiedSize(completeRegionSize, IntSize(scaleWidth, scaleHeight))
+                    )
                 }
 
                 // if onnxruntime upscaling wasn't performed return original region size
             } else {
                 region = image.extractArea(imageRegion.toImageRect())
-                return region.toReaderImageData()
+                val completeRegionSize = IntSize(imageRegion.width, imageRegion.height)
+                requireCompleteSize(region, completeRegionSize)
+                return region.toReaderImageData(
+                    completeResultSatisfiedSize(completeRegionSize, IntSize(scaleWidth, scaleHeight))
+                )
             }
         } finally {
             resized?.close()
@@ -197,12 +220,12 @@ class DesktopReaderImage(
         }
     }
 
-    private suspend fun KomeliaImage.toReaderImageData(): ReaderImageData {
+    private suspend fun KomeliaImage.toReaderImageData(satisfiedSize: IntSize): ReaderImageData {
         if (this.pagesLoaded == 1) {
             val skiaBitmap = this.toSkiaBitmap()
             val image = Image.makeFromBitmap(skiaBitmap)
             skiaBitmap.close()
-            return ReaderImageData(width, height, listOf(image), null)
+            return ReaderImageData(width, height, satisfiedSize, listOf(image), null)
         }
 
         val frames = mutableListOf<RenderImage>()
@@ -222,8 +245,32 @@ class DesktopReaderImage(
             frames.add(image)
             delays?.add(this.pageDelays?.getOrNull(i)?.toLong() ?: defaultFrameDelay)
         }
-        return ReaderImageData(width, pageHeight, frames, delays)
+        return ReaderImageData(width, pageHeight, satisfiedSize, frames, delays)
     }
+
+    private fun requireCompleteSize(image: KomeliaImage, expectedSize: IntSize) {
+        check(image.width == expectedSize.width && image.pageHeight == expectedSize.height) {
+            "backend returned ${image.width} x ${image.pageHeight} for complete " +
+                "${expectedSize.width} x ${expectedSize.height} result"
+        }
+    }
+
+    private fun requireCompleteUpscale(source: KomeliaImage, upscaled: KomeliaImage): Int {
+        check(upscaled.width >= source.width && upscaled.width % source.width == 0) {
+            "upscale returned incomplete width ${upscaled.width} for source width ${source.width}"
+        }
+        val scaleRatio = upscaled.width / source.width
+        check(upscaled.pageHeight == source.pageHeight * scaleRatio) {
+            "upscale returned incomplete height ${upscaled.pageHeight} for source height ${source.pageHeight} " +
+                "at ${scaleRatio}x"
+        }
+        return scaleRatio
+    }
+
+    private fun completeResultSatisfiedSize(actualSize: IntSize, requestedSize: IntSize) = IntSize(
+        width = maxOf(actualSize.width, requestedSize.width),
+        height = maxOf(actualSize.height, requestedSize.height),
+    )
 
     private fun IntRect.toImageRect() = ImageRect(left = left, top = top, right = right, bottom = bottom)
 

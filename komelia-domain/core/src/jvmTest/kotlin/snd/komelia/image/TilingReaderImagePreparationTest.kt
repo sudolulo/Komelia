@@ -129,6 +129,8 @@ internal interface PreparationFixture : ReaderImage {
     fun releaseRenderBlock()
     fun failNextRender(error: Throwable)
     fun failRenderAfter(successes: Int, error: Throwable)
+    fun returnSourceCappedResults(enabled: Boolean)
+    fun returnUnprovenUndersizedResults(enabled: Boolean)
     fun triggerSettingsReload()
     fun changeRenderInputs()
 }
@@ -220,6 +222,37 @@ class TilingReaderImagePreparationTest {
 
             assertSame(painterBefore, image.painter.value)
             assertEquals(1, image.painterPublications)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `a proven source ceiling is reused without a second native render`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.returnSourceCappedResults(true)
+            val request = listOf(requirement(narrowPanel, 3f))
+            image.prepareUpdate(screenSize, request).close()
+            val renders = image.renderEntryCount.value
+            image.prepareUpdate(screenSize, request).close()
+            assertEquals(renders, image.renderEntryCount.value)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `an unproven undersized result never becomes sharp coverage`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.returnUnprovenUndersizedResults(true)
+            assertFailsWith<IllegalStateException> {
+                image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 3f)))
+            }
+            assertNull(image.currentTileCoverage)
+            assertTrue(image.closedImages.isNotEmpty())
+            assertTrue(image.tileCloseCounts.all { it == 1 })
         } finally {
             image.close()
         }
@@ -1100,6 +1133,9 @@ private class DelegatingPreparationFixture(
     override fun failNextRender(error: Throwable) = delegate.failNextRender(error)
     override fun failRenderAfter(successes: Int, error: Throwable) =
         delegate.failRenderAfter(successes, error)
+    override fun returnSourceCappedResults(enabled: Boolean) = delegate.returnSourceCappedResults(enabled)
+    override fun returnUnprovenUndersizedResults(enabled: Boolean) =
+        delegate.returnUnprovenUndersizedResults(enabled)
     override fun triggerSettingsReload() = delegate.triggerSettingsReload()
     override fun changeRenderInputs() = delegate.changeRenderInputs()
     override fun close() = delegate.close()
@@ -1143,6 +1179,8 @@ private class ControllableTilingReaderImage private constructor(
     private val renderGate = AtomicReference(CountDownLatch(0))
     private val renderFailure = AtomicReference<Throwable?>(null)
     private val remainingSuccesses = AtomicLong(0)
+    private val sourceCappedResults = AtomicBoolean(false)
+    private val unprovenUndersizedResults = AtomicBoolean(false)
     private val completedBarrierReuse = AtomicBoolean(false)
     private val pageReplacement = AtomicReference<PageReplacementStep?>(null)
 
@@ -1203,6 +1241,14 @@ private class ControllableTilingReaderImage private constructor(
     fun failRenderAfter(successes: Int, error: Throwable) {
         remainingSuccesses.set(successes.toLong())
         renderFailure.set(error)
+    }
+
+    fun returnSourceCappedResults(enabled: Boolean) {
+        sourceCappedResults.set(enabled)
+    }
+
+    fun returnUnprovenUndersizedResults(enabled: Boolean) {
+        unprovenUndersizedResults.set(enabled)
     }
 
     /**
@@ -1285,6 +1331,7 @@ private class ControllableTilingReaderImage private constructor(
         return ReaderImageData(
             scaleWidth,
             scaleHeight,
+            IntSize(scaleWidth, scaleHeight),
             listOf(trackedRenderImage(IntRect(0, 0, image.width, image.pageHeight), scaleWidth, scaleHeight)),
             null,
         )
@@ -1299,12 +1346,25 @@ private class ControllableTilingReaderImage private constructor(
         renderEntryCount.value += 1
         renderGate.get().await()
         failIfRequested()
-        if (scaleWidth > 512) renderingGate.await()
+        if (scaleWidth > 512 && !sourceCappedResults.get() && !unprovenUndersizedResults.get()) {
+            renderingGate.await()
+        }
         generatedRegions.value += 1
+        val requestedSize = IntSize(scaleWidth, scaleHeight)
+        val actualSize = when {
+            sourceCappedResults.get() -> IntSize(imageRegion.width, imageRegion.height)
+            unprovenUndersizedResults.get() -> IntSize(
+                (scaleWidth / 2).coerceAtLeast(1),
+                (scaleHeight / 2).coerceAtLeast(1),
+            )
+            else -> requestedSize
+        }
+        val satisfiedSize = if (sourceCappedResults.get()) requestedSize else actualSize
         return ReaderImageData(
-            scaleWidth,
-            scaleHeight,
-            listOf(trackedRenderImage(imageRegion, scaleWidth, scaleHeight)),
+            actualSize.width,
+            actualSize.height,
+            satisfiedSize,
+            listOf(trackedRenderImage(imageRegion, actualSize.width, actualSize.height)),
             null,
         )
     }

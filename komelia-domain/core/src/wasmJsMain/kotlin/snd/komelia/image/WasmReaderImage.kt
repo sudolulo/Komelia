@@ -50,7 +50,8 @@ class WasmReaderImage(
 
     override suspend fun resizeImage(image: KomeliaImage, scaleWidth: Int, scaleHeight: Int): ReaderImageData {
         image.resize(scaleWidth, scaleHeight).use { resized ->
-            return resized.toReaderImageData()
+            val requestedSize = IntSize(scaleWidth, scaleHeight)
+            return resized.toReaderImageData(requestedSize).requireActualSize(requestedSize)
         }
     }
 
@@ -65,22 +66,31 @@ class WasmReaderImage(
         try {
             region = image.extractArea(imageRegion.toImageRect())
             if (scaleWidth > imageRegion.width || scaleHeight > imageRegion.height) {
-                val regionData = region.toReaderImageData()
-                return regionData
+                return region.toReaderImageData(IntSize(scaleWidth, scaleHeight))
+                    .requireActualSize(IntSize(imageRegion.width, imageRegion.height))
             }
             resized = region.resize(scaleWidth, scaleHeight)
-            return resized.toReaderImageData()
+            val requestedSize = IntSize(scaleWidth, scaleHeight)
+            return resized.toReaderImageData(requestedSize).requireActualSize(requestedSize)
         } finally {
             region?.close()
             resized?.close()
         }
     }
 
-    private suspend fun KomeliaImage.toReaderImageData(): ReaderImageData {
+    private suspend fun KomeliaImage.toReaderImageData(satisfiedSize: IntSize): ReaderImageData {
         val bitmap = this.toBitmap()
         val image = Image.makeFromBitmap(bitmap)
         bitmap.close()
-        return ReaderImageData(this.width, this.height, listOf(image), null)
+        return ReaderImageData(this.width, this.height, satisfiedSize, listOf(image), null)
+    }
+
+    private fun ReaderImageData.requireActualSize(expectedSize: IntSize): ReaderImageData {
+        if (width == expectedSize.width && height == expectedSize.height) return this
+        frames.forEach { closeRenderImage(it) }
+        throw IllegalStateException(
+            "backend returned $width x $height for complete ${expectedSize.width} x ${expectedSize.height} region"
+        )
     }
 
     private fun IntRect.toImageRect() = ImageRect(left = left, top = top, right = right, bottom = bottom)

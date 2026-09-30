@@ -10,6 +10,7 @@ internal class TileHandle private constructor(
     val sourceBounds: IntRect,
     val displayRegion: Rect,
     val renderSize: IntSize,
+    val satisfiedSize: IntSize,
     val renderGeneration: Long,
     private val closeImage: (RenderImage) -> Unit,
 ) {
@@ -17,12 +18,17 @@ internal class TileHandle private constructor(
     val pixelCount: Long = checkedPixelCount(renderSize)
     internal val isClosed: Boolean get() = references.value == 0
 
+    init {
+        require(satisfiedSize.width > 0 && satisfiedSize.height > 0)
+        require(satisfiedSize.width >= renderSize.width && satisfiedSize.height >= renderSize.height)
+    }
+
     /**
      * A tile may serve a request at the same or a lower output resolution. Serving a higher
      * one would hide a cache miss behind visibly soft content, so both dimensions must fit.
      */
     fun isSufficientFor(requiredSize: IntSize): Boolean =
-        renderSize.width >= requiredSize.width && renderSize.height >= requiredSize.height
+        satisfiedSize.width >= requiredSize.width && satisfiedSize.height >= requiredSize.height
 
     fun retain(): TileOwnership? {
         while (true) {
@@ -52,6 +58,7 @@ internal class TileHandle private constructor(
             sourceBounds: IntRect,
             displayRegion: Rect,
             renderSize: IntSize,
+            satisfiedSize: IntSize,
             renderGeneration: Long,
             closeImage: (RenderImage) -> Unit,
         ): OwnedTile {
@@ -60,6 +67,7 @@ internal class TileHandle private constructor(
                 sourceBounds = sourceBounds,
                 displayRegion = displayRegion,
                 renderSize = renderSize,
+                satisfiedSize = satisfiedSize,
                 renderGeneration = renderGeneration,
                 closeImage = closeImage,
             )
