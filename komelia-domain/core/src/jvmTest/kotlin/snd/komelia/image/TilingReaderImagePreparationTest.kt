@@ -114,6 +114,10 @@ internal interface PreparationFixture : ReaderImage {
     val closedImages: List<RenderImage>
     val publishedTiles: List<List<RenderedTile>>
     val hasRetainedPageFrame: Boolean
+    val fullResizeCount: Int
+    val regionRenderCount: Int
+    suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize)
+    fun retainedFitBaseForTest(): RetainedFitPageBase
     fun replacePageImage()
     suspend fun awaitPageReplacement()
     fun releasePageReplacement()
@@ -253,6 +257,38 @@ class TilingReaderImagePreparationTest {
             assertNull(image.currentTileCoverage)
             assertTrue(image.closedImages.isNotEmpty())
             assertTrue(image.tileCloseCounts.all { it == 1 })
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `panel zoom full resize cannot replace the fitted page base`() = runBlocking {
+        val image = preparationFixture(imageSize = devicePage)
+        try {
+            image.releaseRendering()
+            image.ensureFitPageBaseForTest(deviceDisplay)
+            val base = image.retainedFitBaseForTest()
+            assertEquals(deviceDisplay, base.displaySize)
+            assertTrue(base.handles.all { it.renderSize == deviceDisplay })
+
+            image.prepareUpdate(deviceDisplay, listOf(requirement(deviceFitPanel, 1.25f))).close()
+
+            assertSame(base, image.retainedFitBaseForTest())
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `ensuring the fit base uses one full resize and no source tile grid`() = runBlocking {
+        val image = preparationFixture(imageSize = devicePage)
+        try {
+            image.releaseRendering()
+            image.ensureFitPageBaseForTest(deviceDisplay)
+
+            assertEquals(1, image.fullResizeCount)
+            assertEquals(0, image.regionRenderCount)
         } finally {
             image.close()
         }
@@ -658,15 +694,13 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
-    fun `full resize output is retained after tiled rendering replaces it`() = runTest {
+    fun `fit base is retained after tiled rendering replaces the visible frame`() = runTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
-            // 1600x1600 fitted at zoom 1 is 2.56M display pixels, under the tiling threshold,
-            // so this pass renders the whole page as a single full resize frame
-            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            image.ensureFitPageBaseForTest(smallScreen)
             val pageFrame = image.renderedTiles.single()
-            assertTrue(image.hasRetainedPageFrame, "a published full resize must retain a page frame")
+            assertTrue(image.hasRetainedPageFrame, "ensuring the fit base must retain a page frame")
 
             image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
 
@@ -687,7 +721,7 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
-    fun `retained page frame is unavailable before the first successful full resize`() = runTest {
+    fun `retained page frame is unavailable before the fit base is ensured`() = runTest {
         val image = preparationFixture()
         try {
             assertFalse(image.hasRetainedPageFrame, "a page that has not painted has no page frame")
@@ -710,7 +744,7 @@ class TilingReaderImagePreparationTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
-            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            image.ensureFitPageBaseForTest(smallScreen)
             val outgoing = image.renderedTiles.single()
             // leaves the reader tiled at panel zoom, so nothing the replacement renders can
             // produce another page frame and hide a leak of this one
@@ -747,7 +781,7 @@ class TilingReaderImagePreparationTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
-            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            image.ensureFitPageBaseForTest(smallScreen)
             val outgoing = image.renderedTiles.single()
 
             // a different fitted geometry at panel zoom: the page frame of the previous
@@ -770,36 +804,18 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
-    fun `a full resize invalidated after retention rolls the page frame back`() = runTest {
+    fun `an ordinary full resize does not create a fit base`() = runTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
 
-            // valid right up until the page frame is retained; retaining it is what flips the
-            // predicate false, which lands in the window between retention and frame publication
-            assertFailsWith<CancellationException> {
-                image.prepareUpdate(
-                    smallScreen,
-                    listOf(requirement(wholeSmallPagePanel, 1f)),
-                    isStillValid = { !image.hasRetainedPageFrame },
-                )
-            }
+            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
 
             assertFalse(
                 image.hasRetainedPageFrame,
-                "a page frame retained by a resize invalidated before publication must be rolled back",
+                "only ensureFitPageBase may populate the retained fit base",
             )
-            val outgoing = image.renderedTiles.single()
-            assertEquals(
-                1,
-                image.closedImages.count { it === outgoing.renderImage },
-                "the rolled-back page frame must be released exactly once, got ${image.tileCloseCounts}",
-            )
-            assertEquals(
-                0,
-                image.painterPublications,
-                "an invalidated resize must not publish a frame",
-            )
+            assertNull(image.publishPageFrame())
         } finally {
             image.close()
         }
@@ -810,9 +826,9 @@ class TilingReaderImagePreparationTest {
         val image = preparationFixture(imageSize = devicePage)
         try {
             image.releaseRendering()
-            image.prepareUpdate(deviceDisplay, listOf(requirement(deviceFitPanel, 1f))).close()
+            image.ensureFitPageBaseForTest(deviceDisplay)
             val pageFrame = image.renderedTiles.single()
-            assertTrue(image.hasRetainedPageFrame, "a fit zoom render must retain a page frame")
+            assertTrue(image.hasRetainedPageFrame, "ensuring the fit base must retain a page frame")
 
             image.prepareUpdate(driftedDisplay, listOf(requirement(driftedPanel, 3f))).close()
 
@@ -845,7 +861,7 @@ class TilingReaderImagePreparationTest {
         val image = preparationFixture(imageSize = devicePage)
         try {
             image.releaseRendering()
-            image.prepareUpdate(deviceDisplay, listOf(requirement(deviceFitPanel, 1f))).close()
+            image.ensureFitPageBaseForTest(deviceDisplay)
             val pageFrame = image.renderedTiles.single()
             assertTrue(image.hasRetainedPageFrame)
 
@@ -869,7 +885,7 @@ class TilingReaderImagePreparationTest {
     fun `reader close releases the retained page frame exactly once`() = runTest {
         val image = preparationFixture()
         image.releaseRendering()
-        image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+        image.ensureFitPageBaseForTest(smallScreen)
         assertTrue(image.hasRetainedPageFrame)
 
         image.close()
@@ -888,7 +904,7 @@ class TilingReaderImagePreparationTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
-            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            image.ensureFitPageBaseForTest(smallScreen)
             val pageFrame = image.renderedTiles.single()
             image.prepareUpdate(smallScreen, listOf(requirement(lastTilePanel, 3f))).close()
             val renderedBeforePublication = image.renderedTiles.size
@@ -914,7 +930,7 @@ class TilingReaderImagePreparationTest {
     }
 
     @Test
-    fun `publishing the page frame is refused before the first full resize`() = runTest {
+    fun `publishing the page frame is refused before the fit base is ensured`() = runTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
@@ -938,7 +954,7 @@ class TilingReaderImagePreparationTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
-            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            image.ensureFitPageBaseForTest(smallScreen)
             val pageFrame = image.renderedTiles.single()
             val lease = assertNotNull(image.publishPageFrame())
             val publicationsUnderLease = image.painterPublications
@@ -973,7 +989,7 @@ class TilingReaderImagePreparationTest {
         val image = preparationFixture()
         try {
             image.releaseRendering()
-            image.prepareUpdate(smallScreen, listOf(requirement(wholeSmallPagePanel, 1f))).close()
+            image.ensureFitPageBaseForTest(smallScreen)
             val pageFrame = image.renderedTiles.single()
 
             val lease = assertNotNull(image.publishPageFrame())
@@ -1072,6 +1088,8 @@ private class DelegatingPreparationFixture(
     override val closedImages: List<RenderImage> get() = delegate.closedRenderImages
     override val publishedTiles: List<List<RenderedTile>> get() = delegate.publishedTiles
     override val hasRetainedPageFrame: Boolean get() = delegate.hasRetainedPageFrame
+    override val fullResizeCount: Int get() = delegate.fullResizeCount
+    override val regionRenderCount: Int get() = delegate.regionRenderCount
     override val barrierCompletionCounts: Map<Long, Int>
         get() = completions.mapValues { (_, count) ->
             count + if (delegate.reusedCompletedBarrier) 1 else 0
@@ -1113,6 +1131,9 @@ private class DelegatingPreparationFixture(
     }
 
     override suspend fun publishPageFrame(): PreparedUpdateLease? = delegate.publishPageFrame()
+    override suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize) =
+        delegate.ensureFitPageBaseForTest(maxDisplaySize)
+    override fun retainedFitBaseForTest(): RetainedFitPageBase = delegate.retainedFitBaseForTest()
 
     override suspend fun getOriginalImageSize(): Result<IntSize> = delegate.getOriginalImageSize()
     override suspend fun getOriginalImage(): Result<KomeliaImage> = delegate.getOriginalImage()
@@ -1168,6 +1189,7 @@ private class ControllableTilingReaderImage private constructor(
     private val publicationAttemptCount = MutableStateFlow(0)
     private val generatedRegions = MutableStateFlow(0)
     val renderEntryCount = MutableStateFlow(0)
+    private val fullResizeEntryCount = AtomicLong(0)
     private val closedImageCount = MutableStateFlow(0)
     private val renderedRegions = CopyOnWriteArrayList<IntRect>()
     private val generatedTiles = CopyOnWriteArrayList<RenderedTile>()
@@ -1193,6 +1215,14 @@ private class ControllableTilingReaderImage private constructor(
     val tileCloseCounts: List<Int>
         get() = generatedTiles.map { generated -> closedImages.count { it === generated.renderImage } }
     val reusedCompletedBarrier: Boolean get() = completedBarrierReuse.get()
+    val fullResizeCount: Int get() = fullResizeEntryCount.get().toInt()
+    val regionRenderCount: Int get() = renderEntryCount.value
+
+    suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize) {
+        ensureFitPageBase(maxDisplaySize)
+    }
+
+    fun retainedFitBaseForTest(): RetainedFitPageBase = checkNotNull(retainedFitPageBase)
 
     fun blockPainterPublication() {
         publicationGate.set(CountDownLatch(1))
@@ -1326,6 +1356,7 @@ private class ControllableTilingReaderImage private constructor(
         scaleWidth: Int,
         scaleHeight: Int,
     ): ReaderImageData {
+        fullResizeEntryCount.incrementAndGet()
         renderingGate.await()
         failIfRequested()
         return ReaderImageData(

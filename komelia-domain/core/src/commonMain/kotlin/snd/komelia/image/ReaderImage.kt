@@ -10,6 +10,18 @@ fun interface PreparedUpdateLease : AutoCloseable {
     override fun close()
 }
 
+internal data class RetainedFitPageBase(
+    val generation: Long,
+    val displaySize: IntSize,
+    val handles: List<TileHandle>,
+    val frames: List<TilingReaderImage.ImageFrame>,
+    val ownership: List<TileOwnership>,
+) {
+    fun release() = ownership.forEach { it.close() }
+
+    fun retagged(generation: Long) = copy(generation = generation)
+}
+
 interface ReaderImage : AutoCloseable {
     val pageId: PageId
 

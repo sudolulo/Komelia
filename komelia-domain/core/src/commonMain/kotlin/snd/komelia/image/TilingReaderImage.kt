@@ -111,13 +111,11 @@ abstract class TilingReaderImage(
     /** Tiles the renderer keeps alive between passes for sufficient-resolution reuse. */
     private val retainedTiles = MutableStateFlow<Map<TileCacheKey, RetainedTile>>(emptyMap())
 
-    /**
-     * The fit-zoom full page frame [doFullResize] published for the current render generation,
-     * held through its own ownership so the tiled frame that replaces it cannot close the
-     * bitmap. It covers the whole page, so it can be republished at any offset without
-     * rendering anything; see the panel transition page frame design doc.
-     */
-    private val retainedPageFrame = MutableStateFlow<RetainedPageFrame?>(null)
+    /** Fit-only full page storage. Ordinary full resizes never mutate this slot. */
+    private val retainedFitBase = MutableStateFlow<RetainedFitPageBase?>(null)
+
+    internal val retainedFitPageBase: RetainedFitPageBase?
+        get() = retainedFitBase.value
 
     /**
      * Whether a fit-zoom page frame rendered for the current render generation is held. A frame
@@ -125,7 +123,7 @@ abstract class TilingReaderImage(
      * is not available even in the window before its release runs.
      */
     internal val hasRetainedPageFrame: Boolean
-        get() = retainedPageFrame.value?.generation == renderGeneration
+        get() = retainedFitBase.value?.generation == renderGeneration
 
     /** Mutated only from the processing lane. */
     private var renderGeneration = 0L
@@ -169,7 +167,7 @@ abstract class TilingReaderImage(
             imageEpoch += 1
             // the page frame draws the image being replaced, so it is released here rather
             // than waiting for the next render pass to notice the new generation
-            releaseRetainedPageFrame()
+            releaseRetainedFitBase()
             image.value = null
             originalSize.value = originalImage?.let { IntSize(it.width, it.pageHeight) }
             currentSize.value = null
@@ -453,7 +451,7 @@ abstract class TilingReaderImage(
             arbiter.submitDemand(priority = true) {
                 var frameOwnership: List<TileOwnership> = emptyList()
                 try {
-                    val page = retainedPageFrame.value?.takeIf { it.generation == renderGeneration }
+                    val page = retainedFitBase.value?.takeIf { it.generation == renderGeneration }
                     if (page == null) {
                         logger.debug { "page ${pageId.pageNumber} has no page frame to publish" }
                         published.complete(false)
@@ -472,7 +470,7 @@ abstract class TilingReaderImage(
                     frameData.value = FrameData(
                         frames = page.frames,
                         displaySize = page.displaySize,
-                        scaleFactor = page.scaleFactor,
+                        scaleFactor = fitScaleFactor(page.displaySize, getCurrentImage()),
                         readiness = readiness,
                         handles = page.handles,
                         frameOwnership = frameOwnership,
@@ -482,7 +480,7 @@ abstract class TilingReaderImage(
                     frameOwnership = emptyList()
                     readiness.await()
                     // the installed frame is the fit-zoom full resize again
-                    lastUsedScaleFactor = page.scaleFactor
+                    lastUsedScaleFactor = fitScaleFactor(page.displaySize, getCurrentImage())
                     published.complete(true)
                     lease.awaitRelease()
                 } catch (e: Throwable) {
@@ -673,7 +671,6 @@ abstract class TilingReaderImage(
         val frameOwnership = mutableListOf<TileOwnership>()
         val frameHandles = mutableListOf<TileHandle>()
         val frames = mutableListOf<ImageFrame>()
-        var newlyRetainedPageFrame: RetainedPageFrame? = null
         var succeeded = false
         try {
             resizedImage.frames.forEachIndexed { index, renderImage ->
@@ -699,17 +696,6 @@ abstract class TilingReaderImage(
             // the tiled cache cannot serve a full resize frame, so it is retired here
             stats.evictedTiles += releaseRetainedTilesExcept(emptySet())
 
-            // Retain before publication so the long-lived page-frame and visible frame take
-            // independent ownership. If validity changes between them, the exact retained value
-            // is rolled back below instead of being left publishable.
-            newlyRetainedPageFrame = retainPageFrame(
-                generation = generation,
-                handles = frameHandles,
-                frames = frames.toList(),
-                displayArea = displayArea,
-                scaleFactor = scaleFactor,
-            )
-
             ensureUpdateIsCurrent(isStillValid)
             frameData.value = FrameData(
                 frames = frames,
@@ -720,14 +706,12 @@ abstract class TilingReaderImage(
                 frameOwnership = frameOwnership.toList(),
                 retiredOwnership = frameData.value?.takePendingOwnership() ?: emptyList(),
             )
-            newlyRetainedPageFrame = null
             lastUsedScaleFactor = scaleFactor
             succeeded = true
             logger.info { "page ${pageId.pageNumber} completed full resize to $dstWidth x $dstHeight" }
             return UpdateResult.PUBLISHED
         } finally {
             if (!succeeded) {
-                newlyRetainedPageFrame?.let { rollbackRetainedPageFrame(it) }
                 frameOwnership.forEach { it.close() }
             }
         }
@@ -999,14 +983,14 @@ abstract class TilingReaderImage(
             // generation, so hasRetainedPageFrame and publishPageFrame stay truthful instead of
             // having to special-case an older generation.
             // frame is read after the bump; its displaySize is the pre-drift size, the drift check's reference
-            val frame = retainedPageFrame.value
+            val frame = retainedFitBase.value
             val keepPageFrame = onlyDisplaySizeChanged &&
                 frame != null &&
                 !isMaterialDisplayChange(frame.displaySize, fingerprint.displaySize)
             if (keepPageFrame) {
-                retainedPageFrame.update { it?.retagged(renderGeneration) }
+                retainedFitBase.update { it?.retagged(renderGeneration) }
             } else {
-                releaseRetainedPageFrame()
+                releaseRetainedFitBase()
             }
         }
         return renderGeneration
@@ -1033,44 +1017,95 @@ abstract class TilingReaderImage(
         rendererEpoch += 1
     }
 
-    /**
-     * Takes the long-lived reference that keeps the fit-zoom page frame alive, independent of
-     * the frame ownership [doFullResize] hands to [FrameData]. Neither reference can close the
-     * bitmap while the other holds it.
-     */
-    private fun retainPageFrame(
-        generation: Long,
-        handles: List<TileHandle>,
-        frames: List<ImageFrame>,
-        displayArea: IntSize,
-        scaleFactor: Double,
-    ): RetainedPageFrame {
-        val ownership = handles.mapNotNull { it.retain() }
-        if (ownership.size != handles.size) {
-            ownership.forEach { it.close() }
+    internal suspend fun ensureFitPageBase(maxDisplaySize: IntSize): RetainedFitPageBase {
+        var result: RetainedFitPageBase? = null
+        arbiter.submitDemand {
+            result = ensureFitPageBaseOnLane(maxDisplaySize)
+        }
+        return checkNotNull(result)
+    }
+
+    private suspend fun ensureFitPageBaseOnLane(maxDisplaySize: IntSize): RetainedFitPageBase {
+        require(maxDisplaySize.width > 0 && maxDisplaySize.height > 0) {
+            "fit page base needs a positive display area"
+        }
+        val currentImage = getCurrentImage()
+        val fittedSize = checkNotNull(calculateSizeForArea(maxDisplaySize, stretchImages.value)) {
+            "page ${pageId.pageNumber} has no fitted display size"
+        }
+        require(fittedSize.width > 0 && fittedSize.height > 0) {
+            "fit page base needs positive fitted dimensions"
+        }
+
+        val generation = generationFor(fittedSize)
+        retainedFitBase.value?.takeIf {
+            it.generation == generation && !isMaterialDisplayChange(it.displaySize, fittedSize)
+        }?.let { return it }
+
+        val resized = resizeImage(currentImage, fittedSize.width, fittedSize.height)
+        requireSatisfiedSize(resized, fittedSize)
+        if (resized.width != fittedSize.width || resized.height != fittedSize.height) {
+            resized.frames.forEach { closeRenderImage(it) }
             throw IllegalStateException(
-                "page ${pageId.pageNumber} lost a full resize frame before it could be retained"
+                "page ${pageId.pageNumber} fit base returned ${resized.width} x ${resized.height} " +
+                    "for fitted ${fittedSize.width} x ${fittedSize.height}"
             )
         }
-        val retained = RetainedPageFrame(
-            generation = generation,
-            handles = handles.toList(),
-            frames = frames,
-            displaySize = displayArea,
-            scaleFactor = scaleFactor,
-            ownership = ownership,
-        )
-        retainedPageFrame.getAndUpdate { retained }?.release()
-        return retained
+        if (resized.frames.isEmpty()) {
+            throw IllegalStateException("page ${pageId.pageNumber} fit base returned no frames")
+        }
+        if (generationFor(fittedSize) != generation) {
+            resized.frames.forEach { closeRenderImage(it) }
+            return ensureFitPageBaseOnLane(maxDisplaySize)
+        }
+
+        val sourceBounds = IntRect(0, 0, currentImage.width, currentImage.pageHeight)
+        val displayRegion = Rect(0f, 0f, fittedSize.width.toFloat(), fittedSize.height.toFloat())
+        val handles = mutableListOf<TileHandle>()
+        val ownership = mutableListOf<TileOwnership>()
+        val frames = mutableListOf<ImageFrame>()
+        var succeeded = false
+        try {
+            resized.frames.forEachIndexed { index, renderImage ->
+                val owned = TileHandle.create(
+                    renderImage = renderImage,
+                    sourceBounds = sourceBounds,
+                    displayRegion = displayRegion,
+                    renderSize = fittedSize,
+                    satisfiedSize = resized.satisfiedSize,
+                    renderGeneration = generation,
+                    closeImage = { closeRenderImage(it) },
+                )
+                handles += owned.handle
+                ownership += owned.ownership
+                frames += ImageFrame(
+                    tiles = listOf(readerTileOf(owned.handle)),
+                    delay = resized.delays?.getOrNull(index) ?: defaultFrameDelay,
+                )
+            }
+
+            val retained = RetainedFitPageBase(
+                generation = generation,
+                displaySize = fittedSize,
+                handles = handles.toList(),
+                frames = frames.toList(),
+                ownership = ownership.toList(),
+            )
+            retainedFitBase.getAndUpdate { retained }?.release()
+            succeeded = true
+            return retained
+        } finally {
+            if (!succeeded) ownership.forEach { it.close() }
+        }
     }
 
-    private fun rollbackRetainedPageFrame(retained: RetainedPageFrame) {
-        if (retainedPageFrame.compareAndSet(retained, null)) retained.release()
-    }
+    private fun fitScaleFactor(displaySize: IntSize, image: KomeliaImage): Double =
+        (displaySize.width.toDouble() / image.width)
+            .coerceAtMost(displaySize.height.toDouble() / image.pageHeight)
 
-    /** Releases the retained page frame if one is held. Idempotent under concurrent callers. */
-    private fun releaseRetainedPageFrame() {
-        retainedPageFrame.getAndUpdate { null }?.release()
+    /** Releases the retained fit base if one is held. Idempotent under concurrent callers. */
+    private fun releaseRetainedFitBase() {
+        retainedFitBase.getAndUpdate { null }?.release()
     }
 
     private fun putRetainedTile(
@@ -1125,7 +1160,7 @@ abstract class TilingReaderImage(
         frameData.value = null
         originalImage?.close()
         data?.releaseAll()
-        releaseRetainedPageFrame()
+        releaseRetainedFitBase()
         releaseRetainedTilesExcept(emptySet())
         image.value?.close()
         imageSource.close()
@@ -1228,43 +1263,6 @@ abstract class TilingReaderImage(
         val displayRegion: Rect,
         val generation: Long,
     )
-
-    /**
-     * The fit-zoom page frame of one render generation and the references keeping it alive. An
-     * animated page resizes to several frames, so every one of them is held.
-     *
-     * The fitted geometry it was rendered with is kept alongside it, because republishing it as
-     * the painter has to reproduce the frame exactly rather than derive it again.
-     */
-    private class RetainedPageFrame(
-        val generation: Long,
-        val handles: List<TileHandle>,
-        val frames: List<ImageFrame>,
-        val displaySize: IntSize,
-        val scaleFactor: Double,
-        private val ownership: List<TileOwnership>,
-    ) {
-        fun release() = ownership.forEach { it.close() }
-
-        /**
-         * The same frame under a newer render generation. The display size drifted by a pixel
-         * or two but nothing the frame was rendered from changed, so the bitmaps and their
-         * ownership carry over untouched.
-         *
-         * This TRANSFERS the existing references rather than taking new ones, so the instance
-         * it replaces must be dropped without releasing it - releasing it would close the very
-         * handles the returned frame now owns. That is why generationFor swaps it in with
-         * update rather than the getAndUpdate/release pattern retainPageFrame uses.
-         */
-        fun retagged(generation: Long) = RetainedPageFrame(
-            generation = generation,
-            handles = handles,
-            frames = frames,
-            displaySize = displaySize,
-            scaleFactor = scaleFactor,
-            ownership = ownership,
-        )
-    }
 
     internal class RetainedTile(
         val handle: TileHandle,
