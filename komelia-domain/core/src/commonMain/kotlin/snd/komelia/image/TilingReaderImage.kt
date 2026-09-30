@@ -127,6 +127,9 @@ abstract class TilingReaderImage(
     /** Fit-only full page storage. Ordinary full resizes never mutate this slot. */
     private val retainedFitBase = MutableStateFlow<RetainedFitPageBase?>(null)
 
+    /** Exact panel overlays retained independently from the ordinary viewport working set. */
+    private val retainedPanelWindow = MutableStateFlow<RetainedPanelWindow?>(null)
+
     /** Accounts for every native bitmap and in-flight reservation owned by this reader image. */
     private val pixelLedger = TilePixelLedger(0)
 
@@ -138,6 +141,11 @@ abstract class TilingReaderImage(
 
     internal val visibleFrameSlotPublications: Int
         get() = visibleSlotPublicationCounter.value
+
+    internal val retainedPanelWindowIdentity: Any?
+        get() = retainedPanelWindow.value
+
+    internal suspend fun pixelLedgerSnapshotForTest(): TilePixelLedgerSnapshot = pixelLedger.snapshot()
 
     /**
      * Whether a fit-zoom page frame rendered for the current render generation is held. A frame
@@ -190,6 +198,7 @@ abstract class TilingReaderImage(
             // the page frame draws the image being replaced, so it is released here rather
             // than waiting for the next render pass to notice the new generation
             releaseRetainedFitBase()
+            releaseRetainedPanelWindow()
             image.value = null
             originalSize.value = originalImage?.let { IntSize(it.width, it.pageHeight) }
             currentSize.value = null
@@ -311,6 +320,7 @@ abstract class TilingReaderImage(
             )
             if (visibleSlot.compareAndSet(displaced, invalidated)) {
                 displaced.frameData?.releaseAll()
+                releaseRetainedPanelWindow()
                 return invalidated.epoch
             }
         }
@@ -406,6 +416,249 @@ abstract class TilingReaderImage(
         requirements: List<ViewportRenderRequirement>,
         isStillValid: () -> Boolean,
     ): PreparedUpdateLease = prepareUpdateWithStats(maxDisplaySize, requirements, isStillValid).lease
+
+    final override suspend fun prepareLayeredPanelWindow(
+        maxDisplaySize: IntSize,
+        windowKey: PanelWindowKey,
+        requirements: List<ViewportRenderRequirement>,
+    ): PreparedPanelWindow {
+        require(requirements.isNotEmpty()) { "a layered panel window needs at least one overlay requirement" }
+        require(requirements.all { !it.overscan }) {
+            "layered panel window requirements must use exact coverage without overscan"
+        }
+
+        val decodedImage = getCurrentImage()
+        if (decodedImage.pagesLoaded != 1) {
+            throw LayeredPanelWindowUnavailableException(
+                "layered panel rendering requires one decoded frame, got ${decodedImage.pagesLoaded}"
+            )
+        }
+
+        val lease = PreparedUpdateLeaseImpl()
+        val prepared = CompletableDeferred<PreparedPanelWindow>()
+        val job = processingScope.launch {
+            arbiter.submitDemand {
+                var leaseOwnership: List<TileOwnership> = emptyList()
+                var activeLease: ActivePreparedLease? = null
+                try {
+                    val result = prepareLayeredPanelWindowOnLane(
+                        image = decodedImage,
+                        maxDisplaySize = maxDisplaySize,
+                        windowKey = windowKey,
+                        requirements = requirements,
+                    )
+                    leaseOwnership = result.frame.retainHandles(pixelLedger)
+                    if (leaseOwnership.size != result.frame.handleCount) {
+                        throw RenderInvalidatedException()
+                    }
+                    activeLease = ActivePreparedLease(leaseOwnership)
+                    check(activePreparedLease.compareAndSet(null, activeLease)) {
+                        "page ${pageId.pageNumber} already has an active prepared lease"
+                    }
+                    prepared.complete(PreparedPanelWindow(lease, result.stats))
+                    lease.awaitRelease()
+                } catch (e: CancellationException) {
+                    prepared.completeExceptionally(e)
+                    throw e
+                } catch (e: Throwable) {
+                    currentCoroutineContext().ensureActive()
+                    logger.catching(e)
+                    error.value = e
+                    prepared.completeExceptionally(e)
+                } finally {
+                    activeLease?.let { activePreparedLease.compareAndSet(it, null) }
+                    leaseOwnership.forEach { it.close() }
+                }
+            }
+        }
+        job.invokeOnCompletion { cause ->
+            if (cause != null) prepared.completeExceptionally(cause)
+        }
+        try {
+            return prepared.await()
+        } catch (e: Throwable) {
+            lease.close()
+            currentCoroutineContext().ensureActive()
+            throw e
+        }
+    }
+
+    private suspend fun prepareLayeredPanelWindowOnLane(
+        image: KomeliaImage,
+        maxDisplaySize: IntSize,
+        windowKey: PanelWindowKey,
+        requirements: List<ViewportRenderRequirement>,
+    ): LayeredPreparationResult {
+        val expectedSlot = visibleSlot.value
+        if (windowKey.geometryEpoch != expectedSlot.epoch) throw RenderInvalidatedException()
+        if (image !== this.image.value || image.pagesLoaded != 1) throw RenderInvalidatedException()
+
+        val fittedSize = checkNotNull(calculateSizeForArea(maxDisplaySize, stretchImages.value)) {
+            "page ${pageId.pageNumber} has no fitted display size"
+        }
+        val existingBase = retainedFitBase.value
+        val baseReused = existingBase != null &&
+            existingBase.displaySize == fittedSize &&
+            existingBase.generation == generationFor(fittedSize)
+        val base = ensureFitPageBaseOnLane(maxDisplaySize)
+        check(base.frames.size == 1) { "layered panel rendering requires one fitted base frame" }
+        check(base.displaySize == fittedSize) { "layered panel base must exactly match fitted geometry" }
+
+        val generation = base.generation
+        val displayScaleFactor = fitScaleFactor(fittedSize, image)
+        val zoomFactor = requirements.maxOf { it.zoomFactor }
+        val scaleFactor = displayScaleFactor * zoomFactor
+        val targetWidth = checkedRenderDimension(image.width, scaleFactor)
+        val targetHeight = checkedRenderDimension(image.pageHeight, scaleFactor)
+        val targetPixels = (targetWidth.toLong() * targetHeight)
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+            .toInt()
+        val tileSize = tileSizeFor(targetPixels) ?: 1024
+        val oldWindow = retainedPanelWindow.value?.takeIf {
+            it.generation == generation && it.displaySize == fittedSize
+        }
+        val oldTiles = oldWindow?.tiles?.associateBy { it.key }.orEmpty()
+        val stats = RenderPassStats()
+        val candidateTiles = mutableListOf<RetainedPanelTile>()
+        val candidateOwnership = mutableListOf<TileOwnership>()
+
+        try {
+            for (geometry in tileGeometries(image, tileSize, displayScaleFactor)) {
+                val requiredSize = requiredTileRenderSize(
+                    tileSourceBounds = geometry.sourceBounds,
+                    tileDisplayRegion = geometry.displayRegion,
+                    displayScaleFactor = displayScaleFactor,
+                    displayArea = fittedSize,
+                    requirements = requirements,
+                ) ?: continue
+                val key = TileCacheKey(geometry.sourceBounds, geometry.displayRegion, generation)
+                val oldTile = oldTiles[key]
+                if (oldTile != null && oldTile.handle.isSufficientFor(requiredSize)) {
+                    val ownership = pixelLedger.retain(oldTile.handle)
+                        ?: throw TilePixelBudgetExceededException(
+                            "page ${pageId.pageNumber} layered panel window exceeds " +
+                                "$hardPeakDisplayAreas display areas"
+                        )
+                    candidateOwnership += ownership
+                    candidateTiles += RetainedPanelTile(key, oldTile.handle, readerTileOf(oldTile.handle))
+                    stats.reusedTiles += 1
+                    continue
+                }
+
+                val reservation = pixelLedger.reserve(requiredSize)
+                    ?: throw TilePixelBudgetExceededException(
+                        "page ${pageId.pageNumber} layered panel window exceeds " +
+                            "$hardPeakDisplayAreas display areas"
+                    )
+                val rendered = try {
+                    getImageRegion(
+                        image,
+                        geometry.sourceBounds,
+                        requiredSize.width,
+                        requiredSize.height,
+                    )
+                } catch (e: Throwable) {
+                    reservation.close()
+                    throw e
+                }
+                try {
+                    stats.renderedTiles += 1
+                    if (oldTile != null) stats.upgradedTiles += 1
+                    requireSatisfiedSize(rendered, requiredSize)
+                    if (generationFor(fittedSize) != generation || visibleSlot.value !== expectedSlot) {
+                        rendered.frames.forEach { closeRenderImage(it) }
+                        throw RenderInvalidatedException()
+                    }
+                    rendered.frames.drop(1).forEach { closeRenderImage(it) }
+                    val owned = TileHandle.create(
+                        renderImage = rendered.frames.first(),
+                        sourceBounds = geometry.sourceBounds,
+                        displayRegion = geometry.displayRegion,
+                        renderSize = IntSize(rendered.width, rendered.height),
+                        satisfiedSize = rendered.satisfiedSize,
+                        renderGeneration = generation,
+                        closeImage = { closeRenderImage(it) },
+                    )
+                    val admitted = pixelLedger.attach(reservation, owned)
+                        ?: throw TilePixelBudgetExceededException(
+                            "page ${pageId.pageNumber} layered panel window exceeds " +
+                                "$hardPeakDisplayAreas display areas"
+                        )
+                    candidateOwnership += admitted.ownership
+                    candidateTiles += RetainedPanelTile(key, admitted.handle, readerTileOf(admitted.handle))
+                } finally {
+                    reservation.close()
+                }
+            }
+
+            check(candidateTiles.isNotEmpty()) { "layered panel requirements do not intersect the page" }
+            if (generationFor(fittedSize) != generation || visibleSlot.value !== expectedSlot) {
+                throw RenderInvalidatedException()
+            }
+
+            val candidateWindow = RetainedPanelWindow(
+                generation = generation,
+                displaySize = fittedSize,
+                windowKey = windowKey,
+                requirements = requirements.toList(),
+                tiles = candidateTiles.toList(),
+                ownership = candidateOwnership.toList(),
+            )
+            val frameHandles = base.handles + candidateTiles.map { it.handle }
+            val frameOwnership = frameHandles.mapNotNull { pixelLedger.retain(it) }
+            if (frameOwnership.size != frameHandles.size) {
+                frameOwnership.forEach { it.close() }
+                throw RenderInvalidatedException()
+            }
+            val frame = FrameData(
+                frames = listOf(
+                    ImageFrame(
+                        tiles = base.frames.single().tiles + candidateTiles.map { it.tile },
+                        delay = 0,
+                    )
+                ),
+                displaySize = fittedSize,
+                scaleFactor = scaleFactor,
+                readiness = null,
+                handles = frameHandles,
+                frameOwnership = frameOwnership,
+                retiredOwnership = emptyList(),
+            )
+
+            val publishedSlot = publishVisibleFrame(expectedSlot, frame)
+            val previous = retainedPanelWindow.getAndUpdate { candidateWindow }
+            candidateOwnership.clear()
+            previous?.release()
+            if (visibleSlot.value !== publishedSlot) {
+                if (retainedPanelWindow.compareAndSet(candidateWindow, null)) {
+                    candidateWindow.release()
+                }
+                throw RenderInvalidatedException()
+            }
+            stats.evictedTiles = oldWindow?.tiles?.count { old ->
+                candidateTiles.none { it.key == old.key }
+            } ?: 0
+            displaySize.value = fittedSize
+            currentSize.value = IntSize(targetWidth, targetHeight)
+            lastUsedScaleFactor = scaleFactor
+            error.value = null
+            val snapshot = pixelLedger.snapshot()
+            return LayeredPreparationResult(
+                frame = frame,
+                stats = PanelWindowRenderStats(
+                    reusedTiles = stats.reusedTiles,
+                    upgradedTiles = stats.upgradedTiles,
+                    renderedTiles = stats.renderedTiles,
+                    evictedTiles = stats.evictedTiles,
+                    baseReused = baseReused,
+                    livePixels = snapshot.livePixels,
+                    hardPeakPixels = snapshot.hardPeakPixels,
+                ),
+            )
+        } finally {
+            candidateOwnership.forEach { it.close() }
+        }
+    }
 
     /**
      * [prepareUpdate] plus the accounting of what the pass actually did, for callers that
@@ -556,7 +809,7 @@ abstract class TilingReaderImage(
     private fun publishVisibleFrame(
         expectedSlot: VisibleFrameSlot,
         candidateFrame: FrameData,
-    ) {
+    ): VisibleFrameSlot {
         var published = false
         var publishedSlot: VisibleFrameSlot? = null
         try {
@@ -596,6 +849,7 @@ abstract class TilingReaderImage(
         candidateFrame.releaseRetired()
         candidateFrame.readiness?.complete(Unit)
         if (candidateFrame.frames.size > 1) launchAnimation(checkNotNull(publishedSlot))
+        return checkNotNull(publishedSlot)
     }
 
     private class PreparedUpdateResult(
@@ -1145,6 +1399,7 @@ abstract class TilingReaderImage(
             } else {
                 releaseRetainedFitBase()
             }
+            releaseRetainedPanelWindow()
         }
         return renderGeneration
     }
@@ -1294,6 +1549,10 @@ abstract class TilingReaderImage(
         retainedFitBase.getAndUpdate { null }?.release()
     }
 
+    private fun releaseRetainedPanelWindow() {
+        retainedPanelWindow.getAndUpdate { null }?.release()
+    }
+
     private fun putRetainedTile(
         key: TileCacheKey,
         handle: TileHandle,
@@ -1355,6 +1614,7 @@ abstract class TilingReaderImage(
         originalImage?.close()
         data?.releaseAll()
         releaseRetainedFitBase()
+        releaseRetainedPanelWindow()
         releaseRetainedTilesExcept(emptySet())
         image.value?.close()
         imageSource.close()
@@ -1412,6 +1672,9 @@ abstract class TilingReaderImage(
     ) {
         private val ownership = MutableStateFlow(frameOwnership)
         private val retired = MutableStateFlow(retiredOwnership)
+
+        val handleCount: Int
+            get() = handles.size
 
         /**
          * Takes an independent reference to every handle that satisfied readiness, so a held
@@ -1479,6 +1742,28 @@ abstract class TilingReaderImage(
         val frameOwnership: TileOwnership,
         val insertedOwnership: TileOwnership?,
         val tile: ReaderImageTile,
+    )
+
+    private class RetainedPanelWindow(
+        val generation: Long,
+        val displaySize: IntSize,
+        val windowKey: PanelWindowKey,
+        val requirements: List<ViewportRenderRequirement>,
+        val tiles: List<RetainedPanelTile>,
+        private val ownership: List<TileOwnership>,
+    ) {
+        fun release() = ownership.forEach { it.close() }
+    }
+
+    private class RetainedPanelTile(
+        val key: TileCacheKey,
+        val handle: TileHandle,
+        val tile: ReaderImageTile,
+    )
+
+    private class LayeredPreparationResult(
+        val frame: FrameData,
+        val stats: PanelWindowRenderStats,
     )
 
     private data class RenderFingerprint(

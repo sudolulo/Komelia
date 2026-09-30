@@ -64,6 +64,10 @@ private val smallScreen = IntSize(1_600, 1_600)
 // any pass renders
 private val lastTilePanel = IntRect(1_450, 1_450, 1_550, 1_550)
 
+// exact coverage of one source tile beyond targetCorridor; unlike lastTilePanel this remains an
+// entering edge when overscan is disabled for immutable panel windows
+private val enteringEdgePanel = IntRect(1_650, 1_650, 1_750, 1_750)
+
 // expands to the whole fitted page
 private val wholeSmallPagePanel = IntRect(400, 400, 1_200, 1_200)
 
@@ -97,6 +101,33 @@ private fun movingViewport(index: Int): IntRect {
 private fun requirement(region: IntRect, zoomFactor: Float) =
     ViewportRenderRequirement(region = region, zoomFactor = zoomFactor)
 
+private fun exactRequirement(region: IntRect, zoom: Float) =
+    ViewportRenderRequirement(region = region, zoomFactor = zoom, overscan = false)
+
+private val window012 = listOf(
+    exactRequirement(nearNeighbor, 2f),
+    exactRequirement(targetCorridor, 2f),
+    exactRequirement(narrowPanel, 2.5f),
+)
+
+private val window123 = listOf(
+    exactRequirement(targetCorridor, 2f),
+    exactRequirement(narrowPanel, 2.5f),
+    exactRequirement(enteringEdgePanel, 2f),
+)
+
+private val highDensityWindow012 = listOf(
+    exactRequirement(IntRect(10, 10, 20, 20), 9f),
+    exactRequirement(IntRect(210, 10, 220, 20), 9f),
+    exactRequirement(IntRect(410, 10, 420, 20), 9f),
+)
+
+private val highDensityWindow123 = listOf(
+    exactRequirement(IntRect(210, 10, 220, 20), 9f),
+    exactRequirement(IntRect(410, 10, 420, 20), 9f),
+    exactRequirement(IntRect(610, 10, 620, 20), 9f),
+)
+
 internal class RenderedTile(
     val sourceBounds: IntRect,
     val renderSize: IntSize,
@@ -118,8 +149,12 @@ internal interface PreparationFixture : ReaderImage {
     val regionRenderCount: Int
     val visibleEpoch: Long
     val visibleSlotPublicationCount: Int
+    val retainedFitBaseTile: RenderedTile
+    val retainedPanelWindowIdentity: Any?
     override fun invalidatePanelGeometry(): Long
     suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize)
+    suspend fun awaitViewportUpdate()
+    suspend fun pixelLedgerSnapshotForTest(): TilePixelLedgerSnapshot
     fun retainedFitBaseForTest(): RetainedFitPageBase
     fun visibleSlotForTest(): VisibleFrameSlot
     fun gateBeforeVisibleSlotCas()
@@ -435,6 +470,176 @@ class TilingReaderImagePreparationTest {
             assertEquals(0, image.regionRenderCount)
         } finally {
             image.close()
+        }
+    }
+
+    @Test
+    fun `layered preparation renders only panel intersecting source tiles`() = runBlocking {
+        val image = preparationFixture(imageSize = devicePage)
+        try {
+            image.releaseRendering()
+            image.ensureFitPageBaseForTest(unfoldedDisplay)
+            val before = image.regionRenderCount
+
+            image.prepareLayeredPanelWindow(
+                unfoldedDisplay,
+                PanelWindowKey(centerPanelIndex = 1, geometryEpoch = image.visibleEpoch),
+                listOf(exactRequirement(unfoldedPanel, 3f)),
+            ).lease.close()
+
+            val rendered = image.regionRenderCount - before
+            assertTrue(rendered > 0)
+            assertTrue(rendered < 176)
+            assertEquals(1, image.fullResizeCount)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `layered frame draws fit base first and sharp overlays last`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            val prepared = image.prepareLayeredPanelWindow(
+                screenSize,
+                PanelWindowKey(1, image.visibleEpoch),
+                window012,
+            )
+
+            val tiles = image.publishedTiles.last()
+            assertSame(image.retainedFitBaseTile.renderImage, tiles.first().renderImage)
+            assertTrue(tiles.drop(1).all { it.renderSize.width > 0 && it.renderSize.height > 0 })
+            prepared.lease.close()
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `layered preparation rejects animated pages before any allocation`() = runBlocking {
+        for (frames in listOf(2, 9)) {
+            val image = preparationFixture(decodedFrames = frames)
+            try {
+                assertFailsWith<LayeredPanelWindowUnavailableException> {
+                    image.prepareLayeredPanelWindow(
+                        screenSize,
+                        PanelWindowKey(1, image.visibleEpoch),
+                        window012,
+                    )
+                }
+                assertTrue(image.renderedTiles.isEmpty())
+                assertEquals(0, image.fullResizeCount)
+            } finally {
+                image.close()
+            }
+        }
+    }
+
+    @Test
+    fun `ordinary viewport updates cannot evict retained panel neighbours`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            image.prepareLayeredPanelWindow(
+                screenSize,
+                PanelWindowKey(1, image.visibleEpoch),
+                window012,
+            ).lease.close()
+
+            image.requestUpdate(screenSize, 2.5f, narrowPanel)
+            image.awaitViewportUpdate()
+            val renders = image.regionRenderCount
+
+            image.prepareLayeredPanelWindow(
+                screenSize,
+                PanelWindowKey(1, image.visibleEpoch),
+                window012,
+            ).lease.close()
+            assertEquals(renders, image.regionRenderCount)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `shifting the window renders only the entering edge`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.releaseRendering()
+            image.prepareLayeredPanelWindow(
+                screenSize,
+                PanelWindowKey(1, image.visibleEpoch),
+                window012,
+            ).lease.close()
+            val before = image.regionRenderCount
+
+            val shifted = image.prepareLayeredPanelWindow(
+                screenSize,
+                PanelWindowKey(2, image.visibleEpoch),
+                window123,
+            )
+
+            shifted.lease.close()
+            assertEquals(1, image.regionRenderCount - before, "enteringEdgePanel intersects one new source tile")
+            assertTrue(shifted.stats.reusedTiles > 0)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `over budget window shift preserves the old layered publication`() = runBlocking {
+        val image = preparationFixture(hardPeakDisplayAreas = 2)
+        image.releaseRendering()
+        try {
+            image.prepareLayeredPanelWindow(
+                screenSize,
+                PanelWindowKey(1, image.visibleEpoch),
+                highDensityWindow012,
+            ).lease.close()
+            val slotBefore = image.visibleSlotForTest()
+            val windowBefore = assertNotNull(image.retainedPanelWindowIdentity)
+
+            assertFailsWith<TilePixelBudgetExceededException> {
+                image.prepareLayeredPanelWindow(
+                    screenSize,
+                    PanelWindowKey(2, image.visibleEpoch),
+                    highDensityWindow123,
+                )
+            }
+
+            assertSame(slotBefore, image.visibleSlotForTest())
+            assertSame(windowBefore, image.retainedPanelWindowIdentity)
+            val snapshot = image.pixelLedgerSnapshotForTest()
+            assertTrue(snapshot.livePixels + snapshot.reservedPixels <= snapshot.hardPeakPixels)
+
+            val baseImage = image.retainedFitBaseTile.renderImage
+            val overlayImages = image.renderedTiles.map { it.renderImage }.filter { it !== baseImage }
+            val pageLease = assertNotNull(image.publishPageFrame())
+            assertTrue(
+                overlayImages.none { overlay -> image.closedImages.any { it === overlay } },
+                "the retained window must keep overlays alive after the outgoing layered frame closes",
+            )
+            pageLease.close()
+
+            image.invalidatePanelGeometry()
+            assertTrue(
+                overlayImages.all { overlay -> image.closedImages.count { it === overlay } == 1 },
+                "the final overlay owner must close every native image exactly once",
+            )
+            assertEquals(
+                0,
+                image.closedImages.count { it === baseImage },
+                "the independently retained fit base must survive frame and window retirement",
+            )
+        } finally {
+            val renderedCount = image.renderedTiles.size
+            image.close()
+            withContext(Dispatchers.Default) {
+                withTimeout(2_000) { image.awaitClosedImages(renderedCount) }
+            }
+            assertTrue(image.tileCloseCounts.all { it == 1 })
         }
     }
 
@@ -1207,8 +1412,11 @@ private fun IntRect.containsRect(other: IntRect): Boolean =
 private fun preparationFixture(
     imageSize: IntSize = IntSize(4_096, 4_096),
     hardPeakDisplayAreas: Int = 8,
+    decodedFrames: Int = 1,
 ): PreparationFixture {
-    return DelegatingPreparationFixture(ControllableTilingReaderImage(imageSize, hardPeakDisplayAreas))
+    return DelegatingPreparationFixture(
+        ControllableTilingReaderImage(imageSize, hardPeakDisplayAreas, decodedFrames)
+    )
 }
 
 private class DelegatingPreparationFixture(
@@ -1216,6 +1424,7 @@ private class DelegatingPreparationFixture(
 ) : PreparationFixture {
     private val nextBarrierId = AtomicLong()
     private val completions = ConcurrentHashMap<Long, Int>()
+    private val viewportPublicationTarget = AtomicLong()
 
     override val pageId: ReaderImage.PageId get() = delegate.pageId
     override val originalSize: StateFlow<IntSize?> get() = delegate.originalSize
@@ -1236,6 +1445,8 @@ private class DelegatingPreparationFixture(
     override val regionRenderCount: Int get() = delegate.regionRenderCount
     override val visibleEpoch: Long get() = delegate.visibleEpoch
     override val visibleSlotPublicationCount: Int get() = delegate.visibleSlotPublicationCount
+    override val retainedFitBaseTile: RenderedTile get() = delegate.retainedFitBaseTile
+    override val retainedPanelWindowIdentity: Any? get() = delegate.retainedPanelWindowIdentity
     override fun invalidatePanelGeometry(): Long = delegate.invalidatePanelGeometry()
     override val barrierCompletionCounts: Map<Long, Int>
         get() = completions.mapValues { (_, count) ->
@@ -1243,8 +1454,16 @@ private class DelegatingPreparationFixture(
         }
 
     override fun requestUpdate(maxDisplaySize: IntSize, zoomFactor: Float, visibleDisplaySize: IntRect) {
+        viewportPublicationTarget.set((delegate.painterPublications + 1).toLong())
         delegate.requestUpdate(maxDisplaySize, zoomFactor, visibleDisplaySize)
     }
+
+    override suspend fun awaitViewportUpdate() {
+        delegate.awaitPainterPublications(viewportPublicationTarget.get().toInt())
+    }
+
+    override suspend fun pixelLedgerSnapshotForTest(): TilePixelLedgerSnapshot =
+        delegate.pixelLedgerSnapshotForTest()
 
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
@@ -1276,6 +1495,12 @@ private class DelegatingPreparationFixture(
         completions.compute(barrierId) { _, count -> (count ?: 0) + 1 }
         return lease
     }
+
+    override suspend fun prepareLayeredPanelWindow(
+        maxDisplaySize: IntSize,
+        windowKey: PanelWindowKey,
+        requirements: List<ViewportRenderRequirement>,
+    ): PreparedPanelWindow = delegate.prepareLayeredPanelWindow(maxDisplaySize, windowKey, requirements)
 
     override suspend fun publishPageFrame(): PreparedUpdateLease? = delegate.publishPageFrame()
     override suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize) =
@@ -1332,11 +1557,15 @@ private class ControllableTilingReaderImage private constructor(
     pageId = ReaderImage.PageId("preparation", 1),
     hardPeakDisplayAreas = hardPeakDisplayAreas,
 ) {
-    constructor(imageSize: IntSize, hardPeakDisplayAreas: Int = 8) : this(
+    constructor(
+        imageSize: IntSize,
+        hardPeakDisplayAreas: Int = 8,
+        decodedFrames: Int = 1,
+    ) : this(
         MutableStateFlow(false),
         MutableStateFlow(UpsamplingMode.BILINEAR),
         ImageProcessingPipeline(),
-        FixtureImage(imageSize.width, imageSize.height),
+        FixtureImage(imageSize.width, imageSize.height, decodedFrames),
         hardPeakDisplayAreas,
     )
 
@@ -1376,6 +1605,11 @@ private class ControllableTilingReaderImage private constructor(
     val regionRenderCount: Int get() = renderEntryCount.value
     val visibleEpoch: Long get() = visibleFrameSlot.epoch
     val visibleSlotPublicationCount: Int get() = visibleFrameSlotPublications
+    val retainedFitBaseTile: RenderedTile
+        get() {
+            val renderImage = retainedFitBaseForTest().handles.single().renderImage
+            return generatedTiles.single { it.renderImage === renderImage }
+        }
 
     suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize) {
         ensureFitPageBase(maxDisplaySize)
@@ -1669,11 +1903,11 @@ private class FixtureDecoder(private val image: KomeliaImage) : KomeliaImageDeco
 private class FixtureImage(
     override val width: Int,
     override val height: Int,
+    override val pagesLoaded: Int = 1,
 ) : KomeliaImage {
     override val bands = 4
     override val type = ImageFormat.RGBA_8888
-    override val pagesLoaded = 1
-    override val pagesTotal = 1
+    override val pagesTotal = pagesLoaded
     override val pageHeight = height
     override val pageDelays: IntArray? = null
 

@@ -13,6 +13,30 @@ fun interface PreparedUpdateLease : AutoCloseable {
 
 class RenderInvalidatedException : CancellationException("render publication was invalidated")
 
+class LayeredPanelWindowUnavailableException(
+    message: String = "layered panel rendering is unavailable for this image",
+) : IllegalStateException(message)
+
+data class PanelWindowKey(
+    val centerPanelIndex: Int,
+    val geometryEpoch: Long,
+)
+
+data class PanelWindowRenderStats(
+    val reusedTiles: Int,
+    val upgradedTiles: Int,
+    val renderedTiles: Int,
+    val evictedTiles: Int,
+    val baseReused: Boolean,
+    val livePixels: Long,
+    val hardPeakPixels: Long,
+)
+
+data class PreparedPanelWindow(
+    val lease: PreparedUpdateLease,
+    val stats: PanelWindowRenderStats,
+)
+
 internal data class VisibleFrameSlot(
     val epoch: Long,
     val frameToken: Long,
@@ -47,6 +71,16 @@ interface ReaderImage : AutoCloseable {
      * Non-layered implementations and test doubles intentionally have no geometry epoch.
      */
     fun invalidatePanelGeometry(): Long = 0L
+
+    /**
+     * Publishes an immutable exact panel-overlay window over the retained fitted page base.
+     * Implementations without layered panel rendering reject the operation explicitly.
+     */
+    suspend fun prepareLayeredPanelWindow(
+        maxDisplaySize: IntSize,
+        windowKey: PanelWindowKey,
+        requirements: List<ViewportRenderRequirement>,
+    ): PreparedPanelWindow = throw LayeredPanelWindowUnavailableException()
 
     /**
      * request an asynchronous update.

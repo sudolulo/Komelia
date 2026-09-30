@@ -328,4 +328,31 @@ class DesktopReaderImage(
         }
     }
 
+    internal companion object {
+        fun createTiledPainterForTest(
+            tiles: List<ReaderImageTile>,
+            displaySize: IntSize,
+            scaleFactor: Double,
+            upsamplingMode: UpsamplingMode,
+        ): TiledPainter = SkiaTiledPainter(
+            tiles = tiles,
+            showDebugGrid = false,
+            upsamplingMode = upsamplingMode,
+            scaleFactor = scaleFactor,
+            displaySize = displaySize,
+        )
+    }
+
 }
+
+internal fun createDesktopTiledPainterForTest(
+    tiles: List<TilingReaderImage.ReaderImageTile>,
+    displaySize: IntSize,
+    scaleFactor: Double,
+    upsamplingMode: UpsamplingMode,
+): TilingReaderImage.TiledPainter = DesktopReaderImage.createTiledPainterForTest(
+    tiles = tiles,
+    displaySize = displaySize,
+    scaleFactor = scaleFactor,
+    upsamplingMode = upsamplingMode,
+)
