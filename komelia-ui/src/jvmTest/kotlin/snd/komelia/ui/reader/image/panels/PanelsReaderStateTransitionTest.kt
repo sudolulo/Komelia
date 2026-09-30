@@ -181,10 +181,16 @@ class PanelsReaderStateTransitionTest {
             )
             try {
                 fixture.settleRollingPreparation()
-                val before = fixture.image.nativeRenders
+                val beforeForward = fixture.image.nativeRenders
                 fixture.navigateForwardAndFinish()
+                assertEquals(1, fixture.events.size, "forward mode=$mode")
+                assertEquals(beforeForward, fixture.image.nativeRenders, "forward mode=$mode")
+
+                fixture.settleRollingPreparation()
+                val beforeBackward = fixture.image.nativeRenders
                 fixture.navigateBackwardAndFinish()
-                assertEquals(before, fixture.image.nativeRenders, "mode=$mode")
+                assertEquals(2, fixture.events.size, "backward mode=$mode")
+                assertEquals(beforeBackward, fixture.image.nativeRenders, "backward mode=$mode")
                 assertTrue(
                     fixture.events.all {
                         it.frameSource == PanelTransitionFrameSource.LAYERED_PANEL_WINDOW
@@ -1422,6 +1428,9 @@ private class PanelFixture(
     private val diagnosticListeners: CopyOnWriteArrayList<(PanelTransitionEvent) -> Unit>,
 ) {
     private var viewportObserverSettled = false
+    private var completedMovementEvents = 0
+    private var settledPanel = initialPanel
+    private var nextFrameTimeNanos = 0L
 
     /** drives the viewport until the reader's conflated observers are demonstrably running */
     suspend fun awaitViewportObserver() {
@@ -1482,7 +1491,13 @@ private class PanelFixture(
         if (image.layeredRequests.isEmpty()) state.prepareRollingWindow()
         image.releaseLayeredPreparation()
         withTimeout(2_000) {
-            while (image.layeredRequests.isEmpty() || image.activeLayeredLeases != 0) delay(10)
+            while (
+                image.layeredRequests.isEmpty() ||
+                image.completedLayeredPreparations < image.layeredRequests.size ||
+                image.activeLayeredLeases != 0
+            ) {
+                delay(10)
+            }
         }
         if (!viewportObserverSettled) {
             awaitViewportObserver()
@@ -1491,24 +1506,49 @@ private class PanelFixture(
     }
 
     suspend fun navigateForwardAndFinish() {
-        state.nextPanel()
+        awaitMovementStart(state::nextPanel)
         finishMovement()
     }
 
     suspend fun navigateBackwardAndFinish() {
-        state.previousPanel()
+        awaitMovementStart(state::previousPanel)
         finishMovement()
     }
 
-    suspend fun finishMovement() {
+    private suspend fun awaitMovementStart(navigate: () -> Unit) {
+        val sourcePanel = state.currentPageIndex.value.panel
+        val expectedEventCount = completedMovementEvents + 1
         withTimeout(2_000) {
-            while (!movementStarted() && events.isEmpty()) delay(10)
+            while (
+                state.currentPageIndex.value.panel == sourcePanel &&
+                events.size < expectedEventCount
+            ) {
+                navigate()
+                delay(10)
+            }
+        }
+    }
+
+    suspend fun finishMovement() {
+        val expectedEventCount = completedMovementEvents + 1
+        withTimeout(2_000) {
+            while (
+                state.currentPageIndex.value.panel == settledPanel &&
+                events.size < expectedEventCount
+            ) {
+                delay(10)
+            }
         }
         image.blockLayeredPreparation()
-        repeat(70) { frameClock.sendFrame(it * 16_000_000L) }
-        withTimeout(2_000) {
-            while (events.isEmpty() || image.activeLayeredLeases != 0) delay(10)
+        repeat(70) {
+            frameClock.sendFrame(nextFrameTimeNanos)
+            nextFrameTimeNanos += 16_000_000L
         }
+        withTimeout(2_000) {
+            while (events.size < expectedEventCount || image.activeLayeredLeases != 0) delay(10)
+        }
+        completedMovementEvents = expectedEventCount
+        settledPanel = state.currentPageIndex.value.panel
     }
 
     suspend fun awaitIdle() {
@@ -1678,6 +1718,7 @@ private class ControlledReaderImage(
     private val pageFrameReleases = AtomicInteger()
     private val preparedReleases = AtomicInteger()
     private val layeredLeases = AtomicInteger()
+    private val layeredPreparationCompletions = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
     private val panelGeometryEpochValue = AtomicLong()
     private val layeredPublicationGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
@@ -1697,6 +1738,7 @@ private class ControlledReaderImage(
     val pageFrameLeaseReleases: Int get() = pageFrameReleases.get()
     val preparedLeaseReleases: Int get() = preparedReleases.get()
     val activeLayeredLeases: Int get() = layeredLeases.get()
+    val completedLayeredPreparations: Int get() = layeredPreparationCompletions.get()
     @Volatile
     var currentPanelIndex: () -> Int = { -1 }
 
@@ -1847,6 +1889,7 @@ private class ControlledReaderImage(
             layeredPainterPanelIndices += currentPanelIndex()
         }
         layeredLeases.incrementAndGet()
+        layeredPreparationCompletions.incrementAndGet()
         val closed = AtomicBoolean(false)
         return PreparedPanelWindow(
             lease = PreparedUpdateLease {
