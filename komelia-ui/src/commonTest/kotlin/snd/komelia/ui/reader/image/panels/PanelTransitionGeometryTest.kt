@@ -130,23 +130,6 @@ class PanelTransitionGeometryTest {
     }
 
     @Test
-    fun `fit page requirement covers the full target at fit scale`() {
-        assertEquals(
-            ViewportRenderRequirement(
-                region = IntRect(0, 0, 1192, 1843),
-                zoomFactor = 0.75f,
-            ),
-            fitPageRequirement(targetSize = IntSize(1192, 1843), fitScale = 0.75f),
-        )
-    }
-
-    @Test
-    fun `fit page requirement rejects unusable geometry`() {
-        assertEquals(null, fitPageRequirement(targetSize = IntSize.Zero, fitScale = 1f))
-        assertEquals(null, fitPageRequirement(targetSize = IntSize(1192, 1843), fitScale = Float.NaN))
-    }
-
-    @Test
     fun `visible region at target zoom is bounded around the panel`() {
         val region = visibleDisplayRegion(
             displaySize = IntSize(1000, 2000),

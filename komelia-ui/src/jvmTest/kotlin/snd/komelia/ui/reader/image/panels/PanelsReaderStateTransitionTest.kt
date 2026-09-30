@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
@@ -29,6 +30,11 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import snd.komelia.AppNotifications
@@ -38,11 +44,15 @@ import snd.komelia.image.ImageRect
 import snd.komelia.image.KomeliaImage
 import snd.komelia.image.KomeliaImageDecoder
 import snd.komelia.image.KomeliaPanelDetector
+import snd.komelia.image.LayeredPanelWindowUnavailableException
+import snd.komelia.image.PanelWindowKey
+import snd.komelia.image.PanelWindowRenderStats
+import snd.komelia.image.PreparedPanelWindow
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.PreparedUpdateLease
 import snd.komelia.image.ReaderImageFactory
 import snd.komelia.image.ReaderImageResult
-import snd.komelia.image.TilePixelBudgetExceededException
+import snd.komelia.image.RenderInvalidatedException
 import snd.komelia.image.ViewportRenderRequirement
 import snd.komelia.komga.api.KomgaBookApi
 import snd.komelia.komga.api.KomgaReadListApi
@@ -62,6 +72,7 @@ import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -70,6 +81,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 private val fixtureAreaSize = IntSize(100, 100)
@@ -107,7 +119,7 @@ private fun IntRect.containsRect(other: IntRect): Boolean =
 /**
  * The invariant every panel transition owes, whichever frame it moved on: every viewport it
  * presented was drawable from the frame installed at that moment. Both frames span the whole
- * fitted page - the retained page frame, and the fit-zoom page the fallback renders - so every
+ * fitted page through the renderer-owned base, so every
  * intermediate viewport of the movement is inside the installed coverage.
  */
 private fun assertEveryPresentedViewportCovered(
@@ -146,16 +158,89 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `a settled mid-page panel pre-renders the fit page plus previous current and next`() = runBlocking {
+    fun `settled panel prepares previous current and next overlays without fit requirement`() = runBlocking {
         val fixture = panelFixture(panels = fivePanels, startPanel = 2)
         try {
-            fixture.settle()
+            fixture.settleRollingPreparation()
+            val request = fixture.image.layeredRequests.last()
+            assertEquals(3, request.requirements.size)
+            assertTrue(request.requirements.all { !it.overscan })
+            assertTrue(request.requirements.all { it.zoomFactor > 1f })
+        } finally {
+            fixture.close()
+        }
+    }
 
-            val lastPrepare = fixture.image.prepareRequests.last()
-            assertEquals(4, lastPrepare.requirements.size)
-            val panelRequirements = lastPrepare.requirements.filter { !it.overscan }
-            assertEquals(3, panelRequirements.size)
-            assertTrue(panelRequirements.all { it.zoomFactor > 1f })
+    @Test
+    fun `warm forward and backward transitions render zero tiles in both modes`() = runBlocking {
+        for (mode in PanelTransitionMode.entries) {
+            val fixture = panelFixture(
+                panels = fivePanels,
+                startPanel = 2,
+                transitionMode = MutableStateFlow(mode),
+            )
+            try {
+                fixture.settleRollingPreparation()
+                val before = fixture.image.nativeRenders
+                fixture.navigateForwardAndFinish()
+                fixture.navigateBackwardAndFinish()
+                assertEquals(before, fixture.image.nativeRenders, "mode=$mode")
+                assertTrue(
+                    fixture.events.all {
+                        it.frameSource == PanelTransitionFrameSource.LAYERED_PANEL_WINDOW
+                    }
+                )
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `cold rapid input waits for layered sharp coverage in both modes`() = runBlocking {
+        for (mode in PanelTransitionMode.entries) {
+            val fixture = panelFixture(transitionMode = MutableStateFlow(mode))
+            try {
+                fixture.image.blockLayeredPreparation()
+                fixture.state.nextPanel()
+                assertFalse(fixture.movementStarted())
+                fixture.image.releaseLayeredPreparation()
+                fixture.finishMovement()
+                assertTrue(fixture.layeredPainterWasVisibleBeforeMovement())
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `animated pages keep ordinary reader state and do not enter layered panel navigation`() = runBlocking {
+        for (frames in listOf(2, 9)) {
+            val fixture = panelFixture(imageFrames = frames, startPanel = 1)
+            try {
+                val indexBefore = fixture.state.currentPageIndex.value
+                val painterBefore = fixture.image.painter.value
+                fixture.state.nextPanel()
+                fixture.awaitIdle()
+                assertEquals(indexBefore, fixture.state.currentPageIndex.value)
+                assertSame(painterBefore, fixture.image.painter.value)
+                assertFalse(fixture.movementStarted())
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `settled background preparation closes its lease before a warm tap`() = runBlocking {
+        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
+        try {
+            fixture.settleRollingPreparation()
+            assertEquals(0, fixture.image.activeLayeredLeases)
+            fixture.state.nextPanel()
+            fixture.finishMovement()
+            assertEquals(0, fixture.image.activeLayeredLeases)
+            assertTrue(fixture.events.last().readinessMillis < 10)
         } finally {
             fixture.close()
         }
@@ -174,7 +259,8 @@ class PanelsReaderStateTransitionTest {
             val backgroundPreparation = withTimeout(2_000) {
                 fixture.image.preparationStarted.await()
             }
-            assertEquals(4, backgroundPreparation.requirements.size)
+            assertEquals(3, backgroundPreparation.requirements.size)
+            assertTrue(backgroundPreparation.requirements.all { !it.overscan })
             val rendersBeforePreparation = fixture.image.nativeRenders
 
             fixture.state.nextPanel()
@@ -207,7 +293,7 @@ class PanelsReaderStateTransitionTest {
                 "movement must reacquire the completed rolling window exactly once",
             )
             assertEquals(
-                rendersBeforePreparation + 4,
+                rendersBeforePreparation + 3,
                 fixture.image.nativeRenders,
                 "reacquiring the completed window must perform no additional native renders",
             )
@@ -229,7 +315,7 @@ class PanelsReaderStateTransitionTest {
             fixture.runMovementToCompletion()
 
             assertEquals(
-                PanelTransitionFrameSource.ROLLING_WINDOW,
+                PanelTransitionFrameSource.LAYERED_PANEL_WINDOW,
                 fixture.lastEvent().frameSource,
             )
         } finally {
@@ -249,32 +335,6 @@ class PanelsReaderStateTransitionTest {
             fixture.runMovementToCompletion()
 
             assertTrue(events.last().readinessMillis >= 40)
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `an over budget window falls back to a sharp current and destination pair`() = runBlocking {
-        val fixture = panelFixture(startPanel = 1)
-        try {
-            fixture.image.failNextRollingWindowAsOverBudget()
-
-            fixture.state.nextPanel()
-            withTimeout(2_000) {
-                while (fixture.image.prepareRequests.size < 2) delay(10)
-            }
-            fixture.image.releasePreparation.complete(Unit)
-            withTimeout(2_000) {
-                while (!fixture.movementStarted()) delay(10)
-            }
-            fixture.runMovementToCompletion()
-
-            val event = fixture.lastEvent()
-            assertEquals(PanelTransitionFrameSource.SHARP_PAIR_FALLBACK, event.frameSource)
-            val fallback = fixture.image.prepareRequests[1]
-            assertEquals(3, fallback.requirements.size)
-            assertEquals(2, fallback.requirements.count { !it.overscan && it.zoomFactor > 1f })
         } finally {
             fixture.close()
         }
@@ -336,20 +396,17 @@ class PanelsReaderStateTransitionTest {
 
             withTimeout(2_000) {
                 while (
-                    fixture.image.prepareRequests.none { request ->
-                        request.maxDisplaySize == resizedArea &&
-                            request.requirements.single { it.overscan }.region == IntRect(0, 0, 200, 200)
+                    fixture.image.layeredRequests.none { request ->
+                        request.maxDisplaySize == resizedArea && request.requirements.all { !it.overscan }
                     }
                 ) {
                     delay(10)
                 }
             }
 
-            val resizedRequests = fixture.image.prepareRequests.filter { it.maxDisplaySize == resizedArea }
+            val resizedRequests = fixture.image.layeredRequests.filter { it.maxDisplaySize == resizedArea }
             assertTrue(
-                resizedRequests.all { request ->
-                    request.requirements.single { it.overscan }.region == IntRect(0, 0, 200, 200)
-                },
+                resizedRequests.all { request -> request.requirements.all { !it.overscan } },
                 "input during resize must not prepare new-area frames from the old target geometry: " +
                     resizedRequests,
             )
@@ -450,8 +507,8 @@ class PanelsReaderStateTransitionTest {
 
             assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
             assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
-            assertEquals(4, preparation.requirements.size)
-            assertEquals(3, preparation.requirements.count { !it.overscan })
+            assertEquals(3, preparation.requirements.size)
+            assertTrue(preparation.requirements.all { !it.overscan })
 
             fixture.image.releasePreparation.complete(Unit)
             withTimeout(2_000) {
@@ -507,44 +564,6 @@ class PanelsReaderStateTransitionTest {
                 listOf(Publication.TILED, Publication.TILED),
                 fixture.image.publications.toList(),
                 "the shifted rolling window must publish only after its new edge is ready",
-            )
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `over budget post arrival window waits for the selected destination`() = runBlocking {
-        val fixture = panelFixture(panels = fivePanels, startPanel = 2)
-        try {
-            fixture.settle()
-
-            fixture.image.failRollingWindowsAsOverBudget()
-            val requestsBeforeTransition = fixture.image.prepareRequests.size
-            fixture.state.nextPanel()
-            fixture.runMovementToCompletion()
-            fixture.settle()
-
-            assertEquals(
-                requestsBeforeTransition + 3,
-                fixture.image.prepareRequests.size,
-                "an over-budget background window must not guess a fallback destination before input",
-            )
-
-            val requestsBeforeInput = fixture.image.prepareRequests.size
-            fixture.state.previousPanel()
-            fixture.runMovementToCompletion()
-
-            val fallbackPair = fixture.image.prepareRequests[requestsBeforeInput + 1]
-            val sharpRegions = fallbackPair.requirements.filterNot { it.overscan }.map { it.region }
-
-            assertEquals(
-                listOf(
-                    IntRect(left = 33, top = 53, right = 66, bottom = 86),
-                    IntRect(left = 33, top = 33, right = 66, bottom = 66),
-                ),
-                sharpRegions,
-                "the fallback must contain the current panel and the destination selected by input",
             )
         } finally {
             fixture.close()
@@ -628,12 +647,11 @@ class PanelsReaderStateTransitionTest {
             val startTransformation = fixture.screenScaleState.transformation.value
 
             fixture.state.nextPanel()
-            val fallback = withTimeout(2_000) { fixture.image.preparationStarted.await() }
+            val layered = withTimeout(2_000) { fixture.image.preparationStarted.await() }
 
-            assertEquals(fixtureAreaSize, fallback.maxDisplaySize)
-            assertEquals(4, fallback.requirements.size)
-            assertEquals(1, fallback.requirements.count { it.overscan })
-            assertEquals(3, fallback.requirements.count { !it.overscan })
+            assertEquals(fixtureAreaSize, layered.maxDisplaySize)
+            assertEquals(3, layered.requirements.size)
+            assertTrue(layered.requirements.all { !it.overscan })
             assertEquals(startTransformation, fixture.screenScaleState.transformation.value)
             assertEquals(PanelsReaderState.PageIndex(0, 1, false), fixture.state.currentPageIndex.value)
 
@@ -655,35 +673,6 @@ class PanelsReaderStateTransitionTest {
                 "the transition publishes its sharp window, then the post-arrival window",
             )
             assertEquals(0, fixture.image.pageFramePublications)
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
-    fun `the rolling window includes whole-page fit coverage with exact sharp panels`() = runBlocking {
-        val fixture = panelFixture(pageFrameAvailable = false)
-        try {
-            fixture.awaitViewportObserver()
-
-            fixture.state.nextPanel()
-            val fallback = withTimeout(2_000) { fixture.image.preparationStarted.await() }
-
-            val requirement = fallback.requirements.single { it.overscan }
-            assertEquals(pageRegion, requirement.region, "the fallback must cover the whole fitted page")
-            assertEquals(1f, requirement.zoomFactor, 0.0001f, "the fallback must render at fit zoom")
-            assertEquals(3, fallback.requirements.count { !it.overscan })
-
-            // the corridor this replaced was the bounding box of the post-zoom start and the
-            // destination, rendered at the panel zoom the movement ends on. It covers less of the
-            // page and still costs several times the output pixels, because zoom is squared.
-            val corridor = ViewportRenderRequirement(IntRect(33, 33, 100, 100), 3f)
-            assertEquals(10_000, renderedPixelsOf(requirement))
-            assertEquals(40_401, renderedPixelsOf(corridor))
-            assertTrue(
-                renderedPixelsOf(requirement) < renderedPixelsOf(corridor),
-                "the fit-zoom page must cost fewer output pixels than the corridor it replaced",
-            )
         } finally {
             fixture.close()
         }
@@ -728,18 +717,18 @@ class PanelsReaderStateTransitionTest {
                     "${rollingWindowSamples.map { it.visibleRegion }}",
             )
             val firstPrepare = fixture.image.prepareRequests.first()
-            assertEquals(1, firstPrepare.requirements.count { it.overscan })
-            assertEquals(3, firstPrepare.requirements.count { !it.overscan })
+            assertTrue(firstPrepare.requirements.all { !it.overscan })
+            assertEquals(3, firstPrepare.requirements.size)
             assertEquals(2, fixture.state.currentPageIndex.value.panel)
             assertEquals(3f, fixture.screenScaleState.transformation.value.scale, 0.0001f)
 
             val event = events.single()
             assertEquals(PanelTransitionOutcome.ANIMATED, event.outcome)
-            assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
+            assertEquals(PanelTransitionFrameSource.LAYERED_PANEL_WINDOW, event.frameSource)
             assertEquals(
                 250,
                 event.durationMillis,
-                "the fallback must report the selected mode's full duration: ${event.toLogLine()}",
+                "the layered transition must report the selected mode's full duration: ${event.toLogLine()}",
             )
         } finally {
             fixture.close()
@@ -866,7 +855,7 @@ class PanelsReaderStateTransitionTest {
             assertEquals(PanelTransitionMode.SNAPPY, event.mode)
             assertEquals(250, event.durationMillis)
             assertEquals(PanelTransitionOutcome.ANIMATED, event.outcome)
-            assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
+            assertEquals(PanelTransitionFrameSource.LAYERED_PANEL_WINDOW, event.frameSource)
             assertTrue(event.generation > 0)
             assertTrue(event.readinessMillis >= 0)
             assertTrue(event.movementEndMillis >= event.movementStartMillis)
@@ -890,7 +879,7 @@ class PanelsReaderStateTransitionTest {
 
             assertEquals(1, events.size, "one input must emit exactly one event")
             val event = events.single()
-            assertEquals(PanelTransitionFrameSource.ROLLING_WINDOW, event.frameSource)
+            assertEquals(PanelTransitionFrameSource.LAYERED_PANEL_WINDOW, event.frameSource)
             assertTrue(event.readinessMillis >= 0L)
             assertEquals(PanelTransitionMode.SNAPPY, event.mode)
             assertEquals(250, event.durationMillis)
@@ -912,7 +901,7 @@ class PanelsReaderStateTransitionTest {
 
             fixture.state.nextPanel()
             withTimeout(2_000) { fixture.image.preparationStarted.await() }
-            // the fallback render never completes, so the transition is cancelled while preparing
+            // layered preparation never completes, so the transition is cancelled while preparing
             fixture.state.stop()
 
             withTimeout(2_000) {
@@ -1015,10 +1004,10 @@ class PanelsReaderStateTransitionTest {
                 fixture.image.pageFramePublications,
                 "a page frame retained for the previous page size must never be published at the new one",
             )
-            val rollingWindow = fixture.image.prepareRequests.last()
+            val rollingWindow = fixture.image.layeredRequests.last()
             assertEquals(IntSize(200, 200), rollingWindow.maxDisplaySize)
-            assertEquals(IntRect(0, 0, 200, 200), rollingWindow.requirements.single { it.overscan }.region)
-            assertEquals(3, rollingWindow.requirements.count { !it.overscan })
+            assertEquals(3, rollingWindow.requirements.size)
+            assertTrue(rollingWindow.requirements.all { !it.overscan })
             assertTrue(
                 fixture.image.viewportUpdates.any { it.maxDisplaySize == IntSize(200, 200) },
                 "the new fit geometry must go out on the ordinary viewport path, " +
@@ -1108,12 +1097,12 @@ class PanelsReaderStateTransitionTest {
             )
             assertTrue(
                 movement.map { it.visibleRegion }.distinct().size > 1,
-                "the post-resize fallback must animate through multiple viewports; " +
+                "the post-resize layered frame must animate through multiple viewports; " +
                     "samples=${movement.map { it.visibleRegion }} transitions=$events",
             )
-            val rollingWindow = fixture.image.prepareRequests.last()
-            assertEquals(IntRect(0, 0, 200, 200), rollingWindow.requirements.single { it.overscan }.region)
-            assertEquals(2, rollingWindow.requirements.count { !it.overscan })
+            val rollingWindow = fixture.image.layeredRequests.last()
+            assertEquals(2, rollingWindow.requirements.size)
+            assertTrue(rollingWindow.requirements.all { !it.overscan })
             assertEquals(PanelTransitionOutcome.ANIMATED, events.single().outcome)
             assertEquals(250, events.single().durationMillis)
         } finally {
@@ -1122,31 +1111,36 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `a burst of area changes prepares a bounded number of times and honours the final size`() = runBlocking {
-        val fixture = panelFixture(startPanel = 1)
+    fun `a burst of area changes prepares three throttled sizes and honours the final size`() = runTest {
+        val stateDispatcher = StandardTestDispatcher(testScheduler)
+        val stateScope = CoroutineScope(SupervisorJob() + stateDispatcher)
+        val fixture = panelFixture(startPanel = 1, stateScope = stateScope)
         try {
             fixture.awaitViewportObserver()
+            fixture.image.layeredRequests.clear()
 
-            // a window resize drag: twenty intermediate sizes, spaced far enough apart that an
-            // unthrottled collector prepares every single one of them
             repeat(20) { step ->
                 fixture.screenScaleState.setAreaSize(IntSize(200 + step * 5, 200 + step * 5))
-                delay(10)
+                advanceTimeBy(10)
+                runCurrent()
             }
-            delay(300)
+            advanceTimeBy(100)
+            runCurrent()
 
-            assertTrue(
-                fixture.image.prepareRequests.map { it.maxDisplaySize }.distinct().size <= 3,
-                "a resize drag must not prepare one frame per intermediate size, prepared " +
-                    "${fixture.image.prepareRequests.map { it.maxDisplaySize }}",
+            val preparedSizes = fixture.image.layeredRequests.map { it.maxDisplaySize }.distinct()
+            assertEquals(
+                3,
+                preparedSizes.size,
+                "the 100 ms throttle must accept exactly the initial, middle, and final sizes: $preparedSizes",
             )
             assertEquals(
                 IntSize(295, 295),
-                fixture.image.prepareRequests.last().maxDisplaySize,
+                fixture.image.layeredRequests.last().maxDisplaySize,
                 "the size the drag ended on must always be prepared",
             )
         } finally {
             fixture.close()
+            stateScope.cancel()
         }
     }
 
@@ -1215,42 +1209,32 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `a second resize cancels a gated old size rolling window before it can publish`() = runBlocking {
-        val events = CopyOnWriteArrayList<PanelTransitionEvent>()
-        val fixture = panelFixture(
-            startPanel = 1,
-            pageFrameAvailable = false,
-            diagnostics = { events += it },
-        )
+    fun `material resize invalidates folded geometry before stale layered publication`() = runBlocking {
+        val fixture = panelFixture(startPanel = 1)
         try {
             fixture.awaitViewportObserver()
+            fixture.image.blockLayeredPublication()
+            assertTrue(fixture.state.prepareRollingWindow())
+            fixture.image.awaitLayeredPublicationBlocked()
 
-            val oldArea = IntSize(200, 200)
-            fixture.screenScaleState.setAreaSize(oldArea)
+            val foldedArea = fixture.screenScaleState.areaSize.value
+            val foldedEpoch = fixture.image.geometryEpoch
+            val unfoldedArea = IntSize(2208, 1840)
+            fixture.screenScaleState.setAreaSize(unfoldedArea)
             withTimeout(2_000) {
-                while (fixture.image.prepareRequests.none { it.maxDisplaySize == oldArea }) delay(10)
+                while (fixture.image.geometryEpoch == foldedEpoch) delay(10)
             }
-            // Let the resize collector leave its throttle window while the old rolling window
-            // remains gated inside prepareUpdate.
-            delay(150)
-            val rendersBeforeRelease = fixture.image.nativeRenders
+            assertEquals(foldedEpoch + 1, fixture.image.geometryEpoch)
 
-            // The replacement page cannot prepare another window. The resize itself must still
-            // invalidate the old one rather than relying on a later prepareRollingWindow call.
-            val page = fixture.state.currentPage.value!!
-            fixture.state.currentPage.value = page.copy(panelData = null)
-            fixture.screenScaleState.setAreaSize(IntSize(250, 250))
+            fixture.image.releaseLayeredPublication()
             withTimeout(2_000) {
-                while (events.none { it.outcome == PanelTransitionOutcome.CANCELLED }) delay(10)
+                while (fixture.image.layeredRequests.none { it.maxDisplaySize == unfoldedArea }) delay(10)
             }
 
-            fixture.image.releasePreparation.complete(Unit)
-            delay(150)
-
-            assertEquals(
-                rendersBeforeRelease,
-                fixture.image.nativeRenders,
-                "the superseded $oldArea rolling window rendered after the new area became active",
+            assertEquals(1, fixture.state.currentPageIndex.value.panel)
+            assertTrue(
+                foldedArea !in fixture.image.layeredPublishedSizes,
+                "the invalidated folded painter must never publish: ${fixture.image.layeredPublishedSizes}",
             )
         } finally {
             fixture.close()
@@ -1398,7 +1382,7 @@ private class PanelFixture(
     val frameClock: ControlledFrameClock,
     private val animationScope: CoroutineScope,
     private val initialPanel: Int,
-    private val events: CopyOnWriteArrayList<PanelTransitionEvent>,
+    val events: CopyOnWriteArrayList<PanelTransitionEvent>,
     private val diagnosticListeners: CopyOnWriteArrayList<(PanelTransitionEvent) -> Unit>,
 ) {
     private var viewportObserverSettled = false
@@ -1458,6 +1442,46 @@ private class PanelFixture(
         }
     }
 
+    suspend fun settleRollingPreparation() {
+        if (image.layeredRequests.isEmpty()) state.prepareRollingWindow()
+        image.releaseLayeredPreparation()
+        withTimeout(2_000) {
+            while (image.layeredRequests.isEmpty() || image.activeLayeredLeases != 0) delay(10)
+        }
+        if (!viewportObserverSettled) {
+            awaitViewportObserver()
+            viewportObserverSettled = true
+        }
+    }
+
+    suspend fun navigateForwardAndFinish() {
+        state.nextPanel()
+        finishMovement()
+    }
+
+    suspend fun navigateBackwardAndFinish() {
+        state.previousPanel()
+        finishMovement()
+    }
+
+    suspend fun finishMovement() {
+        withTimeout(2_000) {
+            while (!movementStarted() && events.isEmpty()) delay(10)
+        }
+        image.blockLayeredPreparation()
+        repeat(70) { frameClock.sendFrame(it * 16_000_000L) }
+        withTimeout(2_000) {
+            while (events.isEmpty() || image.activeLayeredLeases != 0) delay(10)
+        }
+    }
+
+    suspend fun awaitIdle() {
+        delay(150)
+    }
+
+    fun layeredPainterWasVisibleBeforeMovement(): Boolean =
+        image.layeredPainterPanelIndices.contains(initialPanel)
+
     fun movementStarted(): Boolean = state.currentPageIndex.value.panel != initialPanel
 
     suspend fun delayPreparation(millis: Long) {
@@ -1503,10 +1527,12 @@ private suspend fun CoroutineScope.panelFixture(
     panels: List<ImageRect> = defaultPanels,
     startPanel: Int = 1,
     pageFrameAvailable: Boolean = true,
+    imageFrames: Int = 1,
     transitionMode: MutableStateFlow<PanelTransitionMode> = MutableStateFlow(PanelTransitionMode.SNAPPY),
     diagnostics: PanelTransitionDiagnostics = PanelTransitionDiagnostics {},
+    stateScope: CoroutineScope? = null,
 ): PanelFixture {
-    val image = ControlledReaderImage(fixtureImageSize, pageFrameAvailable)
+    val image = ControlledReaderImage(fixtureImageSize, pageFrameAvailable, imageFrames)
     val frameClock = ControlledFrameClock()
     val animationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + frameClock)
     val events = CopyOnWriteArrayList<PanelTransitionEvent>()
@@ -1525,6 +1551,7 @@ private suspend fun CoroutineScope.panelFixture(
             diagnostics.onTransition(event)
             diagnosticListeners.forEach { it(event) }
         },
+        stateScope,
     )
     state.currentPage.value = PanelsReaderState.PanelsPage(
         metadata = PageMetadata(KomgaBookId("book"), 1, fixtureImageSize),
@@ -1536,6 +1563,7 @@ private suspend fun CoroutineScope.panelFixture(
         ),
     )
     state.currentPageIndex.value = PanelsReaderState.PageIndex(0, startPanel, false)
+    image.currentPanelIndex = { state.currentPageIndex.value.panel }
     state.initialize()
     return PanelFixture(
         state = state,
@@ -1560,6 +1588,12 @@ private data class PrepareRequest(
     val requirements: List<ViewportRenderRequirement>,
 )
 
+private data class LayeredPrepareRequest(
+    val maxDisplaySize: IntSize,
+    val windowKey: PanelWindowKey,
+    val requirements: List<ViewportRenderRequirement>,
+)
+
 /** which kind of frame a publication installed, in the order the renderer installed them */
 private enum class Publication { PAGE_FRAME, TILED }
 
@@ -1581,6 +1615,7 @@ private class FixturePainter(private val name: String) : Painter() {
 private class ControlledReaderImage(
     imageSize: IntSize,
     pageFrameAvailable: Boolean,
+    private val imageFrames: Int = 1,
 ) : ReaderImage {
     val preparationStarted = CompletableDeferred<PrepareRequest>()
     val pageFramePublicationStarted = CompletableDeferred<Unit>()
@@ -1596,16 +1631,21 @@ private class ControlledReaderImage(
 
     val viewportUpdates = Collections.synchronizedList(mutableListOf<ImageUpdate>())
     val prepareRequests = CopyOnWriteArrayList<PrepareRequest>()
+    val layeredRequests = CopyOnWriteArrayList<LayeredPrepareRequest>()
     val publications = CopyOnWriteArrayList<Publication>()
+    val layeredPublishedSizes = CopyOnWriteArrayList<IntSize>()
+    val layeredPainterPanelIndices = CopyOnWriteArrayList<Int>()
 
     private val renderedCoverage = Collections.synchronizedSet(mutableSetOf<ViewportRenderRequirement>())
     private val renders = AtomicInteger()
     private val pageFramePublishCount = AtomicInteger()
     private val pageFrameReleases = AtomicInteger()
     private val preparedReleases = AtomicInteger()
+    private val layeredLeases = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
-    private val failRollingWindowAsOverBudget = AtomicBoolean(false)
-    private val failRollingWindowsAsOverBudget = AtomicBoolean(false)
+    private val panelGeometryEpoch = AtomicLong()
+    private val layeredPublicationGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
+    private val layeredPublicationReached = AtomicReference(CompletableDeferred<Unit>())
 
     /** serialises frame installation against anything observing what is installed */
     private val installLock = ReentrantLock()
@@ -1620,6 +1660,11 @@ private class ControlledReaderImage(
     val pageFramePublications: Int get() = pageFramePublishCount.get()
     val pageFrameLeaseReleases: Int get() = pageFrameReleases.get()
     val preparedLeaseReleases: Int get() = preparedReleases.get()
+    val activeLayeredLeases: Int get() = layeredLeases.get()
+    val geometryEpoch: Long get() = panelGeometryEpoch.get()
+
+    @Volatile
+    var currentPanelIndex: () -> Int = { -1 }
 
     /** the fitted display region the currently installed frame can draw */
     val installedCoverage: IntRect? get() = coverage.get()
@@ -1647,12 +1692,25 @@ private class ControlledReaderImage(
         preparationGate.set(CompletableDeferred())
     }
 
-    fun failNextRollingWindowAsOverBudget() {
-        failRollingWindowAsOverBudget.set(true)
+    fun blockLayeredPreparation() {
+        blockPreparation()
     }
 
-    fun failRollingWindowsAsOverBudget() {
-        failRollingWindowsAsOverBudget.set(true)
+    fun releaseLayeredPreparation() {
+        preparationGate.get().complete(Unit)
+    }
+
+    fun blockLayeredPublication() {
+        layeredPublicationReached.set(CompletableDeferred())
+        layeredPublicationGate.set(CompletableDeferred())
+    }
+
+    suspend fun awaitLayeredPublicationBlocked() {
+        withTimeout(2_000) { layeredPublicationReached.get().await() }
+    }
+
+    fun releaseLayeredPublication() {
+        layeredPublicationGate.get().complete(Unit)
     }
 
     override val pageId = ReaderImage.PageId("book", 1)
@@ -1661,6 +1719,15 @@ private class ControlledReaderImage(
     override val currentSize = MutableStateFlow<IntSize?>(imageSize)
     override val painter = MutableStateFlow<Painter?>(null)
     override val error = MutableStateFlow<Throwable?>(null)
+
+    override fun invalidatePanelGeometry(): Long {
+        val epoch = panelGeometryEpoch.incrementAndGet()
+        installLock.withLock {
+            coverage.set(null)
+            painter.value = null
+        }
+        return epoch
+    }
 
     override fun requestUpdate(
         maxDisplaySize: IntSize,
@@ -1690,13 +1757,6 @@ private class ControlledReaderImage(
         val request = PrepareRequest(maxDisplaySize, requirements)
         prepareRequests += request
         preparationStarted.complete(request)
-        val sharpRequirementCount = requirements.count { !it.overscan }
-        if (
-            failRollingWindowAsOverBudget.compareAndSet(true, false) ||
-            failRollingWindowsAsOverBudget.get() && sharpRequirementCount >= 3
-        ) {
-            throw TilePixelBudgetExceededException("controlled rolling window exceeds pixel budget")
-        }
         if (requirements.any { it !in renderedCoverage }) {
             preparationGate.get().await()
         }
@@ -1720,6 +1780,58 @@ private class ControlledReaderImage(
         requirements: List<ViewportRenderRequirement>,
     ): PreparedUpdateLease = prepareUpdate(maxDisplaySize, requirements) { true }
 
+    override suspend fun prepareLayeredPanelWindow(
+        maxDisplaySize: IntSize,
+        windowKey: PanelWindowKey,
+        requirements: List<ViewportRenderRequirement>,
+    ): PreparedPanelWindow {
+        if (imageFrames != 1) throw LayeredPanelWindowUnavailableException()
+
+        val request = LayeredPrepareRequest(maxDisplaySize, windowKey, requirements)
+        layeredRequests += request
+        val compatibleRequest = PrepareRequest(maxDisplaySize, requirements)
+        prepareRequests += compatibleRequest
+        preparationStarted.complete(compatibleRequest)
+        if (requirements.any { it !in renderedCoverage }) {
+            preparationGate.get().await()
+        }
+
+        val renderedBefore = renderedCoverage.size
+        render(requirements)
+        val renderedTiles = renderedCoverage.size - renderedBefore
+
+        withContext(NonCancellable) {
+            layeredPublicationReached.get().complete(Unit)
+            layeredPublicationGate.get().await()
+            if (windowKey.geometryEpoch != panelGeometryEpoch.get()) {
+                throw RenderInvalidatedException()
+            }
+
+            install(Publication.TILED, pageRegionFor(maxDisplaySize), FixturePainter("layered $windowKey"))
+            layeredPublishedSizes += maxDisplaySize
+            layeredPainterPanelIndices += currentPanelIndex()
+        }
+        layeredLeases.incrementAndGet()
+        val closed = AtomicBoolean(false)
+        return PreparedPanelWindow(
+            lease = PreparedUpdateLease {
+                if (closed.compareAndSet(false, true)) {
+                    layeredLeases.decrementAndGet()
+                    preparedReleases.incrementAndGet()
+                }
+            },
+            stats = PanelWindowRenderStats(
+                reusedTiles = requirements.size - renderedTiles,
+                upgradedTiles = 0,
+                renderedTiles = renderedTiles,
+                evictedTiles = 0,
+                baseReused = true,
+                livePixels = renderedCoverage.sumOf { renderedPixelsOf(it).toLong() },
+                hardPeakPixels = 8L * maxDisplaySize.width * maxDisplaySize.height,
+            ),
+        )
+    }
+
     private fun install(publication: Publication, region: IntRect, frame: Painter) {
         installLock.withLock {
             coverage.set(region)
@@ -1736,6 +1848,9 @@ private class ControlledReaderImage(
         }
     }
 
+    private fun pageRegionFor(maxDisplaySize: IntSize) =
+        IntRect(0, 0, maxDisplaySize.width, maxDisplaySize.height)
+
     override suspend fun getOriginalImageSize(): Result<IntSize> =
         Result.success(checkNotNull(originalSize.value))
 
@@ -1750,6 +1865,7 @@ private fun CoroutineScope.panelsReaderState(
     screenScaleState: ScreenScaleState,
     transitionMode: MutableStateFlow<PanelTransitionMode> = MutableStateFlow(PanelTransitionMode.SNAPPY),
     diagnostics: PanelTransitionDiagnostics = PanelTransitionDiagnostics {},
+    stateScope: CoroutineScope? = null,
 ): PanelsReaderState {
     val bookApi = unsupportedProxy<KomgaBookApi>()
     val settingsRepository = settingsRepository(transitionMode)
@@ -1799,6 +1915,7 @@ private fun CoroutineScope.panelsReaderState(
         onnxRuntimeRfDetr = panelDetector,
         screenScaleState = screenScaleState,
         transitionDiagnostics = diagnostics,
+        stateScope = stateScope,
     )
 }
 

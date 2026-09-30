@@ -1,7 +1,6 @@
 package snd.komelia.ui.reader.image.panels
 
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import snd.komelia.image.ImageRect
 import snd.komelia.image.ViewportRenderRequirement
@@ -49,19 +48,6 @@ internal fun rollingPanelRequirements(
 
         ViewportRenderRequirement(region = region, zoomFactor = scale, overscan = false)
     }
-}
-
-/** The whole fitted page at [fitScale], or null while its geometry is unusable. */
-internal fun fitPageRequirement(
-    targetSize: IntSize,
-    fitScale: Float,
-): ViewportRenderRequirement? {
-    if (targetSize.width <= 0 || targetSize.height <= 0) return null
-    if (!fitScale.isFinite() || fitScale <= 0f) return null
-    return ViewportRenderRequirement(
-        region = IntRect(0, 0, targetSize.width, targetSize.height),
-        zoomFactor = fitScale,
-    )
 }
 
 internal fun getPanelOffsetAndZoom(

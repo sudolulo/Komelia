@@ -37,10 +37,11 @@ import snd.komelia.AppNotifications
 import snd.komelia.image.BookImageLoader
 import snd.komelia.image.ImageRect
 import snd.komelia.image.KomeliaPanelDetector
+import snd.komelia.image.LayeredPanelWindowUnavailableException
+import snd.komelia.image.PanelWindowKey
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.ReaderImage.PageId
 import snd.komelia.image.ReaderImageResult
-import snd.komelia.image.TilePixelBudgetExceededException
 import snd.komelia.onnxruntime.OnnxRuntimeException
 import snd.komelia.settings.ImageReaderSettingsRepository
 import snd.komelia.settings.model.PagedReadingDirection
@@ -92,11 +93,8 @@ enum class PanelTransitionOutcome {
 
 /** Where the frame a transition moved on came from. */
 enum class PanelTransitionFrameSource {
-    /** the sharp rolling panel window was prepared or reacquired for movement */
-    ROLLING_WINDOW,
-
-    /** the rolling window exceeded its budget, so movement uses only its sharp endpoint pair */
-    SHARP_PAIR_FALLBACK,
+    /** an immutable sharp panel-overlay window layered over the retained fitted page */
+    LAYERED_PANEL_WINDOW,
 }
 
 /**
@@ -159,11 +157,12 @@ class PanelsReaderState(
     private val onnxRuntimeRfDetr: KomeliaPanelDetector,
     val screenScaleState: ScreenScaleState,
     private val transitionDiagnostics: PanelTransitionDiagnostics = PanelTransitionDiagnostics.Logging,
+    stateScope: CoroutineScope? = null,
 ) {
-    private val stateScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val internalStateScope = stateScope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val panelTransitionMode = settingsRepository.getPanelTransitionMode()
-        .stateIn(stateScope, SharingStarted.Eagerly, PanelTransitionMode.SNAPPY)
-    private val panelTransitionController = PanelTransitionController(stateScope) { error ->
+        .stateIn(internalStateScope, SharingStarted.Eagerly, PanelTransitionMode.SNAPPY)
+    private val panelTransitionController = PanelTransitionController(internalStateScope) { error ->
         logger.catching(error)
     }
     private val pageLoadCoordinator = PageLoadCoordinator<PageId, PanelsPage>(
@@ -186,6 +185,8 @@ class PanelsReaderState(
     private var resizeJob: Job? = null
     private var rollingWindowJob: Job? = null
     private var rollingWindowKey: RollingWindowKey? = null
+    private val panelGeometryEpoch = MutableStateFlow(0L)
+    private val layeredNavigationUnavailable = MutableStateFlow<ReaderImage?>(null)
 
     val pageMetadata: MutableStateFlow<List<PageMetadata>> = MutableStateFlow(emptyList())
 
@@ -216,12 +217,16 @@ class PanelsReaderState(
                 }
                 delay(100)
             }
-            .launchIn(stateScope)
+            .launchIn(internalStateScope)
 
         screenScaleState.areaSize
             .drop(1)
             .conflate()
             .onEach { areaSize ->
+                val image = (currentPage.value?.imageResult as? ReaderImageResult.Success)?.image
+                if (image != null) {
+                    panelGeometryEpoch.value = image.invalidatePanelGeometry()
+                }
                 val generation = resizeGeneration.updateAndGet { it + 1 }
                 resizeJob?.cancel()
                 cancelPanelTransition()
@@ -233,7 +238,7 @@ class PanelsReaderState(
 
                 val page = currentPage.value ?: return@onEach
                 val pageIndex = currentPageIndex.value
-                resizeJob = stateScope.launch {
+                resizeJob = internalStateScope.launch {
                     prepareMaterialResize(page, pageIndex, areaSize, generation)
                 }
                 // Cancelling resizeJob does not cancel work the arbiter already accepted, and the
@@ -243,7 +248,7 @@ class PanelsReaderState(
                 // latest value, so the size the drag ends on is still prepared.
                 delay(resizeThrottleMillis)
             }
-            .launchIn(stateScope)
+            .launchIn(internalStateScope)
 
         readingDirection.drop(1).onEach { readingDirection ->
             cancelPanelTransition()
@@ -269,12 +274,12 @@ class PanelsReaderState(
 
             }
 
-        }.launchIn(stateScope)
+        }.launchIn(internalStateScope)
 
         readerState.booksState
             .filterNotNull()
             .onEach { newBook -> onNewBookLoaded(newBook) }
-            .launchIn(stateScope)
+            .launchIn(internalStateScope)
     }
 
     fun stop() {
@@ -283,7 +288,7 @@ class PanelsReaderState(
         rollingWindowJob?.cancel()
         rollingWindowJob = null
         rollingWindowKey = null
-        stateScope.coroutineContext.cancelChildren()
+        internalStateScope.coroutineContext.cancelChildren()
         pageLoadCoordinator.stop { currentPage.value = null }
         pendingPageIndex.value = null
         screenScaleState.enableOverscrollArea(false)
@@ -372,7 +377,7 @@ class PanelsReaderState(
     fun onReadingDirectionChange(readingDirection: PagedReadingDirection) {
         cancelPanelTransition()
         this.readingDirection.value = readingDirection
-        stateScope.launch { settingsRepository.putPagedReaderReadingDirection(readingDirection) }
+        internalStateScope.launch { settingsRepository.putPagedReaderReadingDirection(readingDirection) }
     }
 
 
@@ -419,7 +424,7 @@ class PanelsReaderState(
             }
 
             currentTransitionPage is BookEnd && currentTransitionPage.nextBook != null -> {
-                stateScope.launch {
+                internalStateScope.launch {
                     pageLoadCoordinator.unpublishCurrent { currentPage.value = null }.join()
                     transitionPage.value = null
                     readerState.loadNextBook()
@@ -465,7 +470,7 @@ class PanelsReaderState(
             }
 
             currentTransitionPage is BookStart && currentTransitionPage.previousBook != null -> {
-                stateScope.launch {
+                internalStateScope.launch {
                     pageLoadCoordinator.unpublishCurrent { currentPage.value = null }.join()
                     transitionPage.value = null
                     readerState.loadPreviousBook()
@@ -485,7 +490,7 @@ class PanelsReaderState(
     private fun launchPageLoad(pageIndex: Int) {
         if (pageIndex != currentPageIndex.value.page) {
             val pageNumber = pageIndex + 1
-            stateScope.launch { readerState.onProgressChange(pageNumber) }
+            internalStateScope.launch { readerState.onProgressChange(pageNumber) }
         }
 
         val pageMeta = pageMetadata.value[pageIndex]
@@ -500,6 +505,8 @@ class PanelsReaderState(
                 transitionPage.value = null
                 logger.info { "current page value ${readyPage.page}" }
                 currentPage.value = readyPage.page
+                layeredNavigationUnavailable.value = null
+                panelGeometryEpoch.value = 0L
                 screenScaleState.enableOverscrollArea(true)
                 screenScaleState.apply(readyPage.scale)
                 panelGeometryAreaSize.value = screenScaleState.areaSize.value
@@ -660,11 +667,7 @@ class PanelsReaderState(
         return launchPanelTransition(0, panels.first())
     }
 
-    /**
-     * Publishes the fit page plus the exact previous/current/next panel window in the background.
-     * The lease is only a publication lock; retained tiles keep the published frame alive after it
-     * closes. A newer window cancels an obsolete preparation before taking its place.
-     */
+    /** Publishes the exact previous/current/next panel overlays over the renderer-owned fit base. */
     internal fun prepareRollingWindow(): Boolean = prepareRollingWindow(resizeGeneration = null)
 
     private fun prepareRollingWindow(resizeGeneration: Long?): Boolean {
@@ -676,11 +679,10 @@ class PanelsReaderState(
         val page = currentPage.value ?: return false
         val panelData = page.panelData ?: return false
         val image = (page.imageResult as? ReaderImageResult.Success)?.image ?: return false
+        if (layeredNavigationUnavailable.value === image) return false
         val panelIndex = currentPageIndex.value.panel
         val areaSize = screenScaleState.areaSize.value
         val targetSize = screenScaleState.targetSize.value.toIntSize()
-        val fitScale = screenScaleState.transformationForZoom(0f).scale
-        val fitPage = fitPageRequirement(targetSize, fitScale) ?: return false
         val panelRequirements = rollingPanelRequirements(
             panels = panelData.panels,
             currentPanelIndex = panelIndex,
@@ -691,16 +693,21 @@ class PanelsReaderState(
         )
         if (panelRequirements.isEmpty()) return false
 
-        val key = RollingWindowKey(image, panelIndex, areaSize, targetSize)
+        val geometryEpoch = panelGeometryEpoch.value
+        val windowKey = PanelWindowKey(panelIndex, geometryEpoch)
+        val key = RollingWindowKey(image, windowKey, areaSize, targetSize)
         rollingWindowKey = key
-        rollingWindowJob = stateScope.launch {
+        rollingWindowJob = internalStateScope.launch {
             try {
-                image.prepareUpdate(
+                image.prepareLayeredPanelWindow(
                     maxDisplaySize = areaSize,
-                    requirements = listOf(fitPage) + panelRequirements,
-                ).close()
+                    windowKey = windowKey,
+                    requirements = panelRequirements,
+                ).lease.close()
             } catch (error: CancellationException) {
                 throw error
+            } catch (_: LayeredPanelWindowUnavailableException) {
+                layeredNavigationUnavailable.value = image
             } catch (error: Throwable) {
                 logger.catching(error)
             }
@@ -722,6 +729,7 @@ class PanelsReaderState(
         val sourcePage = currentPage.value ?: return false
         val panelData = sourcePage.panelData ?: return false
         val image = (sourcePage.imageResult as? ReaderImageResult.Success)?.image ?: return false
+        if (layeredNavigationUnavailable.value === image) return false
         val sourceIndex = currentPageIndex.value
         val areaSize = screenScaleState.areaSize.value
         val targetSize = screenScaleState.targetSize.value.toIntSize()
@@ -734,8 +742,6 @@ class PanelsReaderState(
             panel = panel,
         ) ?: return false
 
-        val fitZoomScale = screenScaleState.transformationForZoom(0f).scale
-        val fitZoomPage = fitPageRequirement(targetSize, fitZoomScale) ?: return false
         val rollingRequirements = rollingPanelRequirements(
             panels = panelData.panels,
             currentPanelIndex = sourceIndex.panel,
@@ -745,18 +751,9 @@ class PanelsReaderState(
             imageSize = panelData.originalImageSize,
         )
         if (rollingRequirements.isEmpty()) return false
-        val transitionRequirements = listOf(fitZoomPage) + rollingRequirements
-        val sharpPairRequirements = rollingPanelRequirements(
-            panels = listOf(panelData.panels[sourceIndex.panel], panel),
-            currentPanelIndex = 0,
-            areaSize = areaSize,
-            targetSize = targetSize,
-            transformationForZoom = screenScaleState::transformationForZoom,
-            imageSize = panelData.originalImageSize,
-        ).distinct()
-        if (sharpPairRequirements.isEmpty()) return false
-        val fallbackRequirements = listOf(fitZoomPage) + sharpPairRequirements
-        val transitionWindowKey = RollingWindowKey(image, sourceIndex.panel, areaSize, targetSize)
+        val geometryEpoch = panelGeometryEpoch.value
+        val panelWindowKey = PanelWindowKey(sourceIndex.panel, geometryEpoch)
+        val transitionWindowKey = RollingWindowKey(image, panelWindowKey, areaSize, targetSize)
 
         val transition = PreparedPanelTransition(
             sourcePage = sourcePage,
@@ -803,19 +800,17 @@ class PanelsReaderState(
                         rollingWindowJob?.join()
                     }
                     val lease = try {
-                        image.prepareUpdate(
+                        image.prepareLayeredPanelWindow(
                             maxDisplaySize = transition.areaSize,
-                            requirements = transitionRequirements,
-                        ).also {
-                            frameSource = PanelTransitionFrameSource.ROLLING_WINDOW
+                            windowKey = panelWindowKey,
+                            requirements = rollingRequirements,
+                        ).lease.also {
+                            frameSource = PanelTransitionFrameSource.LAYERED_PANEL_WINDOW
                         }
-                    } catch (_: TilePixelBudgetExceededException) {
-                        image.prepareUpdate(
-                            maxDisplaySize = transition.areaSize,
-                            requirements = fallbackRequirements,
-                        ).also {
-                            frameSource = PanelTransitionFrameSource.SHARP_PAIR_FALLBACK
-                        }
+                    } catch (_: LayeredPanelWindowUnavailableException) {
+                        layeredNavigationUnavailable.value = image
+                        emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
+                        throw CancellationException("layered panel navigation unavailable")
                     }
                     readinessMillis = transitionStart.elapsedNow().inWholeMilliseconds
                     lease
@@ -1013,7 +1008,7 @@ class PanelsReaderState(
 
     private data class RollingWindowKey(
         val image: ReaderImage,
-        val panelIndex: Int,
+        val windowKey: PanelWindowKey,
         val areaSize: IntSize,
         val targetSize: IntSize,
     )
