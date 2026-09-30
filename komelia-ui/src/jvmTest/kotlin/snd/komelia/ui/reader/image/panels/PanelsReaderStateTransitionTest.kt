@@ -146,6 +146,21 @@ private fun renderedPixelsOf(requirement: ViewportRenderRequirement): Int =
     (requirement.region.width * requirement.zoomFactor).roundToInt() *
         (requirement.region.height * requirement.zoomFactor).roundToInt()
 
+private fun PanelTransitionEvent.loggedField(name: String): String? =
+    Regex("(?:^|[ \\[])$name=([^ \\]]+)").find(toLogLine())?.groupValues?.get(1)
+
+private fun PanelTransitionEvent.resolutionAndCacheFields(): List<Any?> = listOf(
+    frameSource,
+    loggedField("window"),
+    loggedField("baseReused"),
+    loggedField("reused"),
+    loggedField("rendered"),
+    loggedField("upgraded"),
+    loggedField("evicted"),
+    loggedField("live"),
+    loggedField("peak"),
+)
+
 class PanelsReaderStateTransitionTest {
     @Test
     fun `snappy uses 250 milliseconds`() {
@@ -330,7 +345,7 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `readiness reports the wait when the window was not pre-rendered`() = runBlocking {
+    fun `blocked cold input reports its wait and rendered edge count`() = runBlocking {
         val events = CopyOnWriteArrayList<PanelTransitionEvent>()
         val fixture = panelFixture(startPanel = 0, pageFrameAvailable = false)
         try {
@@ -340,7 +355,13 @@ class PanelsReaderStateTransitionTest {
             fixture.delayPreparation(millis = 40)
             fixture.runMovementToCompletion()
 
-            assertTrue(events.last().readinessMillis >= 40)
+            val event = events.last()
+            assertTrue(event.readinessMillis >= 40)
+            assertEquals(
+                fixture.image.layeredRequests.first().requirements.size.toString(),
+                event.loggedField("rendered"),
+            )
+            assertTrue(event.loggedField("rendered")!!.toInt() > 0)
         } finally {
             fixture.close()
         }
@@ -871,7 +892,7 @@ class PanelsReaderStateTransitionTest {
     }
 
     @Test
-    fun `a warm rolling transition reports its measured readiness`() = runBlocking {
+    fun `a settled warm transition reports reused layered window diagnostics`() = runBlocking {
         val events = CopyOnWriteArrayList<PanelTransitionEvent>()
         val fixture = panelFixture(
             pageFrameAvailable = true,
@@ -886,16 +907,45 @@ class PanelsReaderStateTransitionTest {
             assertEquals(1, events.size, "one input must emit exactly one event")
             val event = events.single()
             assertEquals(PanelTransitionFrameSource.LAYERED_PANEL_WINDOW, event.frameSource)
-            assertTrue(event.readinessMillis >= 0L)
+            assertTrue(event.readinessMillis < 10L)
             assertEquals(PanelTransitionMode.SNAPPY, event.mode)
             assertEquals(250, event.durationMillis)
-            assertTrue(
-                "stats" !in event.toLogLine(),
-                "the log line must not carry a field it can never populate: ${event.toLogLine()}",
-            )
+            assertEquals("1@0", event.loggedField("window"))
+            assertEquals("true", event.loggedField("baseReused"))
+            assertEquals("0", event.loggedField("rendered"))
+            assertEquals("0", event.loggedField("upgraded"))
+            assertTrue(event.loggedField("reused")!!.toInt() > 0)
+            assertTrue(event.loggedField("live")!!.toLong() > 0)
+            assertEquals("80000", event.loggedField("peak"))
         } finally {
             fixture.close()
         }
+    }
+
+    @Test
+    fun `transition modes change only movement duration diagnostics`() = runBlocking {
+        val eventsByMode = mutableMapOf<PanelTransitionMode, PanelTransitionEvent>()
+        for (mode in PanelTransitionMode.entries) {
+            val fixture = panelFixture(
+                panels = fivePanels,
+                startPanel = 2,
+                transitionMode = MutableStateFlow(mode),
+            )
+            try {
+                fixture.settleRollingPreparation()
+                fixture.navigateForwardAndFinish()
+                val event = fixture.events.single()
+                assertEquals(mode.durationMillis(), event.durationMillis)
+                eventsByMode[mode] = event
+            } finally {
+                fixture.close()
+            }
+        }
+
+        assertEquals(
+            eventsByMode.getValue(PanelTransitionMode.SNAPPY).resolutionAndCacheFields(),
+            eventsByMode.getValue(PanelTransitionMode.CLASSIC).resolutionAndCacheFields(),
+        )
     }
 
     @Test

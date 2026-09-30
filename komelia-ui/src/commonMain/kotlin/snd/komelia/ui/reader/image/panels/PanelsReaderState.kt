@@ -39,6 +39,7 @@ import snd.komelia.image.ImageRect
 import snd.komelia.image.KomeliaPanelDetector
 import snd.komelia.image.LayeredPanelWindowUnavailableException
 import snd.komelia.image.PanelWindowKey
+import snd.komelia.image.PanelWindowRenderStats
 import snd.komelia.image.ReaderImage
 import snd.komelia.image.ReaderImage.PageId
 import snd.komelia.image.ReaderImageResult
@@ -117,14 +118,30 @@ data class PanelTransitionEvent(
      * before it got as far as choosing one.
      */
     val frameSource: PanelTransitionFrameSource?,
+    /** The immutable overlay window installed for movement, absent if preparation did not finish. */
+    val windowKey: PanelWindowKey?,
+    /** Renderer accounting for that window, absent if preparation did not finish. */
+    val stats: PanelWindowRenderStats?,
     val readinessMillis: Long,
     val movementStartMillis: Long,
     val movementEndMillis: Long,
 ) {
+    val reusedTiles: Int? get() = stats?.reusedTiles
+    val renderedTiles: Int? get() = stats?.renderedTiles
+    val upgradedTiles: Int? get() = stats?.upgradedTiles
+    val evictedTiles: Int? get() = stats?.evictedTiles
+    val baseReused: Boolean? get() = stats?.baseReused
+    val livePixels: Long? get() = stats?.livePixels
+    val peakPixels: Long? get() = stats?.hardPeakPixels
+
     fun toLogLine(): String = "panel transition $generation $outcome mode=$mode " +
         "duration=${durationMillis}ms frame=$frameSource " +
+        "window=${windowKey?.let { "${it.centerPanelIndex}@${it.geometryEpoch}" }} " +
         "readiness=${readinessMillis}ms " +
-        "movement=${movementStartMillis}ms..${movementEndMillis}ms"
+        "movement=${movementStartMillis}ms..${movementEndMillis}ms " +
+        "baseReused=$baseReused " +
+        "overlays=[reused=$reusedTiles rendered=$renderedTiles upgraded=$upgradedTiles " +
+        "evicted=$evictedTiles] pixels=[live=$livePixels peak=$peakPixels]"
 }
 
 /** Where [PanelTransitionEvent]s go. The default sink logs them. */
@@ -767,6 +784,8 @@ class PanelsReaderState(
         val generation = transitionGeneration.updateAndGet { it + 1 }
         val transitionStart = TimeSource.Monotonic.markNow()
         var frameSource: PanelTransitionFrameSource? = null
+        var eventWindowKey: PanelWindowKey? = null
+        var renderStats: PanelWindowRenderStats? = null
         var readinessMillis: Long? = null
         var movementStartMillis: Long? = null
         var movementEndMillis: Long? = null
@@ -784,6 +803,8 @@ class PanelsReaderState(
                     durationMillis = transitionDurationMillis,
                     outcome = outcome,
                     frameSource = frameSource,
+                    windowKey = eventWindowKey,
+                    stats = renderStats,
                     readinessMillis = readinessMillis ?: elapsedMillis,
                     movementStartMillis = movementStartMillis ?: elapsedMillis,
                     movementEndMillis = movementEndMillis ?: elapsedMillis,
@@ -798,13 +819,15 @@ class PanelsReaderState(
                         rollingWindowJob?.join()
                     }
                     val lease = try {
-                        image.prepareLayeredPanelWindow(
+                        val prepared = image.prepareLayeredPanelWindow(
                             maxDisplaySize = transition.areaSize,
                             windowKey = panelWindowKey,
                             requirements = rollingRequirements,
-                        ).lease.also {
-                            frameSource = PanelTransitionFrameSource.LAYERED_PANEL_WINDOW
-                        }
+                        )
+                        frameSource = PanelTransitionFrameSource.LAYERED_PANEL_WINDOW
+                        eventWindowKey = panelWindowKey
+                        renderStats = prepared.stats
+                        prepared.lease
                     } catch (_: LayeredPanelWindowUnavailableException) {
                         layeredNavigationUnavailable.value = image
                         emitTransitionEvent(PanelTransitionOutcome.CANCELLED)
