@@ -117,15 +117,21 @@ private val window123 = listOf(
 )
 
 private val highDensityWindow012 = listOf(
-    exactRequirement(IntRect(10, 10, 20, 20), 9f),
-    exactRequirement(IntRect(210, 10, 220, 20), 9f),
-    exactRequirement(IntRect(410, 10, 420, 20), 9f),
+    exactRequirement(IntRect(10, 10, 20, 20), 11f),
+    exactRequirement(IntRect(210, 10, 220, 20), 11f),
+    exactRequirement(IntRect(410, 10, 420, 20), 11f),
 )
 
 private val highDensityWindow123 = listOf(
-    exactRequirement(IntRect(210, 10, 220, 20), 9f),
-    exactRequirement(IntRect(410, 10, 420, 20), 9f),
-    exactRequirement(IntRect(610, 10, 620, 20), 9f),
+    exactRequirement(IntRect(210, 10, 220, 20), 11f),
+    exactRequirement(IntRect(410, 10, 420, 20), 11f),
+    exactRequirement(IntRect(610, 10, 620, 20), 11f),
+)
+
+private val highDensityWindow234 = listOf(
+    exactRequirement(IntRect(410, 10, 420, 20), 11f),
+    exactRequirement(IntRect(610, 10, 620, 20), 11f),
+    exactRequirement(IntRect(810, 10, 820, 20), 11f),
 )
 
 internal class RenderedTile(
@@ -590,22 +596,36 @@ class TilingReaderImagePreparationTest {
 
     @Test
     fun `over budget window shift preserves the old layered publication`() = runBlocking {
-        val image = preparationFixture(hardPeakDisplayAreas = 2)
+        val image = preparationFixture(hardPeakDisplayAreas = 3)
+        val ownershipLedger = TilePixelLedger(Long.MAX_VALUE)
+        var outgoingFrameOwnership = emptyList<TileOwnership>()
+        var leaseOwnership = emptyList<TileOwnership>()
         image.releaseRendering()
         try {
-            image.prepareLayeredPanelWindow(
+            val first = image.prepareLayeredPanelWindow(
                 screenSize,
                 PanelWindowKey(1, image.visibleEpoch),
                 highDensityWindow012,
-            ).lease.close()
+            )
+            outgoingFrameOwnership = image.retainVisibleFrameOwnership(ownershipLedger)
+            first.lease.close()
+
+            val second = image.prepareLayeredPanelWindow(
+                screenSize,
+                PanelWindowKey(2, image.visibleEpoch),
+                highDensityWindow123,
+            )
+            leaseOwnership = image.retainVisibleFrameOwnership(ownershipLedger)
+            second.lease.close()
+
             val slotBefore = image.visibleSlotForTest()
             val windowBefore = assertNotNull(image.retainedPanelWindowIdentity)
 
             assertFailsWith<TilePixelBudgetExceededException> {
                 image.prepareLayeredPanelWindow(
                     screenSize,
-                    PanelWindowKey(2, image.visibleEpoch),
-                    highDensityWindow123,
+                    PanelWindowKey(3, image.visibleEpoch),
+                    highDensityWindow234,
                 )
             }
 
@@ -616,14 +636,20 @@ class TilingReaderImagePreparationTest {
 
             val baseImage = image.retainedFitBaseTile.renderImage
             val overlayImages = image.renderedTiles.map { it.renderImage }.filter { it !== baseImage }
-            val pageLease = assertNotNull(image.publishPageFrame())
+            leaseOwnership.forEach { it.close() }
             assertTrue(
                 overlayImages.none { overlay -> image.closedImages.any { it === overlay } },
-                "the retained window must keep overlays alive after the outgoing layered frame closes",
+                "the window, visible frame, and outgoing frame must survive lease retirement",
             )
-            pageLease.close()
 
             image.invalidatePanelGeometry()
+            assertEquals(
+                1,
+                overlayImages.count { overlay -> image.closedImages.any { it === overlay } },
+                "only the current-only overlay may close while the outgoing frame remains",
+            )
+
+            outgoingFrameOwnership.forEach { it.close() }
             assertTrue(
                 overlayImages.all { overlay -> image.closedImages.count { it === overlay } == 1 },
                 "the final overlay owner must close every native image exactly once",
@@ -634,6 +660,8 @@ class TilingReaderImagePreparationTest {
                 "the independently retained fit base must survive frame and window retirement",
             )
         } finally {
+            leaseOwnership.forEach { it.close() }
+            outgoingFrameOwnership.forEach { it.close() }
             val renderedCount = image.renderedTiles.size
             image.close()
             withContext(Dispatchers.Default) {
@@ -1408,6 +1436,15 @@ private suspend fun renderDestinationViewport(displaySize: IntSize, zoom: Float)
 
 private fun IntRect.containsRect(other: IntRect): Boolean =
     left <= other.left && top <= other.top && right >= other.right && bottom >= other.bottom
+
+private suspend fun PreparationFixture.retainVisibleFrameOwnership(
+    ledger: TilePixelLedger,
+): List<TileOwnership> {
+    val frame = assertNotNull(visibleSlotForTest().frameData)
+    return frame.retainHandles(ledger).also { ownership ->
+        assertEquals(frame.handleCount, ownership.size)
+    }
+}
 
 private fun preparationFixture(
     imageSize: IntSize = IntSize(4_096, 4_096),
