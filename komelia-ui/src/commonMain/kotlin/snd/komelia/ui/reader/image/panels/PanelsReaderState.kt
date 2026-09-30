@@ -185,7 +185,6 @@ class PanelsReaderState(
     private var resizeJob: Job? = null
     private var rollingWindowJob: Job? = null
     private var rollingWindowKey: RollingWindowKey? = null
-    private val panelGeometryEpoch = MutableStateFlow(0L)
     private val layeredNavigationUnavailable = MutableStateFlow<ReaderImage?>(null)
 
     val pageMetadata: MutableStateFlow<List<PageMetadata>> = MutableStateFlow(emptyList())
@@ -225,7 +224,7 @@ class PanelsReaderState(
             .onEach { areaSize ->
                 val image = (currentPage.value?.imageResult as? ReaderImageResult.Success)?.image
                 if (image != null) {
-                    panelGeometryEpoch.value = image.invalidatePanelGeometry()
+                    image.invalidatePanelGeometry()
                 }
                 val generation = resizeGeneration.updateAndGet { it + 1 }
                 resizeJob?.cancel()
@@ -506,7 +505,6 @@ class PanelsReaderState(
                 logger.info { "current page value ${readyPage.page}" }
                 currentPage.value = readyPage.page
                 layeredNavigationUnavailable.value = null
-                panelGeometryEpoch.value = 0L
                 screenScaleState.enableOverscrollArea(true)
                 screenScaleState.apply(readyPage.scale)
                 panelGeometryAreaSize.value = screenScaleState.areaSize.value
@@ -693,7 +691,7 @@ class PanelsReaderState(
         )
         if (panelRequirements.isEmpty()) return false
 
-        val geometryEpoch = panelGeometryEpoch.value
+        val geometryEpoch = image.panelGeometryEpoch
         val windowKey = PanelWindowKey(panelIndex, geometryEpoch)
         val key = RollingWindowKey(image, windowKey, areaSize, targetSize)
         rollingWindowKey = key
@@ -751,7 +749,7 @@ class PanelsReaderState(
             imageSize = panelData.originalImageSize,
         )
         if (rollingRequirements.isEmpty()) return false
-        val geometryEpoch = panelGeometryEpoch.value
+        val geometryEpoch = image.panelGeometryEpoch
         val panelWindowKey = PanelWindowKey(sourceIndex.panel, geometryEpoch)
         val transitionWindowKey = RollingWindowKey(image, panelWindowKey, areaSize, targetSize)
 

@@ -1218,13 +1218,13 @@ class PanelsReaderStateTransitionTest {
             fixture.image.awaitLayeredPublicationBlocked()
 
             val foldedArea = fixture.screenScaleState.areaSize.value
-            val foldedEpoch = fixture.image.geometryEpoch
+            val foldedEpoch = fixture.image.panelGeometryEpoch
             val unfoldedArea = IntSize(2208, 1840)
             fixture.screenScaleState.setAreaSize(unfoldedArea)
             withTimeout(2_000) {
-                while (fixture.image.geometryEpoch == foldedEpoch) delay(10)
+                while (fixture.image.panelGeometryEpoch == foldedEpoch) delay(10)
             }
-            assertEquals(foldedEpoch + 1, fixture.image.geometryEpoch)
+            assertEquals(foldedEpoch + 1, fixture.image.panelGeometryEpoch)
 
             fixture.image.releaseLayeredPublication()
             withTimeout(2_000) {
@@ -1235,6 +1235,42 @@ class PanelsReaderStateTransitionTest {
             assertTrue(
                 foldedArea !in fixture.image.layeredPublishedSizes,
                 "the invalidated folded painter must never publish: ${fixture.image.layeredPublishedSizes}",
+            )
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun `renderer invalidation is adopted by later layered preparations`() = runBlocking {
+        val fixture = panelFixture(startPanel = 1)
+        try {
+            fixture.settleRollingPreparation()
+            val requestsBeforeInvalidation = fixture.image.layeredRequests.size
+            val rendererEpoch = fixture.image.invalidatePanelGeometry()
+
+            assertTrue(fixture.state.prepareRollingWindow())
+            withTimeout(2_000) {
+                while (fixture.image.layeredRequests.size == requestsBeforeInvalidation) delay(10)
+            }
+            assertEquals(rendererEpoch, fixture.image.layeredRequests.last().windowKey.geometryEpoch)
+
+            fixture.state.nextPanel()
+            fixture.finishMovement()
+            withTimeout(2_000) {
+                while (
+                    fixture.image.layeredRequests.last().windowKey.centerPanelIndex != 2 ||
+                    fixture.image.activeLayeredLeases != 0
+                ) {
+                    delay(10)
+                }
+            }
+
+            assertEquals(2, fixture.state.currentPageIndex.value.panel)
+            assertTrue(
+                fixture.image.layeredRequests
+                    .drop(requestsBeforeInvalidation)
+                    .all { it.windowKey.geometryEpoch == rendererEpoch },
             )
         } finally {
             fixture.close()
@@ -1643,7 +1679,7 @@ private class ControlledReaderImage(
     private val preparedReleases = AtomicInteger()
     private val layeredLeases = AtomicInteger()
     private val coverage = AtomicReference<IntRect?>(null)
-    private val panelGeometryEpoch = AtomicLong()
+    private val panelGeometryEpochValue = AtomicLong()
     private val layeredPublicationGate = AtomicReference(CompletableDeferred<Unit>().apply { complete(Unit) })
     private val layeredPublicationReached = AtomicReference(CompletableDeferred<Unit>())
 
@@ -1661,8 +1697,6 @@ private class ControlledReaderImage(
     val pageFrameLeaseReleases: Int get() = pageFrameReleases.get()
     val preparedLeaseReleases: Int get() = preparedReleases.get()
     val activeLayeredLeases: Int get() = layeredLeases.get()
-    val geometryEpoch: Long get() = panelGeometryEpoch.get()
-
     @Volatile
     var currentPanelIndex: () -> Int = { -1 }
 
@@ -1719,9 +1753,10 @@ private class ControlledReaderImage(
     override val currentSize = MutableStateFlow<IntSize?>(imageSize)
     override val painter = MutableStateFlow<Painter?>(null)
     override val error = MutableStateFlow<Throwable?>(null)
+    override val panelGeometryEpoch: Long get() = panelGeometryEpochValue.get()
 
     override fun invalidatePanelGeometry(): Long {
-        val epoch = panelGeometryEpoch.incrementAndGet()
+        val epoch = panelGeometryEpochValue.incrementAndGet()
         installLock.withLock {
             coverage.set(null)
             painter.value = null
@@ -1803,7 +1838,7 @@ private class ControlledReaderImage(
         withContext(NonCancellable) {
             layeredPublicationReached.get().complete(Unit)
             layeredPublicationGate.get().await()
-            if (windowKey.geometryEpoch != panelGeometryEpoch.get()) {
+            if (windowKey.geometryEpoch != panelGeometryEpochValue.get()) {
                 throw RenderInvalidatedException()
             }
 

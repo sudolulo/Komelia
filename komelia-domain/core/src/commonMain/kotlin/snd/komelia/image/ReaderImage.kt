@@ -66,6 +66,13 @@ interface ReaderImage : AutoCloseable {
     val error: StateFlow<Throwable?>
 
     /**
+     * The renderer-owned epoch that layered panel window keys must capture.
+     *
+     * Non-layered implementations and test doubles intentionally remain on epoch zero.
+     */
+    val panelGeometryEpoch: Long get() = 0L
+
+    /**
      * Atomically invalidates panel geometry before replacement rendering is queued.
      *
      * Non-layered implementations and test doubles intentionally have no geometry epoch.

@@ -233,6 +233,7 @@ class TilingReaderImagePreparationTest {
 
             assertFailsWith<RenderInvalidatedException> { stale.await() }
             assertEquals(epoch, image.visibleEpoch)
+            assertEquals(epoch, image.panelGeometryEpoch)
             assertNull(image.painter.value)
             assertEquals(0, image.visibleSlotPublicationCount)
         } finally {
@@ -1498,6 +1499,7 @@ private class DelegatingPreparationFixture(
     override val currentSize: StateFlow<IntSize?> get() = delegate.currentSize
     override val painter: StateFlow<androidx.compose.ui.graphics.painter.Painter?> get() = delegate.painter
     override val error: StateFlow<Throwable?> get() = delegate.error
+    override val panelGeometryEpoch: Long get() = delegate.panelGeometryEpoch
     override val painterPublications: Int get() = delegate.painterPublications
     override val currentTileCoverage: IntRect? get() = delegate.currentTileCoverage
     override val publishedRegions: List<IntRect> get() = delegate.publishedRegions

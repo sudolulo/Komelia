@@ -308,6 +308,9 @@ abstract class TilingReaderImage(
         }
     }
 
+    final override val panelGeometryEpoch: Long
+        get() = visibleSlot.value.epoch
+
     final override fun invalidatePanelGeometry(): Long {
         animationScope.coroutineContext.cancelChildren()
         while (true) {
