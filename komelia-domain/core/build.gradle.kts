@@ -12,6 +12,21 @@ plugins {
 group = "io.github.snd-r.komelia.domain.core"
 version = "unspecified"
 
+// PageFrameRetentionMeasurement is a measurement harness, not a test: it renders billions of
+// real pixels and prints numbers. It is kept out of the ordinary suite here rather than with
+// @Ignore, so that it stays selectable. Run it with exactly:
+//   ./gradlew :komelia-domain:core:jvmTest -PkomeliaMeasurement \
+//       --tests 'snd.komelia.image.PageFrameRetentionMeasurement' --rerun-tasks --console=plain
+val komeliaMeasurementEnabled = providers.gradleProperty("komeliaMeasurement").isPresent
+tasks.withType<Test>().configureEach {
+    if (komeliaMeasurementEnabled) {
+        maxHeapSize = "4g"
+        testLogging { showStandardStreams = true }
+    } else {
+        exclude("**/PageFrameRetentionMeasurement*")
+    }
+}
+
 kotlin {
     android {
         namespace = "io.github.snd_r.komelia.domain.core"

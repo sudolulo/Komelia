@@ -1026,7 +1026,20 @@ class PanelsReaderStateTransitionTest {
             )
 
             withTimeout(2_000) {
-                while (fixture.image.preparedLeaseReleases == 0) delay(10)
+                var previousPrepareCount = -1
+                var stableChecks = 0
+                while (stableChecks < 3) {
+                    delay(10)
+                    val prepareCount = fixture.image.prepareRequests.size
+                    val allReleased = fixture.image.preparedLeaseReleases == prepareCount
+                    val movementFinished = events.any { it.outcome == PanelTransitionOutcome.ANIMATED }
+                    if (movementFinished && allReleased && prepareCount == previousPrepareCount) {
+                        stableChecks++
+                    } else {
+                        stableChecks = 0
+                    }
+                    previousPrepareCount = prepareCount
+                }
             }
             assertEquals(
                 fixture.image.prepareRequests.size,
@@ -1603,13 +1616,6 @@ private class ControlledReaderImage(
     @Volatile
     var pageFrameAvailable: Boolean = pageFrameAvailable
 
-    /**
-     * The fitted page size the retained page frame was rendered for. The double never re-renders
-     * a page frame for a new size: an ordinary viewport update is asynchronous in the renderer,
-     * so a transition that follows a resize finds the frame of the size before it, and is refused.
-     */
-    private val pageFrameDisplaySize: IntSize = fixtureAreaSize
-
     val nativeRenders: Int get() = renders.get()
     val pageFramePublications: Int get() = pageFramePublishCount.get()
     val pageFrameLeaseReleases: Int get() = pageFrameReleases.get()
@@ -1666,13 +1672,10 @@ private class ControlledReaderImage(
         install(Publication.TILED, visibleDisplaySize, FixturePainter("tiled $visibleDisplaySize"))
     }
 
-    override suspend fun publishPageFrame(displayArea: IntSize): PreparedUpdateLease? {
+    override suspend fun publishPageFrame(): PreparedUpdateLease? {
         pageFramePublicationStarted.complete(Unit)
         pageFrameGate.get().await()
         if (!pageFrameAvailable) return null
-        // the retained frame's tiles carry absolute display coordinates, so the renderer refuses
-        // to publish one whose geometry no longer matches the caller's page; so does this double
-        if (displayArea != pageFrameDisplaySize) return null
 
         pageFramePublishCount.incrementAndGet()
         install(Publication.PAGE_FRAME, pageRegion, pageFramePainter)
@@ -1682,6 +1685,7 @@ private class ControlledReaderImage(
     override suspend fun prepareUpdate(
         maxDisplaySize: IntSize,
         requirements: List<ViewportRenderRequirement>,
+        isStillValid: () -> Boolean,
     ): PreparedUpdateLease {
         val request = PrepareRequest(maxDisplaySize, requirements)
         prepareRequests += request
@@ -1697,6 +1701,7 @@ private class ControlledReaderImage(
             preparationGate.get().await()
         }
 
+        if (!isStillValid()) throw kotlinx.coroutines.CancellationException("image update is obsolete")
         render(requirements)
         val installed = requirements.map { it.region }.reduce { left, right ->
             IntRect(
@@ -1709,6 +1714,11 @@ private class ControlledReaderImage(
         install(Publication.TILED, installed, FixturePainter("tiled $installed"))
         return PreparedUpdateLease { preparedReleases.incrementAndGet() }
     }
+
+    override suspend fun prepareUpdate(
+        maxDisplaySize: IntSize,
+        requirements: List<ViewportRenderRequirement>,
+    ): PreparedUpdateLease = prepareUpdate(maxDisplaySize, requirements) { true }
 
     private fun install(publication: Publication, region: IntRect, frame: Painter) {
         installLock.withLock {
