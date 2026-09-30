@@ -114,6 +114,9 @@ abstract class TilingReaderImage(
     /** Fit-only full page storage. Ordinary full resizes never mutate this slot. */
     private val retainedFitBase = MutableStateFlow<RetainedFitPageBase?>(null)
 
+    /** Accounts for every native bitmap and in-flight reservation owned by this reader image. */
+    private val pixelLedger = TilePixelLedger(0)
+
     internal val retainedFitPageBase: RetainedFitPageBase?
         get() = retainedFitBase.value
 
@@ -399,9 +402,12 @@ abstract class TilingReaderImage(
                     ensureUpdateIsCurrent(isStillValid)
                     error.value = null
                     // the lease owns the exact handle set that satisfied readiness
-                    leaseOwnership = frameData.value?.retainHandles() ?: emptyList()
+                    leaseOwnership = frameData.value?.retainHandles(pixelLedger) ?: emptyList()
                     prepared.complete(
-                        PreparedUpdateResult(lease, stats.toTransitionStats(retainedPixels()))
+                        PreparedUpdateResult(
+                            lease,
+                            stats.toTransitionStats(pixelLedger.snapshot().livePixels),
+                        )
                     )
                     lease.awaitRelease()
                 } catch (e: CancellationException) {
@@ -458,7 +464,7 @@ abstract class TilingReaderImage(
                         return@submitDemand
                     }
 
-                    frameOwnership = page.handles.mapNotNull { it.retain() }
+                    frameOwnership = page.handles.mapNotNull { pixelLedger.retain(it) }
                     if (frameOwnership.size != page.handles.size) {
                         // the frame died between the availability check and the reference
                         logger.warn { "page ${pageId.pageNumber} lost its page frame before publication" }
@@ -581,12 +587,10 @@ abstract class TilingReaderImage(
         this.currentSize.value = IntSize(dstWidth.roundToInt(), dstHeight.roundToInt())
 
         val tileSize = tileSizeFor((dstWidth * dstHeight).roundToInt())
-        val budget = TilePixelBudget(
-            hardPeakPixels = hardPeakDisplayAreas.toLong() * displaySize.width * displaySize.height,
-        )
 
         repeat(maxGenerationRetries) {
             val generation = generationFor(displaySize)
+            pixelLedger.setHardPeakPixels(hardPeakPixelsFor(displaySize))
             val result = if (image.pagesLoaded > 1 || tileSize == null) {
                 doFullResize(
                     image = image,
@@ -607,7 +611,6 @@ abstract class TilingReaderImage(
                     displayArea = displaySize,
                     tileSize = tileSize,
                     generation = generation,
-                    budget = budget,
                     readiness = request.readiness,
                     stats = stats,
                     isStillValid = isStillValid,
@@ -646,6 +649,7 @@ abstract class TilingReaderImage(
 
         val dstWidth = checkedRenderDimension(image.width, scaleFactor)
         val dstHeight = checkedRenderDimension(image.pageHeight, scaleFactor)
+        val requiredSize = IntSize(dstWidth, dstHeight)
         val sourceBounds = IntRect(0, 0, image.width, image.pageHeight)
         val tileDisplayRegion = Rect(
             0f,
@@ -655,24 +659,37 @@ abstract class TilingReaderImage(
         )
 
         ensureUpdateIsCurrent(isStillValid)
-        val resizedImage = resizeImage(image, dstWidth, dstHeight)
-        stats.renderedTiles += 1
-        requireSatisfiedSize(resizedImage, IntSize(dstWidth, dstHeight))
-
-        if (!isStillValid()) {
-            resizedImage.frames.forEach { closeRenderImage(it) }
-            throw CancellationException("image update is obsolete")
+        val reservations = reserveFramePixels(image.pagesLoaded, requiredSize)
+        val resizedImage = try {
+            resizeImage(image, dstWidth, dstHeight)
+        } catch (e: Throwable) {
+            reservations.forEach { it.close() }
+            throw e
         }
-        if (generationFor(displayArea) != generation) {
-            resizedImage.frames.forEach { closeRenderImage(it) }
-            return UpdateResult.STALE
-        }
-
         val frameOwnership = mutableListOf<TileOwnership>()
         val frameHandles = mutableListOf<TileHandle>()
         val frames = mutableListOf<ImageFrame>()
+        var ownedFrameCount = 0
+        var rawFramesAlreadyClosed = false
         var succeeded = false
         try {
+            stats.renderedTiles += 1
+            try {
+                requireSatisfiedSize(resizedImage, requiredSize)
+            } catch (e: Throwable) {
+                rawFramesAlreadyClosed = true
+                throw e
+            }
+
+            ensureUpdateIsCurrent(isStillValid)
+            if (generationFor(displayArea) != generation) return UpdateResult.STALE
+            if (resizedImage.frames.size > reservations.size) {
+                throw IllegalStateException(
+                    "page ${pageId.pageNumber} returned ${resizedImage.frames.size} frames " +
+                        "after reserving ${reservations.size}"
+                )
+            }
+
             resizedImage.frames.forEachIndexed { index, renderImage ->
                 val owned = TileHandle.create(
                     renderImage = renderImage,
@@ -683,10 +700,13 @@ abstract class TilingReaderImage(
                     renderGeneration = generation,
                     closeImage = { closeRenderImage(it) },
                 )
-                frameOwnership += owned.ownership
-                frameHandles += owned.handle
+                ownedFrameCount = index + 1
+                val admitted = pixelLedger.attach(reservations[index], owned)
+                    ?: return UpdateResult.STALE
+                frameOwnership += admitted.ownership
+                frameHandles += admitted.handle
                 frames += ImageFrame(
-                    tiles = listOf(readerTileOf(owned.handle)),
+                    tiles = listOf(readerTileOf(admitted.handle)),
                     delay = resizedImage.delays?.getOrNull(index) ?: defaultFrameDelay,
                 )
             }
@@ -711,8 +731,12 @@ abstract class TilingReaderImage(
             logger.info { "page ${pageId.pageNumber} completed full resize to $dstWidth x $dstHeight" }
             return UpdateResult.PUBLISHED
         } finally {
+            reservations.forEach { it.close() }
             if (!succeeded) {
                 frameOwnership.forEach { it.close() }
+                if (!rawFramesAlreadyClosed) {
+                    resizedImage.frames.drop(ownedFrameCount).forEach { closeRenderImage(it) }
+                }
             }
         }
     }
@@ -727,7 +751,6 @@ abstract class TilingReaderImage(
         displayArea: IntSize,
         tileSize: Int,
         generation: Long,
-        budget: TilePixelBudget,
         readiness: CompletableDeferred<Unit>?,
         stats: RenderPassStats,
         isStillValid: () -> Boolean,
@@ -754,7 +777,7 @@ abstract class TilingReaderImage(
                 val key = TileCacheKey(tileRegion, tileDisplayRegion, generation)
                 val retained = retainedTiles.value[key]
                 if (retained != null && retained.handle.isSufficientFor(requiredSize)) {
-                    val frameOwnership = budget.retain(retained.handle)
+                    val frameOwnership = pixelLedger.retain(retained.handle)
                     if (frameOwnership != null) {
                         stats.reusedTiles += 1
                         passTiles += PassTile(
@@ -780,7 +803,7 @@ abstract class TilingReaderImage(
                     !retained.handle.isSufficientFor(requiredSize)
 
                 ensureUpdateIsCurrent(isStillValid)
-                val reservation = budget.reserve(requiredSize.width, requiredSize.height)
+                val reservation = pixelLedger.reserve(requiredSize)
                     ?: throw TilePixelBudgetExceededException(
                         "page ${pageId.pageNumber} rolling window exceeds " +
                             "$hardPeakDisplayAreas display areas"
@@ -791,50 +814,52 @@ abstract class TilingReaderImage(
                     reservation.close()
                     throw e
                 }
-                stats.renderedTiles += 1
-                if (upgradesRetainedTile) stats.upgradedTiles += 1
-                requireSatisfiedSize(rendered, requiredSize)
+                try {
+                    stats.renderedTiles += 1
+                    if (upgradesRetainedTile) stats.upgradedTiles += 1
+                    requireSatisfiedSize(rendered, requiredSize)
 
-                if (!isStillValid()) {
-                    reservation.close()
-                    rendered.frames.forEach { closeRenderImage(it) }
-                    throw CancellationException("image update is obsolete")
-                }
-                if (generationFor(displayArea) != generation) {
-                    reservation.close()
-                    rendered.frames.forEach { closeRenderImage(it) }
-                    return UpdateResult.STALE
-                }
+                    if (!isStillValid()) {
+                        rendered.frames.forEach { closeRenderImage(it) }
+                        throw CancellationException("image update is obsolete")
+                    }
+                    if (generationFor(displayArea) != generation) {
+                        rendered.frames.forEach { closeRenderImage(it) }
+                        return UpdateResult.STALE
+                    }
 
-                // the tiled path draws a single frame; any extra frame is ours to close
-                rendered.frames.drop(1).forEach { closeRenderImage(it) }
-                val owned = TileHandle.create(
-                    renderImage = rendered.frames.first(),
-                    sourceBounds = tileRegion,
-                    displayRegion = tileDisplayRegion,
-                    renderSize = IntSize(rendered.width, rendered.height),
-                    satisfiedSize = rendered.satisfiedSize,
-                    renderGeneration = generation,
-                    closeImage = { closeRenderImage(it) },
-                )
-                val admitted = reservation.attach(owned) ?: return UpdateResult.STALE
-                val frameOwnership = admitted.handle.retain()
-                if (frameOwnership == null) {
-                    admitted.ownership.close()
-                    throw IllegalStateException(
-                        "page ${pageId.pageNumber} could not take ownership of a rendered tile"
+                    // the tiled path draws a single frame; any extra frame is ours to close
+                    rendered.frames.drop(1).forEach { closeRenderImage(it) }
+                    val owned = TileHandle.create(
+                        renderImage = rendered.frames.first(),
+                        sourceBounds = tileRegion,
+                        displayRegion = tileDisplayRegion,
+                        renderSize = IntSize(rendered.width, rendered.height),
+                        satisfiedSize = rendered.satisfiedSize,
+                        renderGeneration = generation,
+                        closeImage = { closeRenderImage(it) },
                     )
-                }
+                    val admitted = pixelLedger.attach(reservation, owned) ?: return UpdateResult.STALE
+                    val frameOwnership = pixelLedger.retain(admitted.handle)
+                    if (frameOwnership == null) {
+                        admitted.ownership.close()
+                        throw IllegalStateException(
+                            "page ${pageId.pageNumber} could not take ownership of a rendered tile"
+                        )
+                    }
 
-                putRetainedTile(key, admitted.handle, admitted.ownership)
-                passTiles += PassTile(
-                    key = key,
-                    handle = admitted.handle,
-                    frameOwnership = frameOwnership,
-                    insertedOwnership = admitted.ownership,
-                    tile = readerTileOf(admitted.handle),
-                )
-                addedNewTiles = true
+                    putRetainedTile(key, admitted.handle, admitted.ownership)
+                    passTiles += PassTile(
+                        key = key,
+                        handle = admitted.handle,
+                        frameOwnership = frameOwnership,
+                        insertedOwnership = admitted.ownership,
+                        tile = readerTileOf(admitted.handle),
+                    )
+                    addedNewTiles = true
+                } finally {
+                    reservation.close()
+                }
             }
 
             val activeKeys = passTiles.mapTo(mutableSetOf()) { it.key }
@@ -891,6 +916,34 @@ abstract class TilingReaderImage(
         else -> 256
     }
 
+    private fun hardPeakPixelsFor(displaySize: IntSize): Long {
+        val displayPixels = checkedPixelCount(displaySize)
+        val displayAreas = hardPeakDisplayAreas.toLong()
+        require(displayAreas >= 0) { "hard peak display areas must not be negative" }
+        check(displayAreas == 0L || displayPixels <= Long.MAX_VALUE / displayAreas)
+        return displayPixels * displayAreas
+    }
+
+    private suspend fun reserveFramePixels(
+        frameCount: Int,
+        size: IntSize,
+    ): List<PixelReservation> {
+        require(frameCount > 0) { "a rendered image must contain at least one frame" }
+        val reservations = mutableListOf<PixelReservation>()
+        try {
+            repeat(frameCount) {
+                reservations += pixelLedger.reserve(size)
+                    ?: throw TilePixelBudgetExceededException(
+                        "page ${pageId.pageNumber} render exceeds $hardPeakDisplayAreas display areas"
+                    )
+            }
+            return reservations
+        } catch (e: Throwable) {
+            reservations.forEach { it.close() }
+            throw e
+        }
+    }
+
     private fun ensureUpdateIsCurrent(isStillValid: () -> Boolean) {
         if (!isStillValid()) throw CancellationException("image update is obsolete")
     }
@@ -942,16 +995,6 @@ abstract class TilingReaderImage(
             yTaken = (yTaken + tileSize).coerceAtMost(image.height)
         }
         return geometries
-    }
-
-    /** Unique live native pixels the retained working set holds; a shared handle counts once. */
-    private fun retainedPixels(): Long {
-        val counted = mutableSetOf<TileHandle>()
-        var pixels = 0L
-        for (tile in retainedTiles.value.values) {
-            if (counted.add(tile.handle)) pixels += tile.handle.pixelCount
-        }
-        return pixels
     }
 
     private fun readerTileOf(handle: TileHandle) = ReaderImageTile(
@@ -1038,25 +1081,17 @@ abstract class TilingReaderImage(
         }
 
         val generation = generationFor(fittedSize)
+        pixelLedger.setHardPeakPixels(hardPeakPixelsFor(fittedSize))
         retainedFitBase.value?.takeIf {
             it.generation == generation && !isMaterialDisplayChange(it.displaySize, fittedSize)
         }?.let { return it }
 
-        val resized = resizeImage(currentImage, fittedSize.width, fittedSize.height)
-        requireSatisfiedSize(resized, fittedSize)
-        if (resized.width != fittedSize.width || resized.height != fittedSize.height) {
-            resized.frames.forEach { closeRenderImage(it) }
-            throw IllegalStateException(
-                "page ${pageId.pageNumber} fit base returned ${resized.width} x ${resized.height} " +
-                    "for fitted ${fittedSize.width} x ${fittedSize.height}"
-            )
-        }
-        if (resized.frames.isEmpty()) {
-            throw IllegalStateException("page ${pageId.pageNumber} fit base returned no frames")
-        }
-        if (generationFor(fittedSize) != generation) {
-            resized.frames.forEach { closeRenderImage(it) }
-            return ensureFitPageBaseOnLane(maxDisplaySize)
+        val reservations = reserveFramePixels(currentImage.pagesLoaded, fittedSize)
+        val resized = try {
+            resizeImage(currentImage, fittedSize.width, fittedSize.height)
+        } catch (e: Throwable) {
+            reservations.forEach { it.close() }
+            throw e
         }
 
         val sourceBounds = IntRect(0, 0, currentImage.width, currentImage.pageHeight)
@@ -1064,8 +1099,38 @@ abstract class TilingReaderImage(
         val handles = mutableListOf<TileHandle>()
         val ownership = mutableListOf<TileOwnership>()
         val frames = mutableListOf<ImageFrame>()
+        var ownedFrameCount = 0
+        var rawFramesAlreadyClosed = false
         var succeeded = false
         try {
+            try {
+                requireSatisfiedSize(resized, fittedSize)
+            } catch (e: Throwable) {
+                rawFramesAlreadyClosed = true
+                throw e
+            }
+            if (resized.width != fittedSize.width || resized.height != fittedSize.height) {
+                throw IllegalStateException(
+                    "page ${pageId.pageNumber} fit base returned ${resized.width} x ${resized.height} " +
+                        "for fitted ${fittedSize.width} x ${fittedSize.height}"
+                )
+            }
+            if (resized.frames.isEmpty()) {
+                throw IllegalStateException("page ${pageId.pageNumber} fit base returned no frames")
+            }
+            if (resized.frames.size > reservations.size) {
+                throw IllegalStateException(
+                    "page ${pageId.pageNumber} fit base returned ${resized.frames.size} frames " +
+                        "after reserving ${reservations.size}"
+                )
+            }
+            if (generationFor(fittedSize) != generation) {
+                resized.frames.forEach { closeRenderImage(it) }
+                rawFramesAlreadyClosed = true
+                reservations.forEach { it.close() }
+                return ensureFitPageBaseOnLane(maxDisplaySize)
+            }
+
             resized.frames.forEachIndexed { index, renderImage ->
                 val owned = TileHandle.create(
                     renderImage = renderImage,
@@ -1076,10 +1141,15 @@ abstract class TilingReaderImage(
                     renderGeneration = generation,
                     closeImage = { closeRenderImage(it) },
                 )
-                handles += owned.handle
-                ownership += owned.ownership
+                ownedFrameCount = index + 1
+                val admitted = pixelLedger.attach(reservations[index], owned)
+                    ?: throw TilePixelBudgetExceededException(
+                        "page ${pageId.pageNumber} fit base exceeded its pixel reservation"
+                    )
+                handles += admitted.handle
+                ownership += admitted.ownership
                 frames += ImageFrame(
-                    tiles = listOf(readerTileOf(owned.handle)),
+                    tiles = listOf(readerTileOf(admitted.handle)),
                     delay = resized.delays?.getOrNull(index) ?: defaultFrameDelay,
                 )
             }
@@ -1095,7 +1165,13 @@ abstract class TilingReaderImage(
             succeeded = true
             return retained
         } finally {
-            if (!succeeded) ownership.forEach { it.close() }
+            reservations.forEach { it.close() }
+            if (!succeeded) {
+                ownership.forEach { it.close() }
+                if (!rawFramesAlreadyClosed) {
+                    resized.frames.drop(ownedFrameCount).forEach { closeRenderImage(it) }
+                }
+            }
         }
     }
 
@@ -1223,7 +1299,8 @@ abstract class TilingReaderImage(
          * Takes an independent reference to every handle that satisfied readiness, so a held
          * preparation lease keeps its coverage alive regardless of what the frame does next.
          */
-        fun retainHandles(): List<TileOwnership> = handles.mapNotNull { it.retain() }
+        suspend fun retainHandles(ledger: TilePixelLedger): List<TileOwnership> =
+            handles.mapNotNull { ledger.retain(it) }
 
         /** Releases the frame this one replaced, once this frame's painter is actually visible. */
         fun releaseRetired() {

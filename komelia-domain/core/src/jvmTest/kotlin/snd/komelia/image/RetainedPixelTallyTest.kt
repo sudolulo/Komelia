@@ -1,8 +1,10 @@
 package snd.komelia.image
 
 import androidx.compose.ui.unit.IntSize
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 class RetainedPixelTallyTest {
     @Test
@@ -49,6 +51,22 @@ class RetainedPixelTallyTest {
         val tally = RetainedPixelTally(retained)
 
         assertEquals(16L, tally.remove(handleOf(9, 9)))
+    }
+
+    @Test
+    fun `old window and new edge coexist inside the hard peak`() = runTest {
+        val ledger = TilePixelLedger(80_000)
+        val sharedA = admittedTile(ledger, IntSize(100, 100))
+        val sharedB = admittedTile(ledger, IntSize(100, 100))
+        val oldEdge = admittedTile(ledger, IntSize(100, 100))
+        val newEdge = admittedTile(ledger, IntSize(100, 100))
+
+        assertTrue(ledger.snapshot().livePixels <= 80_000L)
+
+        oldEdge.ownership.close()
+        sharedA.ownership.close()
+        sharedB.ownership.close()
+        newEdge.ownership.close()
     }
 }
 

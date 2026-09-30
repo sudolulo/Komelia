@@ -12,29 +12,45 @@ import kotlinx.coroutines.withContext
  */
 class TilePixelBudgetExceededException(message: String) : IllegalStateException(message)
 
-internal class TilePixelBudget(
-    private val hardPeakPixels: Long,
+internal class TilePixelLedger(
+    hardPeakPixels: Long,
 ) {
     private val mutex = Mutex()
     private val liveHandles = mutableMapOf<TileHandle, Long>()
     private var livePixels = 0L
     private var reservedPixels = 0L
+    private var hardPeakPixels = hardPeakPixels
 
     init {
         require(hardPeakPixels >= 0)
     }
 
-    suspend fun reserve(width: Int, height: Int): PixelReservation? {
-        val pixelCount = checkedPixelCount(IntSize(width, height))
+    suspend fun setHardPeakPixels(hardPeakPixels: Long) {
+        require(hardPeakPixels >= 0)
+        withContext(NonCancellable) {
+            mutex.withLock {
+                removeClosedHandles()
+                if (livePixels + reservedPixels > hardPeakPixels) {
+                    throw TilePixelBudgetExceededException(
+                        "cannot lower tile pixel peak to $hardPeakPixels while " +
+                            "$livePixels live and $reservedPixels reserved pixels remain"
+                    )
+                }
+                this@TilePixelLedger.hardPeakPixels = hardPeakPixels
+            }
+        }
+    }
+
+    suspend fun reserve(size: IntSize): PixelReservation? {
+        val pixelCount = checkedPixelCount(size)
         return mutex.withLock {
             removeClosedHandles()
             if (!canAdmit(pixelCount)) return@withLock null
 
             reservedPixels += pixelCount
             PixelReservation(
-                budget = this,
-                width = width,
-                height = height,
+                ledger = this,
+                size = size,
                 pixelCount = pixelCount,
             )
         }
@@ -61,19 +77,22 @@ internal class TilePixelBudget(
         return ownership.takeIf { admitted }
     }
 
-    internal suspend fun attach(
+    suspend fun attach(
         reservation: PixelReservation,
         tile: OwnedTile,
     ): OwnedTile? {
         val attached = withContext(NonCancellable) {
             mutex.withLock {
+                require(reservation.ledger === this@TilePixelLedger) {
+                    "pixel reservation belongs to a different ledger"
+                }
                 removeClosedHandles()
                 if (!reservation.active) return@withLock false
 
                 reservation.active = false
                 reservedPixels -= reservation.pixelCount
                 val actualSize = tile.handle.renderSize
-                if (actualSize.width > reservation.width || actualSize.height > reservation.height) {
+                if (actualSize.width > reservation.size.width || actualSize.height > reservation.size.height) {
                     return@withLock false
                 }
 
@@ -92,11 +111,23 @@ internal class TilePixelBudget(
     internal suspend fun cancel(reservation: PixelReservation) {
         withContext(NonCancellable) {
             mutex.withLock {
+                require(reservation.ledger === this@TilePixelLedger) {
+                    "pixel reservation belongs to a different ledger"
+                }
                 if (!reservation.active) return@withLock
                 reservation.active = false
                 reservedPixels -= reservation.pixelCount
             }
         }
+    }
+
+    suspend fun snapshot(): TilePixelLedgerSnapshot = mutex.withLock {
+        removeClosedHandles()
+        TilePixelLedgerSnapshot(
+            livePixels = livePixels,
+            reservedPixels = reservedPixels,
+            hardPeakPixels = hardPeakPixels,
+        )
     }
 
     private fun canAdmit(pixelCount: Long): Boolean {
@@ -112,15 +143,18 @@ internal class TilePixelBudget(
     }
 }
 
+internal data class TilePixelLedgerSnapshot(
+    val livePixels: Long,
+    val reservedPixels: Long,
+    val hardPeakPixels: Long,
+)
+
 internal class PixelReservation internal constructor(
-    private val budget: TilePixelBudget,
-    internal val width: Int,
-    internal val height: Int,
+    internal val ledger: TilePixelLedger,
+    internal val size: IntSize,
     internal val pixelCount: Long,
 ) {
     internal var active = true
 
-    suspend fun attach(tile: OwnedTile): OwnedTile? = budget.attach(this, tile)
-
-    suspend fun close() = budget.cancel(this)
+    suspend fun close() = ledger.cancel(this)
 }

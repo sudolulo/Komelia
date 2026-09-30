@@ -3,6 +3,7 @@ package snd.komelia.image
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
+import kotlinx.coroutines.test.runTest
 import org.jetbrains.skia.Bitmap
 import org.jetbrains.skia.ColorAlphaType
 import org.jetbrains.skia.ColorInfo
@@ -49,6 +50,25 @@ class TileHandleTest {
         lease.close()
         assertEquals(1, closed.get())
         assertNull(created.handle.retain())
+    }
+
+    @Test
+    fun `shared handle counts once while independent owners close separately`() = runTest {
+        val ledger = TilePixelLedger(1_000_000)
+        val tile = tileHandle(renderSize = IntSize(100, 100))
+        val baseOwner = requireNotNull(ledger.retain(tile.handle))
+        val windowOwner = requireNotNull(ledger.retain(tile.handle))
+        val frameOwner = requireNotNull(ledger.retain(tile.handle))
+        assertEquals(10_000L, ledger.snapshot().livePixels)
+
+        baseOwner.close()
+        windowOwner.close()
+        assertFalse(tile.handle.isClosed)
+        assertEquals(10_000L, ledger.snapshot().livePixels)
+        frameOwner.close()
+        tile.ownership.close()
+        assertTrue(tile.handle.isClosed)
+        assertEquals(0L, ledger.snapshot().livePixels)
     }
 
     @Test
@@ -105,6 +125,11 @@ internal fun tileHandle(
             onClose()
         },
     )
+}
+
+internal suspend fun admittedTile(ledger: TilePixelLedger, size: IntSize): OwnedTile {
+    val reservation = requireNotNull(ledger.reserve(size))
+    return requireNotNull(ledger.attach(reservation, tileHandle(renderSize = size)))
 }
 
 private fun renderImage(size: IntSize): Image {
