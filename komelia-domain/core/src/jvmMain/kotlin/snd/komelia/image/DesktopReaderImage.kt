@@ -49,10 +49,8 @@ class DesktopReaderImage(
     init {
         upscaler?.upscaleMode?.drop(1)?.onEach {
             invalidateRenderGeneration()
-            lastUpdateRequest?.let {
-                this.painter.value = null
-                reloadLastRequest()
-            }
+            invalidatePanelGeometry()
+            reloadLastRequest()
         }?.launchIn(processingScope)
     }
 

@@ -116,8 +116,15 @@ internal interface PreparationFixture : ReaderImage {
     val hasRetainedPageFrame: Boolean
     val fullResizeCount: Int
     val regionRenderCount: Int
+    val visibleEpoch: Long
+    val visibleSlotPublicationCount: Int
+    override fun invalidatePanelGeometry(): Long
     suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize)
     fun retainedFitBaseForTest(): RetainedFitPageBase
+    fun visibleSlotForTest(): VisibleFrameSlot
+    fun gateBeforeVisibleSlotCas()
+    suspend fun awaitVisibleSlotCasGate()
+    fun releaseVisibleSlotCasGate()
     fun replacePageImage()
     suspend fun awaitPageReplacement()
     fun releasePageReplacement()
@@ -133,10 +140,12 @@ internal interface PreparationFixture : ReaderImage {
     fun releaseRenderBlock()
     fun failNextRender(error: Throwable)
     fun failRenderAfter(successes: Int, error: Throwable)
+    fun failNextPainter(error: Throwable)
     fun returnSourceCappedResults(enabled: Boolean)
     fun returnUnprovenUndersizedResults(enabled: Boolean)
     fun triggerSettingsReload()
     fun changeRenderInputs()
+    fun changeSampling()
 }
 
 class TilingReaderImagePreparationTest {
@@ -163,6 +172,141 @@ class TilingReaderImagePreparationTest {
             preparation.await().close()
             assertTrue(image.painter.value != null)
         } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `geometry invalidation wins against a gated stale publication`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.gateBeforeVisibleSlotCas()
+            val stale = async {
+                image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f)))
+            }
+            image.awaitVisibleSlotCasGate()
+
+            val epoch = image.invalidatePanelGeometry()
+            image.releaseVisibleSlotCasGate()
+
+            assertFailsWith<RenderInvalidatedException> { stale.await() }
+            assertEquals(epoch, image.visibleEpoch)
+            assertNull(image.painter.value)
+            assertEquals(0, image.visibleSlotPublicationCount)
+        } finally {
+            image.releaseVisibleSlotCasGate()
+            image.close()
+        }
+    }
+
+    @Test
+    fun `frame and painter become visible in one slot CAS`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
+
+            val slot = image.visibleSlotForTest()
+            assertNotNull(slot.frameData)
+            assertNotNull(slot.painter)
+            assertSame(slot.painter, image.painter.value)
+            assertEquals(1, image.visibleSlotPublicationCount)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `sampling change keeps painter synchronized with the visible slot`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f))).close()
+            val firstToken = image.visibleSlotForTest().frameToken
+
+            image.changeSampling()
+            withTimeout(5_000) {
+                while (image.visibleSlotPublicationCount < 2) yield()
+            }
+
+            val slot = image.visibleSlotForTest()
+            assertTrue(slot.frameToken > firstToken)
+            assertSame(slot.painter, image.painter.value)
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `cancelled accepted work cannot publish after geometry invalidation`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.gateBeforeVisibleSlotCas()
+            val stale = async {
+                image.prepareUpdate(screenSize, listOf(requirement(narrowPanel, 2f)))
+            }
+            image.awaitVisibleSlotCasGate()
+
+            stale.cancel()
+            image.invalidatePanelGeometry()
+            image.releaseVisibleSlotCasGate()
+            stale.cancelAndJoin()
+            image.awaitClosedImages(image.renderedTiles.size)
+
+            assertNull(image.painter.value)
+            assertEquals(0, image.visibleSlotPublicationCount)
+            assertTrue(image.tileCloseCounts.isNotEmpty())
+            assertTrue(
+                image.tileCloseCounts.all { it == 1 },
+                "expected every candidate tile to close exactly once, got ${image.tileCloseCounts}",
+            )
+        } finally {
+            image.releaseVisibleSlotCasGate()
+            image.close()
+        }
+    }
+
+    @Test
+    fun `painter construction failure leaves the previous visible slot owned`() = runBlocking {
+        val image = preparationFixture(imageSize = IntSize(1_000, 1_000))
+        try {
+            image.releaseRendering()
+            image.prepareUpdate(screenSize, listOf(requirement(widePanel, 1f))).close()
+            val visibleBefore = image.visibleSlotForTest()
+            val previousImage = image.renderedTiles.single().renderImage
+            val failure = IllegalStateException("painter construction failed")
+
+            image.failNextPainter(failure)
+            val observed = assertFailsWith<IllegalStateException> {
+                image.prepareUpdate(screenSize, listOf(requirement(widePanel, 2f)))
+            }
+
+            assertSame(failure, observed)
+            assertSame(visibleBefore, image.visibleSlotForTest())
+            assertSame(visibleBefore.painter, image.painter.value)
+            assertEquals(0, image.closedImages.count { it === previousImage })
+        } finally {
+            image.close()
+        }
+    }
+
+    @Test
+    fun `geometry invalidation of viewport work does not become an image error`() = runBlocking {
+        val image = preparationFixture()
+        try {
+            image.gateBeforeVisibleSlotCas()
+            image.requestUpdate(screenSize, 2f, narrowPanel)
+            image.awaitVisibleSlotCasGate()
+
+            image.invalidatePanelGeometry()
+            image.releaseVisibleSlotCasGate()
+            image.awaitClosedImages(image.renderedTiles.size)
+            image.releaseRendering()
+            image.ensureFitPageBaseForTest(smallScreen)
+
+            assertNull(image.error.value)
+            assertNull(image.painter.value)
+            assertEquals(0, image.visibleSlotPublicationCount)
+        } finally {
+            image.releaseVisibleSlotCasGate()
             image.close()
         }
     }
@@ -1090,6 +1234,9 @@ private class DelegatingPreparationFixture(
     override val hasRetainedPageFrame: Boolean get() = delegate.hasRetainedPageFrame
     override val fullResizeCount: Int get() = delegate.fullResizeCount
     override val regionRenderCount: Int get() = delegate.regionRenderCount
+    override val visibleEpoch: Long get() = delegate.visibleEpoch
+    override val visibleSlotPublicationCount: Int get() = delegate.visibleSlotPublicationCount
+    override fun invalidatePanelGeometry(): Long = delegate.invalidatePanelGeometry()
     override val barrierCompletionCounts: Map<Long, Int>
         get() = completions.mapValues { (_, count) ->
             count + if (delegate.reusedCompletedBarrier) 1 else 0
@@ -1134,6 +1281,10 @@ private class DelegatingPreparationFixture(
     override suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize) =
         delegate.ensureFitPageBaseForTest(maxDisplaySize)
     override fun retainedFitBaseForTest(): RetainedFitPageBase = delegate.retainedFitBaseForTest()
+    override fun visibleSlotForTest(): VisibleFrameSlot = delegate.visibleSlotForTest()
+    override fun gateBeforeVisibleSlotCas() = delegate.gateBeforeVisibleSlotCas()
+    override suspend fun awaitVisibleSlotCasGate() = delegate.awaitVisibleSlotCasGate()
+    override fun releaseVisibleSlotCasGate() = delegate.releaseVisibleSlotCasGate()
 
     override suspend fun getOriginalImageSize(): Result<IntSize> = delegate.getOriginalImageSize()
     override suspend fun getOriginalImage(): Result<KomeliaImage> = delegate.getOriginalImage()
@@ -1154,16 +1305,19 @@ private class DelegatingPreparationFixture(
     override fun failNextRender(error: Throwable) = delegate.failNextRender(error)
     override fun failRenderAfter(successes: Int, error: Throwable) =
         delegate.failRenderAfter(successes, error)
+    override fun failNextPainter(error: Throwable) = delegate.failNextPainter(error)
     override fun returnSourceCappedResults(enabled: Boolean) = delegate.returnSourceCappedResults(enabled)
     override fun returnUnprovenUndersizedResults(enabled: Boolean) =
         delegate.returnUnprovenUndersizedResults(enabled)
     override fun triggerSettingsReload() = delegate.triggerSettingsReload()
     override fun changeRenderInputs() = delegate.changeRenderInputs()
+    override fun changeSampling() = delegate.changeSampling()
     override fun close() = delegate.close()
 }
 
 private class ControllableTilingReaderImage private constructor(
     private val linearLight: MutableStateFlow<Boolean>,
+    private val samplingMode: MutableStateFlow<UpsamplingMode>,
     private val processingPipeline: ImageProcessingPipeline,
     fixtureImage: KomeliaImage,
     hardPeakDisplayAreas: Int,
@@ -1172,7 +1326,7 @@ private class ControllableTilingReaderImage private constructor(
     imageDecoder = FixtureDecoder(fixtureImage),
     processingPipeline = processingPipeline,
     stretchImages = MutableStateFlow(false),
-    upsamplingMode = MutableStateFlow(UpsamplingMode.BILINEAR),
+    upsamplingMode = samplingMode,
     downSamplingKernel = MutableStateFlow(ReduceKernel.DEFAULT),
     linearLightDownSampling = linearLight,
     pageId = ReaderImage.PageId("preparation", 1),
@@ -1180,6 +1334,7 @@ private class ControllableTilingReaderImage private constructor(
 ) {
     constructor(imageSize: IntSize, hardPeakDisplayAreas: Int = 8) : this(
         MutableStateFlow(false),
+        MutableStateFlow(UpsamplingMode.BILINEAR),
         ImageProcessingPipeline(),
         FixtureImage(imageSize.width, imageSize.height),
         hardPeakDisplayAreas,
@@ -1200,11 +1355,13 @@ private class ControllableTilingReaderImage private constructor(
     private val renderingGate = CountDownLatch(1)
     private val renderGate = AtomicReference(CountDownLatch(0))
     private val renderFailure = AtomicReference<Throwable?>(null)
+    private val painterFailure = AtomicReference<Throwable?>(null)
     private val remainingSuccesses = AtomicLong(0)
     private val sourceCappedResults = AtomicBoolean(false)
     private val unprovenUndersizedResults = AtomicBoolean(false)
     private val completedBarrierReuse = AtomicBoolean(false)
     private val pageReplacement = AtomicReference<PageReplacementStep?>(null)
+    private val visibleSlotCasGate = AtomicReference<VisibleSlotCasGate?>(null)
 
     val painterPublications: Int get() = publicationCount.value
     val currentTileCoverage: IntRect? get() = installedTileCoverage.get()
@@ -1217,12 +1374,29 @@ private class ControllableTilingReaderImage private constructor(
     val reusedCompletedBarrier: Boolean get() = completedBarrierReuse.get()
     val fullResizeCount: Int get() = fullResizeEntryCount.get().toInt()
     val regionRenderCount: Int get() = renderEntryCount.value
+    val visibleEpoch: Long get() = visibleFrameSlot.epoch
+    val visibleSlotPublicationCount: Int get() = visibleFrameSlotPublications
 
     suspend fun ensureFitPageBaseForTest(maxDisplaySize: IntSize) {
         ensureFitPageBase(maxDisplaySize)
     }
 
     fun retainedFitBaseForTest(): RetainedFitPageBase = checkNotNull(retainedFitPageBase)
+
+    fun visibleSlotForTest(): VisibleFrameSlot = visibleFrameSlot
+
+    fun gateBeforeVisibleSlotCas() {
+        visibleSlotCasGate.set(VisibleSlotCasGate())
+    }
+
+    suspend fun awaitVisibleSlotCasGate() {
+        checkNotNull(visibleSlotCasGate.get()) { "visible slot CAS gate was not installed" }
+            .entered.first { it }
+    }
+
+    fun releaseVisibleSlotCasGate() {
+        visibleSlotCasGate.get()?.release?.countDown()
+    }
 
     fun blockPainterPublication() {
         publicationGate.set(CountDownLatch(1))
@@ -1273,6 +1447,10 @@ private class ControllableTilingReaderImage private constructor(
         renderFailure.set(error)
     }
 
+    fun failNextPainter(error: Throwable) {
+        painterFailure.set(error)
+    }
+
     fun returnSourceCappedResults(enabled: Boolean) {
         sourceCappedResults.set(enabled)
     }
@@ -1318,6 +1496,10 @@ private class ControllableTilingReaderImage private constructor(
         linearLight.value = !linearLight.value
     }
 
+    fun changeSampling() {
+        samplingMode.value = UpsamplingMode.NEAREST
+    }
+
     override fun closeRenderImage(renderImage: RenderImage) {
         closedImages += renderImage
         runCatching { renderImage.close() }
@@ -1348,7 +1530,13 @@ private class ControllableTilingReaderImage private constructor(
             generatedTiles.firstOrNull { it.renderImage === tile.renderImage }
         }
         publicationCount.value += 1
-        return FixturePainter()
+        val painter = FixturePainter()
+        visibleSlotCasGate.get()?.let { gate ->
+            gate.entered.value = true
+            gate.release.await()
+        }
+        painterFailure.getAndSet(null)?.let { throw it }
+        return painter
     }
 
     override suspend fun resizeImage(
@@ -1422,8 +1610,14 @@ private class ControllableTilingReaderImage private constructor(
         publicationGate.get().countDown()
         renderingGate.countDown()
         renderGate.get().countDown()
+        visibleSlotCasGate.get()?.release?.countDown()
         pageReplacement.get()?.resume()
     }
+}
+
+private class VisibleSlotCasGate {
+    val entered = MutableStateFlow(false)
+    val release = CountDownLatch(1)
 }
 
 /**

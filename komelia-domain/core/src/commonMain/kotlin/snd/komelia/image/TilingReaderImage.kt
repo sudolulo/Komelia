@@ -9,6 +9,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -20,6 +21,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.drop
@@ -89,7 +91,19 @@ abstract class TilingReaderImage(
     final override val pageId: ReaderImage.PageId,
     protected val hardPeakDisplayAreas: Int = 8,
 ) : ReaderImage {
-    final override val painter = MutableStateFlow<TiledPainter?>(null)
+    private val visibleSlot = MutableStateFlow(
+        VisibleFrameSlot(
+            epoch = 0L,
+            frameToken = 0L,
+            frameData = null,
+            painter = null,
+        )
+    )
+    private val visibleSlotPublicationCounter = MutableStateFlow(0)
+    private val pendingVisibleFrame = MutableStateFlow<FrameData?>(null)
+    private val activePreparedLease = MutableStateFlow<ActivePreparedLease?>(null)
+
+    final override val painter: StateFlow<Painter?> = VisiblePainterStateFlow(visibleSlot)
     final override val error = MutableStateFlow<Throwable?>(null)
 
     final override val originalSize = MutableStateFlow<IntSize?>(null)
@@ -104,7 +118,6 @@ abstract class TilingReaderImage(
     private val arbiter = ImageUpdateArbiter(processingScope)
 
     private val jobFlow = MutableSharedFlow<UpdateRequest>(1, 0, BufferOverflow.DROP_OLDEST)
-    private val frameData = MutableStateFlow<FrameData?>(null)
     protected val image = MutableStateFlow<KomeliaImage?>(null)
     protected val defaultFrameDelay = 100L
 
@@ -119,6 +132,12 @@ abstract class TilingReaderImage(
 
     internal val retainedFitPageBase: RetainedFitPageBase?
         get() = retainedFitBase.value
+
+    internal val visibleFrameSlot: VisibleFrameSlot
+        get() = visibleSlot.value
+
+    internal val visibleFrameSlotPublications: Int
+        get() = visibleSlotPublicationCounter.value
 
     /**
      * Whether a fit-zoom page frame rendered for the current render generation is held. A frame
@@ -179,7 +198,7 @@ abstract class TilingReaderImage(
         }.launchIn(processingScope)
 
         stretchImages.drop(1).onEach { reloadLastRequest() }.launchIn(processingScope)
-        upsamplingMode.onEach { mode -> painter.update { it?.withSamplingMode(mode) } }
+        upsamplingMode.onEach { mode -> replaceVisiblePainterSampling(mode) }
             .launchIn(processingScope)
         downSamplingKernel.drop(1).onEach { reloadLastRequest() }
             .launchIn(processingScope)
@@ -188,64 +207,61 @@ abstract class TilingReaderImage(
 
         processingScope.launch { loadImage() }
 
-        frameData.onEach { data ->
-            try {
-                when {
-                    data == null -> this.painter.value = null
-                    data.frames.size == 1 -> {
-                        val nextPainter = createTilePainter(
-                            tiles = data.frames.first().tiles,
-                            displaySize = data.displaySize,
-                            scaleFactor = data.scaleFactor
-                        )
-                        currentCoroutineContext().ensureActive()
-                        this.painter.value = nextPainter
-                        // the retired frame stays alive until its replacement is actually visible
-                        data.releaseRetired()
-                        data.readiness?.complete(Unit)
-                    }
-
-                    else -> launchAnimation(data)
-                }
-            } catch (e: Throwable) {
-                currentCoroutineContext().ensureActive()
-                logger.catching(e)
-                this.error.value = e
-                data?.readiness?.completeExceptionally(e)
-            }
-        }.launchIn(processingScope)
     }
 
-    private fun launchAnimation(data: FrameData) {
+    private fun launchAnimation(initialSlot: VisibleFrameSlot) {
+        val data = checkNotNull(initialSlot.frameData)
         animationScope.coroutineContext.cancelChildren()
         animationScope.launch {
             try {
-                val painters = data.frames.map {
-                    createTilePainter(
-                        tiles = it.tiles,
-                        displaySize = data.displaySize,
-                        scaleFactor = data.scaleFactor
-                    )
-                }
-                var firstPainterPublished = false
-
+                var frameIndex = 0
                 while (isActive) {
-                    for ((index, tiledPainter) in painters.withIndex()) {
-                        val frameDelay = data.frames[index].delay
-                        this@TilingReaderImage.painter.value = tiledPainter
-                        if (!firstPainterPublished) {
-                            data.releaseRetired()
-                            data.readiness?.complete(Unit)
-                            firstPainterPublished = true
-                        }
-                        delay(if (frameDelay < 10) defaultFrameDelay else frameDelay)
+                    val frameDelay = data.frames[frameIndex].delay
+                    delay(if (frameDelay < 10) defaultFrameDelay else frameDelay)
+                    frameIndex = (frameIndex + 1) % data.frames.size
+
+                    val expected = visibleSlot.value
+                    if (expected.frameData !== data) return@launch
+                    val nextPainter = createTilePainter(
+                        tiles = data.frames[frameIndex].tiles,
+                        displaySize = data.displaySize,
+                        scaleFactor = data.scaleFactor,
+                    )
+                    val candidate = expected.copy(
+                        frameToken = expected.frameToken + 1,
+                        painter = nextPainter,
+                    )
+                    if (visibleSlot.compareAndSet(expected, candidate)) {
+                        visibleSlotPublicationCounter.update { it + 1 }
+                    } else if (visibleSlot.value.frameData !== data) {
+                        return@launch
                     }
                 }
             } catch (e: Throwable) {
                 currentCoroutineContext().ensureActive()
                 logger.catching(e)
                 this@TilingReaderImage.error.value = e
-                data.readiness?.completeExceptionally(e)
+            }
+        }
+    }
+
+    private fun replaceVisiblePainterSampling(mode: UpsamplingMode) {
+        while (true) {
+            val expected = visibleSlot.value
+            val data = expected.frameData ?: return
+            val firstFrame = data.frames.firstOrNull() ?: return
+            val candidatePainter = createTilePainter(
+                tiles = firstFrame.tiles,
+                displaySize = data.displaySize,
+                scaleFactor = data.scaleFactor,
+            ).withSamplingMode(mode)
+            val candidate = expected.copy(
+                frameToken = expected.frameToken + 1,
+                painter = candidatePainter,
+            )
+            if (visibleSlot.compareAndSet(expected, candidate)) {
+                visibleSlotPublicationCounter.update { it + 1 }
+                return
             }
         }
     }
@@ -254,6 +270,8 @@ abstract class TilingReaderImage(
         try {
             processUpdateLocked(request, stats) { true }
             error.value = null
+        } catch (e: RenderInvalidatedException) {
+            request.readiness?.completeExceptionally(e)
         } catch (e: Throwable) {
             currentCoroutineContext().ensureActive()
             logger.catching(e)
@@ -278,6 +296,23 @@ abstract class TilingReaderImage(
     protected suspend fun reloadLastRequest() {
         lastUpdateRequest?.let { lastRequest ->
             jobFlow.emit(lastRequest)
+        }
+    }
+
+    final override fun invalidatePanelGeometry(): Long {
+        animationScope.coroutineContext.cancelChildren()
+        while (true) {
+            val displaced = visibleSlot.value
+            val invalidated = VisibleFrameSlot(
+                epoch = displaced.epoch + 1,
+                frameToken = displaced.frameToken + 1,
+                frameData = null,
+                painter = null,
+            )
+            if (visibleSlot.compareAndSet(displaced, invalidated)) {
+                displaced.frameData?.releaseAll()
+                return invalidated.epoch
+            }
         }
     }
 
@@ -391,6 +426,7 @@ abstract class TilingReaderImage(
             // over the prepared coverage while a caller still depends on it
             arbiter.submitDemand {
                 var leaseOwnership: List<TileOwnership> = emptyList()
+                var activeLease: ActivePreparedLease? = null
                 try {
                     val request = UpdateRequest(
                         requirements = requirements,
@@ -402,7 +438,11 @@ abstract class TilingReaderImage(
                     ensureUpdateIsCurrent(isStillValid)
                     error.value = null
                     // the lease owns the exact handle set that satisfied readiness
-                    leaseOwnership = frameData.value?.retainHandles(pixelLedger) ?: emptyList()
+                    leaseOwnership = visibleSlot.value.frameData?.retainHandles(pixelLedger) ?: emptyList()
+                    activeLease = ActivePreparedLease(leaseOwnership)
+                    check(activePreparedLease.compareAndSet(null, activeLease)) {
+                        "page ${pageId.pageNumber} already has an active prepared lease"
+                    }
                     prepared.complete(
                         PreparedUpdateResult(
                             lease,
@@ -421,6 +461,7 @@ abstract class TilingReaderImage(
                     readiness.completeExceptionally(e)
                     prepared.completeExceptionally(e)
                 } finally {
+                    activeLease?.let { activePreparedLease.compareAndSet(it, null) }
                     leaseOwnership.forEach { it.close() }
                 }
             }
@@ -457,6 +498,7 @@ abstract class TilingReaderImage(
             arbiter.submitDemand(priority = true) {
                 var frameOwnership: List<TileOwnership> = emptyList()
                 try {
+                    val expectedSlot = visibleSlot.value
                     val page = retainedFitBase.value?.takeIf { it.generation == renderGeneration }
                     if (page == null) {
                         logger.debug { "page ${pageId.pageNumber} has no page frame to publish" }
@@ -473,18 +515,18 @@ abstract class TilingReaderImage(
                     }
 
                     val readiness = CompletableDeferred<Unit>()
-                    frameData.value = FrameData(
+                    val candidateFrame = FrameData(
                         frames = page.frames,
                         displaySize = page.displaySize,
                         scaleFactor = fitScaleFactor(page.displaySize, getCurrentImage()),
                         readiness = readiness,
                         handles = page.handles,
                         frameOwnership = frameOwnership,
-                        retiredOwnership = frameData.value?.takePendingOwnership() ?: emptyList(),
+                        retiredOwnership = emptyList(),
                     )
                     // the frame owns those references now, so the failure path must not close them
                     frameOwnership = emptyList()
-                    readiness.await()
+                    publishVisibleFrame(expectedSlot, candidateFrame)
                     // the installed frame is the fit-zoom full resize again
                     lastUsedScaleFactor = fitScaleFactor(page.displaySize, getCurrentImage())
                     published.complete(true)
@@ -511,10 +553,61 @@ abstract class TilingReaderImage(
         }
     }
 
+    private fun publishVisibleFrame(
+        expectedSlot: VisibleFrameSlot,
+        candidateFrame: FrameData,
+    ) {
+        var published = false
+        var publishedSlot: VisibleFrameSlot? = null
+        try {
+            check(pendingVisibleFrame.compareAndSet(null, candidateFrame)) {
+                "page ${pageId.pageNumber} already has a pending visible frame"
+            }
+            val firstFrame = candidateFrame.frames.firstOrNull()
+                ?: throw IllegalStateException("page ${pageId.pageNumber} produced an empty frame list")
+            val candidatePainter = createTilePainter(
+                tiles = firstFrame.tiles,
+                displaySize = candidateFrame.displaySize,
+                scaleFactor = candidateFrame.scaleFactor,
+            )
+            candidateFrame.adoptRetired(
+                expectedSlot.frameData?.takePendingOwnership() ?: emptyList()
+            )
+            val candidateSlot = VisibleFrameSlot(
+                epoch = expectedSlot.epoch,
+                frameToken = expectedSlot.frameToken + 1,
+                frameData = candidateFrame,
+                painter = candidatePainter,
+            )
+            if (!visibleSlot.compareAndSet(expectedSlot, candidateSlot)) {
+                throw RenderInvalidatedException()
+            }
+            published = true
+            publishedSlot = candidateSlot
+            visibleSlotPublicationCounter.update { it + 1 }
+        } catch (e: Throwable) {
+            if (!published) candidateFrame.releaseAll()
+            candidateFrame.readiness?.completeExceptionally(e)
+            throw e
+        } finally {
+            pendingVisibleFrame.compareAndSet(candidateFrame, null)
+        }
+
+        candidateFrame.releaseRetired()
+        candidateFrame.readiness?.complete(Unit)
+        if (candidateFrame.frames.size > 1) launchAnimation(checkNotNull(publishedSlot))
+    }
+
     private class PreparedUpdateResult(
         val lease: PreparedUpdateLease,
         val stats: TransitionRenderStats,
     )
+
+    private class ActivePreparedLease(
+        private val ownership: List<TileOwnership>,
+    ) {
+        fun release() = ownership.forEach { it.close() }
+    }
 
     /**
      * Accumulates what one demand-path call did across every attempt it needed, including the
@@ -553,6 +646,7 @@ abstract class TilingReaderImage(
         isStillValid: () -> Boolean,
     ): Boolean {
         ensureUpdateIsCurrent(isStillValid)
+        val expectedSlot = visibleSlot.value
 
         if (request.maxDisplaySize.width <= 0 || request.maxDisplaySize.height <= 0) {
             logger.debug { "page ${pageId.pageNumber} skipped update for empty area ${request.maxDisplaySize}" }
@@ -601,6 +695,7 @@ abstract class TilingReaderImage(
                     readiness = request.readiness,
                     stats = stats,
                     isStillValid = isStillValid,
+                    expectedSlot = expectedSlot,
                 )
             } else {
                 doTile(
@@ -614,12 +709,19 @@ abstract class TilingReaderImage(
                     readiness = request.readiness,
                     stats = stats,
                     isStillValid = isStillValid,
+                    expectedSlot = expectedSlot,
                 )
             }
 
             when (result) {
                 UpdateResult.PUBLISHED -> return true
-                UpdateResult.UNCHANGED -> return false
+                UpdateResult.UNCHANGED -> {
+                    ensureUpdateIsCurrent(isStillValid)
+                    if (!visibleSlot.compareAndSet(expectedSlot, expectedSlot)) {
+                        throw RenderInvalidatedException()
+                    }
+                    return false
+                }
                 UpdateResult.STALE -> logger.debug {
                     "page ${pageId.pageNumber} discarded render generation $generation output"
                 }
@@ -641,8 +743,9 @@ abstract class TilingReaderImage(
         readiness: CompletableDeferred<Unit>?,
         stats: RenderPassStats,
         isStillValid: () -> Boolean,
+        expectedSlot: VisibleFrameSlot,
     ): UpdateResult {
-        if (lastUsedScaleFactor == scaleFactor) {
+        if (lastUsedScaleFactor == scaleFactor && expectedSlot.frameData != null) {
             error.value?.let { throw (it) }
             return UpdateResult.UNCHANGED
         }
@@ -671,6 +774,7 @@ abstract class TilingReaderImage(
         val frames = mutableListOf<ImageFrame>()
         var ownedFrameCount = 0
         var rawFramesAlreadyClosed = false
+        var candidateOwnsFrame = false
         var succeeded = false
         try {
             stats.renderedTiles += 1
@@ -717,15 +821,17 @@ abstract class TilingReaderImage(
             stats.evictedTiles += releaseRetainedTilesExcept(emptySet())
 
             ensureUpdateIsCurrent(isStillValid)
-            frameData.value = FrameData(
+            val candidateFrame = FrameData(
                 frames = frames,
                 displaySize = displayArea,
                 scaleFactor = scaleFactor,
                 readiness = readiness,
                 handles = frameHandles.toList(),
                 frameOwnership = frameOwnership.toList(),
-                retiredOwnership = frameData.value?.takePendingOwnership() ?: emptyList(),
+                retiredOwnership = emptyList(),
             )
+            candidateOwnsFrame = true
+            publishVisibleFrame(expectedSlot, candidateFrame)
             lastUsedScaleFactor = scaleFactor
             succeeded = true
             logger.info { "page ${pageId.pageNumber} completed full resize to $dstWidth x $dstHeight" }
@@ -733,7 +839,7 @@ abstract class TilingReaderImage(
         } finally {
             reservations.forEach { it.close() }
             if (!succeeded) {
-                frameOwnership.forEach { it.close() }
+                if (!candidateOwnsFrame) frameOwnership.forEach { it.close() }
                 if (!rawFramesAlreadyClosed) {
                     resizedImage.frames.drop(ownedFrameCount).forEach { closeRenderImage(it) }
                 }
@@ -754,12 +860,14 @@ abstract class TilingReaderImage(
         readiness: CompletableDeferred<Unit>?,
         stats: RenderPassStats,
         isStillValid: () -> Boolean,
+        expectedSlot: VisibleFrameSlot,
     ): UpdateResult {
         val timeSource = TimeSource.Monotonic
         val start = timeSource.markNow()
 
         val passTiles = mutableListOf<PassTile>()
         var addedNewTiles = false
+        var candidateOwnsFrame = false
         var succeeded = false
         try {
             for (geometry in tileGeometries(image, tileSize, displayScaleFactor)) {
@@ -864,7 +972,7 @@ abstract class TilingReaderImage(
 
             val activeKeys = passTiles.mapTo(mutableSetOf()) { it.key }
             val newTiles = passTiles.map { it.tile }
-            val previousFrame = frameData.value
+            val previousFrame = expectedSlot.frameData
             val previousTileRegions = previousFrame?.frames?.firstOrNull()?.tiles
                 ?.mapTo(mutableSetOf()) { it.displayRegion }
             val coverageChanged = previousTileRegions != newTiles.mapTo(mutableSetOf()) { it.displayRegion }
@@ -873,15 +981,17 @@ abstract class TilingReaderImage(
 
             ensureUpdateIsCurrent(isStillValid)
             if (shouldPublish) {
-                frameData.value = FrameData(
+                val candidateFrame = FrameData(
                     frames = listOf(ImageFrame(newTiles, 0)),
                     displaySize = displayArea,
                     scaleFactor = scaleFactor,
                     readiness = readiness,
                     handles = passTiles.map { it.handle },
                     frameOwnership = passTiles.map { it.frameOwnership },
-                    retiredOwnership = previousFrame?.takePendingOwnership() ?: emptyList(),
+                    retiredOwnership = emptyList(),
                 )
+                candidateOwnsFrame = true
+                publishVisibleFrame(expectedSlot, candidateFrame)
                 val end = timeSource.markNow()
                 logger.info {
                     "page ${pageId.pageNumber} completed tiled resize in ${end - start};  ${newTiles.size} tiles"
@@ -899,7 +1009,7 @@ abstract class TilingReaderImage(
                 // a failed or stale pass owns nothing: the visible frame and the rest of the
                 // retained working set are untouched
                 for (pass in passTiles) {
-                    pass.frameOwnership.close()
+                    if (!candidateOwnsFrame) pass.frameOwnership.close()
                     pass.insertedOwnership?.let { inserted ->
                         dropRetainedTile(pass.key)
                         inserted.close()
@@ -1232,8 +1342,16 @@ abstract class TilingReaderImage(
         animationScope.cancel()
         imageAwaitScope.cancel()
 
-        val data = frameData.value
-        frameData.value = null
+        val data = visibleSlot.getAndUpdate { current ->
+            VisibleFrameSlot(
+                epoch = current.epoch + 1,
+                frameToken = current.frameToken + 1,
+                frameData = null,
+                painter = null,
+            )
+        }.frameData
+        pendingVisibleFrame.getAndUpdate { null }?.releaseAll()
+        activePreparedLease.getAndUpdate { null }?.release()
         originalImage?.close()
         data?.releaseAll()
         releaseRetainedFitBase()
@@ -1307,6 +1425,10 @@ abstract class TilingReaderImage(
             retired.getAndUpdate { emptyList() }.forEach { it.close() }
         }
 
+        fun adoptRetired(retiredOwnership: List<TileOwnership>) {
+            retired.update { it + retiredOwnership }
+        }
+
         /**
          * Hands every reference this frame still owns to its replacement. A frame that is
          * superseded before it ever publishes therefore cannot strand its tiles.
@@ -1369,4 +1491,32 @@ abstract class TilingReaderImage(
         val upsamplingMode: UpsamplingMode,
         val rendererEpoch: Long,
     )
+}
+
+@OptIn(ExperimentalForInheritanceCoroutinesApi::class)
+private class VisiblePainterStateFlow(
+    private val visibleSlot: StateFlow<VisibleFrameSlot>,
+) : StateFlow<Painter?> {
+    override val value: Painter?
+        get() = visibleSlot.value.painter
+
+    override val replayCache: List<Painter?>
+        get() = listOf(value)
+
+    override suspend fun collect(collector: FlowCollector<Painter?>): Nothing {
+        var initialized = false
+        var previous: Painter? = null
+        return visibleSlot.collect(
+            object : FlowCollector<VisibleFrameSlot> {
+                override suspend fun emit(value: VisibleFrameSlot) {
+                    val next = value.painter
+                    if (!initialized || previous != next) {
+                        initialized = true
+                        previous = next
+                        collector.emit(next)
+                    }
+                }
+            }
+        )
+    }
 }

@@ -3,12 +3,22 @@ package snd.komelia.image
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.StateFlow
 import kotlin.math.roundToInt
 
 fun interface PreparedUpdateLease : AutoCloseable {
     override fun close()
 }
+
+class RenderInvalidatedException : CancellationException("render publication was invalidated")
+
+internal data class VisibleFrameSlot(
+    val epoch: Long,
+    val frameToken: Long,
+    val frameData: TilingReaderImage.FrameData?,
+    val painter: TilingReaderImage.TiledPainter?,
+)
 
 internal data class RetainedFitPageBase(
     val generation: Long,
@@ -30,6 +40,13 @@ interface ReaderImage : AutoCloseable {
     val currentSize: StateFlow<IntSize?>
     val painter: StateFlow<Painter?>
     val error: StateFlow<Throwable?>
+
+    /**
+     * Atomically invalidates panel geometry before replacement rendering is queued.
+     *
+     * Non-layered implementations and test doubles intentionally have no geometry epoch.
+     */
+    fun invalidatePanelGeometry(): Long = 0L
 
     /**
      * request an asynchronous update.
