@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
+import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -600,6 +601,7 @@ class TilingReaderImagePreparationTest {
         val ownershipLedger = TilePixelLedger(Long.MAX_VALUE)
         var outgoingFrameOwnership = emptyList<TileOwnership>()
         var leaseOwnership = emptyList<TileOwnership>()
+        var readerClosed = false
         image.releaseRendering()
         try {
             val first = image.prepareLayeredPanelWindow(
@@ -607,6 +609,7 @@ class TilingReaderImagePreparationTest {
                 PanelWindowKey(1, image.visibleEpoch),
                 highDensityWindow012,
             )
+            val outgoingFrameImages = image.publishedTiles.last().map { it.renderImage }
             outgoingFrameOwnership = image.retainVisibleFrameOwnership(ownershipLedger)
             first.lease.close()
 
@@ -615,6 +618,7 @@ class TilingReaderImagePreparationTest {
                 PanelWindowKey(2, image.visibleEpoch),
                 highDensityWindow123,
             )
+            val leasedFrameImages = image.publishedTiles.last().map { it.renderImage }
             leaseOwnership = image.retainVisibleFrameOwnership(ownershipLedger)
             second.lease.close()
 
@@ -635,35 +639,60 @@ class TilingReaderImagePreparationTest {
             assertTrue(snapshot.livePixels + snapshot.reservedPixels <= snapshot.hardPeakPixels)
 
             val baseImage = image.retainedFitBaseTile.renderImage
-            val overlayImages = image.renderedTiles.map { it.renderImage }.filter { it !== baseImage }
-            leaseOwnership.forEach { it.close() }
-            assertTrue(
-                overlayImages.none { overlay -> image.closedImages.any { it === overlay } },
-                "the window, visible frame, and outgoing frame must survive lease retirement",
+            val nativeImages = image.renderedTiles.map { it.renderImage }
+            var outgoingFrameActive = true
+            var leasedFrameActive = true
+            var currentFrameAndWindowActive = true
+            var fitBaseActive = true
+            data class OwnerRetirement(val name: String, val close: () -> Unit)
+            val orderedRetirements = listOf(
+                OwnerRetirement("outgoing frame") {
+                    outgoingFrameOwnership.forEach { it.close() }
+                    outgoingFrameOwnership = emptyList()
+                    outgoingFrameActive = false
+                },
+                OwnerRetirement("leased frame") {
+                    leaseOwnership.forEach { it.close() }
+                    leaseOwnership = emptyList()
+                    leasedFrameActive = false
+                },
+                OwnerRetirement("current frame and window") {
+                    image.invalidatePanelGeometry()
+                    currentFrameAndWindowActive = false
+                },
+                OwnerRetirement("fit base reader") {
+                    image.close()
+                    readerClosed = true
+                    currentFrameAndWindowActive = false
+                    fitBaseActive = false
+                },
+            )
+            val shuffledRetirements = orderedRetirements.shuffled(Random(20_260_930))
+            assertFalse(
+                shuffledRetirements.map { it.name } == orderedRetirements.map { it.name },
+                "the owner retirement coverage must not accidentally use construction order",
             )
 
-            image.invalidatePanelGeometry()
-            assertEquals(
-                1,
-                overlayImages.count { overlay -> image.closedImages.any { it === overlay } },
-                "only the current-only overlay may close while the outgoing frame remains",
-            )
-
-            outgoingFrameOwnership.forEach { it.close() }
-            assertTrue(
-                overlayImages.all { overlay -> image.closedImages.count { it === overlay } == 1 },
-                "the final overlay owner must close every native image exactly once",
-            )
-            assertEquals(
-                0,
-                image.closedImages.count { it === baseImage },
-                "the independently retained fit base must survive frame and window retirement",
-            )
+            shuffledRetirements.forEach { retirement ->
+                retirement.close()
+                nativeImages.forEach { nativeImage ->
+                    val stillOwned =
+                        (fitBaseActive && nativeImage === baseImage) ||
+                            (outgoingFrameActive && outgoingFrameImages.any { it === nativeImage }) ||
+                            (leasedFrameActive && leasedFrameImages.any { it === nativeImage }) ||
+                            (currentFrameAndWindowActive && leasedFrameImages.any { it === nativeImage })
+                    assertEquals(
+                        if (stillOwned) 0 else 1,
+                        image.closedImages.count { it === nativeImage },
+                        "native image close count after retiring ${retirement.name}",
+                    )
+                }
+            }
         } finally {
             leaseOwnership.forEach { it.close() }
             outgoingFrameOwnership.forEach { it.close() }
             val renderedCount = image.renderedTiles.size
-            image.close()
+            if (!readerClosed) image.close()
             withContext(Dispatchers.Default) {
                 withTimeout(2_000) { image.awaitClosedImages(renderedCount) }
             }
