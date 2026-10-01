@@ -14,6 +14,14 @@ results.
 
 All existing JVM, Android build, Wasm build, and diff checks remain mandatory.
 
+**Amendment (2026-10-01, approved by Holden):** the original revision ran the emulator on `code`
+with software CPU emulation. That was measured and rejected: with `-accel off`, an API 37 Pixel 9 Pro
+Fold image reached adb after 373 s and was still stuck in the package-manager scan, not booted, at
+1787 s. The emulator now runs on a dedicated KVM runner VM, `android-runner`, which `code` drives
+over SSH. Everything else in this design is unchanged: the x86_64 acceptance variant, the
+instrumented fixture, the host-owned emulator lifecycle, real emulator posture commands, and the
+assertions.
+
 ## Goal
 
 Provide one repo-owned, self-contained, PII-free command that provisions or uses a pinned generic
@@ -22,10 +30,20 @@ Compose rendering paths without a server, credentials, external book data, or ma
 
 ## Environment constraints
 
-- `code` is a TrueNAS LXC with 40 x86_64 CPUs and sufficient disk space.
-- `/dev/kvm` exists on the TrueNAS host but is **not** exposed inside `code`.
-- KVM pass-through is outside this design. The initial harness uses explicit software CPU emulation
-  and a pinned software GPU renderer. Real-time performance is therefore not an acceptance signal.
+- `code` is an unprivileged TrueNAS Incus LXC with 40 x86_64 CPUs. It builds the APKs, including
+  the Docker-built x86_64 native libraries. It has no `/dev/kvm`, and TrueNAS 25.10 middleware
+  offers no supported way to map one in.
+- The emulator runs on `android-runner`: libvirt VM `androidrunner` (TrueNAS VM id 18), Debian 13,
+  8 vCPU host-passthrough, 16 GB RAM, static `192.168.10.24` on `br1`, SSH user `runner`. TrueNAS
+  has nested KVM enabled, so `/dev/kvm` is usable inside the guest.
+- Measured on `android-runner`: the pinned image cold-boots in 152-153 s. `adb emu fold`/`unfold`
+  switch 2076x2152 `OPENED` <-> 1080x2424 `CLOSED` as a real `DeviceState` transition. The UI is slow
+  immediately after boot (screencap 11.5 s, a Settings cold start timed out at 15.5 s), so readiness
+  is always awaited through markers and app idleness, never fixed delays.
+- The runner uses a pinned software GPU (SwiftShader) and nested virtualization on a shared host.
+  Real-time performance is therefore still not an acceptance signal.
+- The host CPU (Xeon E5-2690 v2) has no AVX2. The pinned emulator and image were verified to run
+  on it; changing either pin requires re-verification on the runner.
 - The application debug APK currently packages only `arm64-v8a`; emulator acceptance needs an
   isolated x86_64 variant. Existing arm64 debug and release variants must remain unchanged.
 
@@ -75,11 +93,18 @@ file is edited.
 
 ### AVD setup
 
-`scripts/setup-panel-window-emulator.sh` is the only provisioning entry point. It must:
+`scripts/setup-panel-window-emulator.sh` is the only provisioning entry point. It runs on `code` and
+provisions `android-runner` over SSH. It must:
 
-- require an explicit Android SDK root and use SDK tools from that root;
-- install a pinned emulator package and API 37 Google APIs x86_64 system image;
-- create one named generic Pixel Fold AVD from a verified profile;
+- require the runner's SSH alias and its explicit Android SDK root (`~/Android/Sdk` on the runner),
+  and use SDK tools from that root;
+- verify `/dev/kvm` is readable and writable on the runner and that `emulator -accel-check` reports
+  KVM usable; fail with that exact reason otherwise. There is no software-emulation fallback;
+- install the emulator's host runtime libraries on the runner (the X11/GL/NSS set it links against;
+  the emulator exits 127 without them) and verify the launcher resolves every library;
+- install pinned packages: emulator `37.2.12`, platform-tools `37.0.1`, and
+  `system-images;android-37.0;google_apis;x86_64` revision 6;
+- create one named AVD from the verified `pixel_9_pro_fold` profile;
 - be idempotent and verify the resulting package/image/profile/AVD identities;
 - verify required SDK licences are already accepted and fail with the exact missing licence when
   they are not; the script does not accept legal terms on the user's behalf;
@@ -109,16 +134,25 @@ the production renderer and state.
 
 ## Host/test synchronization
 
-`scripts/test-panel-window-emulator.sh` is the canonical acceptance command. It owns:
+`scripts/test-panel-window-emulator.sh` is the canonical acceptance command. It runs on `code`,
+builds the acceptance APK and test APK there, copies them to a per-run directory on
+`android-runner`, and drives the emulator on the runner over SSH. Remote steps run as copied script
+files or single non-interactive commands; nothing is fed to a remote shell on stdin, because
+`adb shell` consumes stdin. It owns:
 
 - an unambiguous emulator serial reserved for this run;
-- headless startup with no snapshots, no audio, `-accel off`, and `-gpu software`;
+- headless startup with no snapshots, no audio, `-accel on`, and a pinned software GPU
+  (SwiftShader);
+- a refusal to start, with the exact reason, if the runner is unreachable or KVM is unusable;
 - bounded boot, instrumentation, posture-change, and shutdown waits;
 - APK/test-APK installation and instrumentation arguments;
 - per-process logcat capture;
 - exact readiness-marker matching;
 - official `adb -s <serial> emu fold`, `unfold`, and supported `posture` commands;
-- trap-based shutdown and removal of all per-run temporary files.
+- trap-based shutdown of the emulator **by its own PID on the runner** (stopping the wrapper alone
+  was observed to leave `qemu-system-x86_64-headless` running), plus removal of all per-run
+  temporary files on both hosts. Failure artifacts are copied back to `code` before the runner's
+  per-run directory is deleted.
 
 The test emits a marker only after its state and current window are stable. For the geometry case,
 the host changes posture after that marker. The test waits for the actual Compose root/window size to
@@ -217,8 +251,10 @@ The new acceptance work is complete only when:
 - setup succeeds twice without creating duplicate AVDs or modifying tracked files;
 - the canonical test command passes from a clean checkout and prints counts for postures, modes,
   checkpoints, warm/cold transitions, epochs, rendered/upgraded overlays, live pixels, and hard peak;
-- a forced assertion failure proves failure artifacts are retained and the emulator is stopped;
-- a subsequent successful run removes transient artifacts and also stops the emulator;
+- a forced assertion failure proves failure artifacts are copied back to `code` and the emulator on
+  `android-runner` is stopped (no `qemu-system-x86_64-headless` process remains);
+- a subsequent successful run removes transient artifacts on both hosts and also stops the emulator;
+- an unreachable runner and an unusable `/dev/kvm` each make the command fail fast with that reason;
 - the exact three-run JVM matrix, Android debug build, Wasm compilation, working-tree `diff --check`,
   and full implementation-range `diff --check` all pass;
 - repository status contains only task-owned changes plus explicitly recorded baseline dirt.
@@ -227,7 +263,9 @@ The new acceptance work is complete only when:
 
 - Real Pixel hardware wall-clock or thermal performance.
 - Human-perceived sharpness or UI-polish review.
-- KVM pass-through into `code`.
+- KVM pass-through into `code` (not supported by TrueNAS 25.10 middleware for an unprivileged LXC).
+- Provisioning or recreating the `android-runner` VM itself; that is homelab infrastructure,
+  documented in the homelab repository, not in this repository.
 - Production navigation, server login, external book data, or analytics.
 - Animated/multi-frame image support.
 - A generic screenshot-golden framework or broad emulator test platform.
