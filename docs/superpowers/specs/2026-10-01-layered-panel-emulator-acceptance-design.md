@@ -33,9 +33,9 @@ Compose rendering paths without a server, credentials, external book data, or ma
 - `code` is an unprivileged TrueNAS Incus LXC with 40 x86_64 CPUs. It builds the APKs, including
   the Docker-built x86_64 native libraries. It has no `/dev/kvm`, and TrueNAS 25.10 middleware
   offers no supported way to map one in.
-- The emulator runs on `android-runner`: libvirt VM `androidrunner` (TrueNAS VM id 18), Debian 13,
-  8 vCPU host-passthrough, 16 GB RAM, static `192.168.10.24` on `br1`, SSH user `runner`. TrueNAS
-  has nested KVM enabled, so `/dev/kvm` is usable inside the guest.
+- The emulator runs on `android-runner`: a libvirt VM on the same TrueNAS host, Debian 13,
+  8 vCPU host-passthrough, 16 GB RAM, a static LAN address, reached over SSH as a dedicated
+  unprivileged user. TrueNAS has nested KVM enabled, so `/dev/kvm` is usable inside the guest.
 - Measured on `android-runner`: the pinned image cold-boots in 152-153 s. `adb emu fold`/`unfold`
   switch 2076x2152 `OPENED` <-> 1080x2424 `CLOSED` as a real `DeviceState` transition. The UI is slow
   immediately after boot (screencap 11.5 s, a Settings cold start timed out at 15.5 s), so readiness
